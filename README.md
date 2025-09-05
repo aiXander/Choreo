@@ -1,25 +1,3 @@
-# TODO:
-
-- create 6 nice, diverse profiles
-- make all llm calls run in parallel
-
-
-- merge
-matching:
-  b_min: 2
-  b_max: 4
-
-report:
-  top_matches_per_user: 5
-
-
-- investigate embedding scoring model: weights, recipe, instructions, ...
-
-- normalize all embedding and LLM scores to same range before combining
-- fix combining of llm-score with embedding score:
-Current: if llm_score is missing, you set final_weight = embed_score (not scaled by embed_weight).
-Consequence: with embed_weight < 1, pairs with LLM get compressed by weights, while pairs without LLM are not—skewing comparisons.
-
 
 Future optimizations:
 - LLM-scoring is generating score, introduction & topics in a single call for each candidate pair: lots of tokens
@@ -27,7 +5,7 @@ Future optimizations:
  ---> Then aggregate all scores, rank and then generate the final introduction & topics
 
 - run LLM pairing on the actual profile instead of the sections?
-
+- properly scan code for dependencies (remove unneeded ones) and update pyproject.toml
 
 #####################################################################################
 
@@ -73,82 +51,95 @@ A flexible user profile matching system that uses LLM embeddings and processing 
    - Cohort summary: `data/outputs/cohort.json`
    - Raw edges: `data/graphs/edges.jsonl`
 
+## How It Works: The Matching Algorithm
+
+This system implements a sophisticated 8-step pipeline that transforms raw user profiles into meaningful connections:
+
+### Step 1: Profile Ingestion 📁
+- Load raw text files from `data/raw/` (one `.txt` file per user)
+- Each filename becomes a user ID (e.g., `alice.txt` → user "alice")
+- Create Profile objects with content hashing for change detection
+
+### Step 2: LLM Section Extraction 🧠
+- Use LLM to analyze each profile and extract structured sections:
+  - **Skills**: Technical abilities and expertise
+  - **Interests**: Hobbies, topics of interest, passions
+  - **Goals**: Professional/personal objectives and aspirations  
+  - **Personality**: Communication style, work preferences, values
+- Smart caching prevents re-processing unchanged profiles
+- Configurable word limits per section to manage costs
+
+### Step 3: Multi-Section Embedding 🔢
+- Generate vector embeddings for each user's sections separately
+- Creates a 3D tensor: `(n_users, n_sections, embedding_dim)`
+- Uses OpenAI's text-embedding models by default
+- Embeddings capture semantic similarity within each section type
+
+### Step 4: Similarity Matrix Generation 🎯
+- Compute cosine similarity matrices for each section independently
+- Apply **recipe-based weighting** to combine sections:
+  - **Overlap**: Similar interests (40%) + goals (30%) + skills (20%) + personality (10%)
+  - **Complement**: Shared interests/goals but different skills
+  - **Debate**: Same topics but contrasting perspectives
+- Result: Single fused similarity matrix capturing relationship potential
+
+### Step 5: Smart LLM Pair Scoring ⚡
+- **Intelligent pair selection**: Use greedy algorithm to select optimal subset of pairs for expensive LLM evaluation
+- **Per-user budgeting**: Each user gets evaluated against their top N 'best-match' candidates (configurable)
+- **Batch processing**: Evaluate multiple pairs in parallel for speed
+- LLM generates:
+  - Match quality score (0-1)
+  - Personalized introduction text
+  - Conversation starter topics
+
+### Step 6: Greedy B-Matching 🔗
+- Blend embedding scores + LLM scores
+- Run **greedy b-matching algorithm** to create fair matches:
+  - Every user gets between `b_min` and `b_max` connections
+  - Greedily select highest-weighted edges first
+  - Backfill users below minimum degree requirement
+- Ensures balanced network where no one is over/under-connected
+
+### Step 7: Personalized Reports 📝
+- Generate markdown reports for each user listing their matches
+- Include match reasoning, conversation starters, and contact details
+- Create cohort summary with network statistics and visualizations
+
+### Step 8: Visualization & Analytics 🎨
+- Generate t-SNE plots showing user clusters in embedding space
+- Create similarity heatmaps for different sections
+
 ## Matching Recipes
 
-### Overlap (Default)
-Matches users with similar interests, goals, and complementary skills.
+The system supports different strategies for matching through configurable "recipes":
+
+### Overlap Recipe (Default)
+Find users with similar interests and complementary skills
 ```yaml
-recipe:
-  name: "overlap"
-  section_weights:
-    skills: 0.20
-    interests: 0.40
-    goals: 0.30
-    personality: 0.10
-  dissimilar_sections: []
+section_weights:
+  skills: 0.20      # Some skill overlap helpful
+  interests: 0.40   # Strong interest alignment
+  goals: 0.30       # Shared objectives
+  personality: 0.10 # Compatible styles
 ```
 
-### Complement
-Matches users with aligned interests/goals but different skillsets.
-```yaml
-recipe:
-  name: "complement"
-  section_weights:
-    interests: 0.45
-    goals: 0.35
-    skills: 0.20
-    personality: 0.0
-  dissimilar_sections: ["skills"]
-```
+## Technical Architecture
 
-### Debate
-Matches users with aligned topics but different perspectives.
-```yaml
-recipe:
-  name: "debate"  
-  section_weights:
-    interests: 0.5
-    goals: 0.2
-    personality: 0.3
-    skills: 0.0
-  dissimilar_sections: ["personality"]
-```
-
-## Architecture
+The system is built with modularity and extensibility in mind:
 
 ```
-main.py              # Pipeline orchestration
-├── ingest.py        # Load .txt profiles → Profile objects
-├── extract.py       # LLM: profile → structured sections  
-├── embed.py         # Generate embeddings per section
-├── candidate.py     # Fused similarity + top-K candidates
-├── score.py         # LLM pair scoring for top pairs
+main.py              # Pipeline orchestration & async management
+├── ingest.py        # Profile loading & validation
+├── extract.py       # LLM section extraction with batching  
+├── embed.py         # Multi-section embedding generation
+├── candidate.py     # Similarity fusion & candidate generation
+├── score.py         # Intelligent LLM pair scoring
 ├── match.py         # Greedy b-matching algorithm
-├── report.py        # Generate user reports + cohort summary
-├── llm.py           # LiteLLM wrapper with caching
-└── utils.py         # Cosine similarity, I/O helpers
+├── report.py        # Report generation & templating
+├── visualize.py     # t-SNE plots & similarity heatmaps
+├── llm.py           # LLM wrapper with caching & rate limiting
+└── utils.py         # Mathematical utilities & I/O helpers
 ```
-
-## Configuration
-
-- **Budgets**: Control LLM usage and costs
-- **Matching**: Set degree bounds (b_min, b_max) and candidate pool size
-- **Blending**: Weight embedding vs LLM scores in final ranking
-- **Models**: Choose embedding and LLM models (supports OpenAI, Anthropic, etc.)
-
-## Data Flow
-
-1. **Raw profiles** (.txt) → **Extracted sections** (skills, interests, goals, personality)
-2. **Section embeddings** → **Fused similarity matrix** (recipe-based)
-3. **Top-K candidates** → **LLM pair scoring** → **Final edge weights**
-4. **Greedy b-matching** → **User reports** + **Cohort summary**
-
-## Extending the System
-
-- **New Recipes**: Add new section weighting schemes and dissimilar sections
-- **Custom Sections**: Modify `sections.yaml` to extract different profile aspects  
-- **Alternative Matching**: Replace greedy b-matching with min-cost flow or other algorithms
-- **Rich Outputs**: Extend reports with visualizations, export formats, etc.
 
 ## Requirements
 

@@ -247,15 +247,30 @@ def score_pairs_with_llm(
             # Run batch scoring
             llm_wrapper.set_component("pair_scoring")
             
-            try:
-                responses = asyncio.run(
-                    llm_wrapper.batch_json_complete(
+            async def _async_score_with_cleanup():
+                """Run batch scoring with proper async cleanup."""
+                try:
+                    responses = await llm_wrapper.batch_json_complete(
                         prompts=prompts,
                         model=model,
                         cache_keys=cache_keys,
                         batch_size=16
                     )
-                )
+                    return responses
+                finally:
+                    # Force cleanup of any remaining tasks (like connection pools from litellm)
+                    print("Cleaning up remaining async tasks...")
+                    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+                    if tasks:
+                        print(f"Cancelling {len(tasks)} remaining tasks...")
+                        for task in tasks:
+                            task.cancel()
+                        # Gather with return_exceptions=True to suppress logging worker errors
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        print("Task cleanup completed")
+
+            try:
+                responses = asyncio.run(_async_score_with_cleanup())
                 
                 # Process batch responses
                 for pair, response in zip(valid_pairs, responses):

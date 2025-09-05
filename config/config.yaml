@@ -20,15 +20,13 @@ recipe:
     persona:       0.10
 
 blending:  # final = w*embed + (1-w)*llm_score
-  embed_weight: 0.6         
+  embed_weight: 0.6
   llm_weight:   0.4
 
 matching:
   b_min: 2
   b_max: 4
 
-report:
-  top_matches_per_user: 5
 
 io:
   raw_dir: "data/raw"

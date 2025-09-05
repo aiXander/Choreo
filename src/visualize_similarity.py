@@ -51,8 +51,6 @@ def create_similarity_plots(
         plt.imshow(similarity_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')  # Equal aspect ratio
         plt.colorbar(label='Similarity Score')
         plt.title(f'{section_name.capitalize()} Similarity Matrix\n(Weight: {weight:.2f})')
-        plt.xlabel('User Index')
-        plt.ylabel('User Index')
         
         # Add user labels if reasonable number
         if len(user_ids) <= 20:
@@ -76,9 +74,7 @@ def create_similarity_plots(
     
     # Add weights summary to title
     weights_str = ", ".join([f"{k}: {v:.2f}" for k, v in section_weights.items()])
-    plt.title(f'Combined Similarity Matrix\n(Recipe: {recipe_type})\nWeights: {weights_str}')
-    plt.xlabel('User Index')
-    plt.ylabel('User Index')
+    plt.title(f'Combined Similarity Matrix\n{weights_str}')
     
     if len(user_ids) <= 20:
         plt.xticks(range(len(user_ids)), user_ids, rotation=45, ha='right')
@@ -111,8 +107,6 @@ def create_similarity_plots(
         weight = section_weights.get(section_name, 0.0)
         ax.set_title(f'{section_name.capitalize()}\n(w={weight:.2f})', 
                     fontsize=12)
-        ax.set_xlabel('User Index', fontsize=10)
-        ax.set_ylabel('User Index', fontsize=10)
         
         if len(user_ids) <= 10:
             ax.set_xticks(range(len(user_ids)))
@@ -123,10 +117,8 @@ def create_similarity_plots(
     # Plot combined matrix on the right
     ax_combined = fig.add_subplot(gs[:, 2])
     im_combined = ax_combined.imshow(combined_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')  # Equal aspect ratio
-    weights_str = ", ".join([f"{k}: {v:.2f}" for k, v in section_weights.items()])
-    ax_combined.set_title(f'Combined Matrix\n(Recipe: {recipe_type})\nWeights: {weights_str}', fontsize=14)
-    ax_combined.set_xlabel('User Index', fontsize=12)
-    ax_combined.set_ylabel('User Index', fontsize=12)
+    weights_str = ", ".join([f"{k[:8]}: {v:.2f}" for k, v in section_weights.items()])
+    ax_combined.set_title(f'Combined Matrix\n{weights_str}', fontsize=14)
     
     if len(user_ids) <= 15:
         ax_combined.set_xticks(range(len(user_ids)))

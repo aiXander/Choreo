@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Prompt-mesh: User profile matching system using LLM embeddings and processing.
+User profile matching system using LLM embeddings and processing.
+Created by Xander Steenbrugge -- xander@eden.art
 """
+
+print(f"Starting!")
 
 import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
-
-print(f"Main.py started!")
 
 # Add src to path for direct execution
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -25,6 +26,7 @@ from match import create_matches
 from report import generate_all_reports
 from cost_tracker import get_cost_tracker
 from visualize_similarity import create_similarity_plots
+from tsne import create_tsne_plots
 
 print(f"Loaded all modules, ready to go!")
 
@@ -88,6 +90,21 @@ def main(group_name: str = None, force: bool = False):
     )
     print(f"✅ Created embeddings: {embeddings.shape}")
     
+    print("\n📊 Step 3.5: Creating t-SNE visualizations...")
+    try:
+        tsne_results = create_tsne_plots(
+            embeddings=embeddings,
+            user_ids=user_ids,
+            section_names=section_names,
+            output_dir=config['io']['outputs_dir'],
+            metric='cosine',
+            perplexity=7
+        )
+        print(f"✅ Created t-SNE plots: {tsne_results['plots_dir']}")
+    except Exception as e:
+        print(f"❌ Error creating t-SNE visualizations: {e}")
+        return 1
+    
     print("\n🎯 Step 4: Generating similarity matrix...")
     try:
         similarity_matrix, user_ids_sorted, matrices_dict = generate_similarity_matrix(
@@ -129,7 +146,7 @@ def main(group_name: str = None, force: bool = False):
     
     print("\n🔗 Step 6: Greedy b-matching...")
     try:
-        # Create candidate pairs from LLM scores for matching algorithm
+        # Create candidate pairs from LLM scores only (no original candidates without LLM evaluation)
         scored_candidates = [
             CandidatePair.create(score.user1, score.user2, score.embed_score)
             for score in llm_scores.values()
@@ -140,8 +157,7 @@ def main(group_name: str = None, force: bool = False):
             llm_scores=llm_scores,
             all_user_ids=user_ids_sorted,
             matching_config=config['matching'],
-            blending_config=config['blending'],
-            graphs_dir=config['io']['outputs_dir'].replace('outputs', 'graphs')
+            blending_config=config['blending']
         )
         print(f"✅ Created {len(final_edges)} final matches")
     except Exception as e:
@@ -154,7 +170,7 @@ def main(group_name: str = None, force: bool = False):
             all_edges=final_edges,
             extracted_sections=extracted_sections,
             outputs_dir=config['io']['outputs_dir'],
-            top_matches_per_user=config['report']['top_matches_per_user']
+            top_matches_per_user=config['matching']['b_max']
         )
         print(f"✅ Generated reports for all users")
     except Exception as e:
@@ -191,6 +207,7 @@ def main(group_name: str = None, force: bool = False):
     print(f"📁 Check outputs in: {config['io']['outputs_dir']}")
     print(f"📊 Cohort summary: {config['io']['outputs_dir']}/cohort.json")
     print(f"💰 Cost report: {cost_report_path}")
+    print(f"📊 t-SNE plots: {tsne_results['plots_dir']}")
     print(f"🎨 Similarity plots: {plots_results['plots_dir']}")
     
     return 0

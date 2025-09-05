@@ -131,76 +131,49 @@ def extract_sections_from_profiles(
         # Run batch extraction
         llm_wrapper.set_component("profile_extraction")
         
-        try:
-            print("DEBUG: About to call asyncio.run")
-            
-            # Use a more explicit event loop management
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
+        async def _async_batch_with_cleanup():
+            """Run batch processing with proper async cleanup."""
             try:
-                responses = loop.run_until_complete(
-                    llm_wrapper.batch_json_complete(
-                        prompts=prompts,
-                        model=model,
-                        cache_keys=cache_keys,
-                        schema_hints=schema_hints,
-                        batch_size=16
-                    )
+                responses = await llm_wrapper.batch_json_complete(
+                    prompts=prompts,
+                    model=model,
+                    cache_keys=cache_keys,
+                    schema_hints=schema_hints,
+                    batch_size=16
                 )
-                print("DEBUG: loop.run_until_complete finished")
+                return responses
             finally:
-                # Ensure proper cleanup
-                pending = asyncio.all_tasks(loop)
-                if pending:
-                    print(f"DEBUG: Cancelling {len(pending)} pending tasks")
-                    for i, task in enumerate(pending):
-                        print(f"DEBUG: Cancelling task {i+1}: {task}")
+                # Force cleanup of any remaining tasks (like connection pools from litellm)
+                print("Cleaning up remaining async tasks...")
+                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+                if tasks:
+                    print(f"Cancelling {len(tasks)} remaining tasks...")
+                    for task in tasks:
                         task.cancel()
-                    
-                    print("DEBUG: Gathering cancelled tasks with timeout")
-                    try:
-                        loop.run_until_complete(
-                            asyncio.wait_for(
-                                asyncio.gather(*pending, return_exceptions=True), 
-                                timeout=5.0
-                            )
-                        )
-                        print("DEBUG: Successfully gathered cancelled tasks")
-                    except asyncio.TimeoutError:
-                        print("DEBUG: Timeout waiting for cancelled tasks, forcing cleanup")
-                    except Exception as e:
-                        print(f"DEBUG: Exception during task cleanup: {e}")
-                
-                print("DEBUG: Closing event loop")
-                loop.close()
-                print("DEBUG: Event loop closed")
-            
-            print("DEBUG: asyncio.run completed, responses received")
-            print(f"DEBUG: Type of responses: {type(responses)}")
-            print(f"DEBUG: Length of responses: {len(responses) if responses else 'None'}")
+                    # Gather with return_exceptions=True to suppress logging worker errors
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    print("Task cleanup completed")
 
+        try:
+            print(f"Entering async batch batch_json_complete...")
+            responses = asyncio.run(_async_batch_with_cleanup())
+            print(f"Async batch completed, received {len(responses)} responses")
             print(f"Generated {len(responses)} LLM extractions, now processing results...")
-            print(f"DEBUG: Starting to process {len(responses)} responses")
             
             # Process batch responses
-            for idx, (profile, response) in enumerate(zip(uncached_profiles, responses)):
-                print(f"DEBUG: Processing response {idx + 1}/{len(responses)} for profile {profile.id}")
+            for profile, response in zip(uncached_profiles, responses):
                 try:
                     if isinstance(response, Exception):
                         raise response
                     
                     # Validate and truncate sections
-                    print(f"DEBUG: Validating and truncating sections for profile {profile.id}")
                     processed_sections = {}
                     for section_name, config in sections_config['sections'].items():
-                        print(f"DEBUG: Processing section '{section_name}' for profile {profile.id}")
                         raw_content = response.get(section_name, "Not specified")
                         max_words = config['max_words']
                         truncated_content = truncate_words(str(raw_content), max_words)
                         processed_sections[section_name] = truncated_content
                     
-                    print(f"DEBUG: Creating ExtractedSections object for profile {profile.id}")
                     sections = ExtractedSections(
                         id=profile.id,
                         sections=processed_sections,
@@ -209,14 +182,12 @@ def extract_sections_from_profiles(
                     extracted_sections.append(sections)
                     
                     # Prepare for saving
-                    print(f"DEBUG: Preparing data for saving for profile {profile.id}")
                     section_data = {
                         'id': profile.id,
                         'sections': processed_sections,
                         'hash': profile.hash
                     }
                     new_sections_data.append(section_data)
-                    print(f"DEBUG: Completed processing profile {profile.id}")
                     
                 except Exception as e:
                     print(f"Error processing response for {profile.id}: {e}")
@@ -232,7 +203,6 @@ def extract_sections_from_profiles(
                     )
                     extracted_sections.append(sections)
 
-            print(f"DEBUG: Finished processing loop, extracted_sections length: {len(extracted_sections)}")
             print(f"Done processing {len(extracted_sections)} LLM extractions")
                     
         except Exception as e:
@@ -251,10 +221,8 @@ def extract_sections_from_profiles(
                 extracted_sections.append(sections)
     
     # Save sections (overwrite if force, append otherwise)
-    print("DEBUG: Starting save process")
     print("Saving...")
     if new_sections_data:
-        print(f"DEBUG: Saving {len(new_sections_data)} new sections")
         if force or not sections_file.exists():
             # Create new file or overwrite existing
             save_jsonl(new_sections_data, sections_file)

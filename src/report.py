@@ -81,8 +81,16 @@ def generate_user_report(
                 "**Conversation Starters:**"
             ])
             
-            for topic in match.starter_topics:
-                lines.append(f"- {topic}")
+            # Parse starter topics from string format
+            if isinstance(match.starter_topics, str):
+                # Split on bullet points and clean up
+                topics = [topic.strip() for topic in match.starter_topics.split('•') if topic.strip()]
+                for topic in topics:
+                    lines.append(f"- {topic}")
+            else:
+                # Handle case where it's already a list
+                for topic in match.starter_topics:
+                    lines.append(f"- {topic}")
             
             lines.append("")  # Empty line between matches
     
@@ -191,7 +199,7 @@ def generate_all_reports(
         all_edges: All final edges
         extracted_sections: All user sections
         outputs_dir: Output directory
-        top_matches_per_user: Number of matches per user report
+        top_matches_per_user: Maximum matches per user (from b_max parameter)
     """
     outputs_path = ensure_dir(outputs_dir)
     

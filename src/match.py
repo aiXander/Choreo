@@ -6,7 +6,6 @@ from collections import defaultdict
 
 from candidate import CandidatePair
 from score import PairScore
-from utils import save_jsonl, ensure_dir
 
 
 @dataclass
@@ -198,8 +197,7 @@ def create_matches(
     llm_scores: Dict[str, PairScore],
     all_user_ids: List[str],
     matching_config: Dict,
-    blending_config: Dict,
-    graphs_dir: str
+    blending_config: Dict
 ) -> List[Edge]:
     """
     Full pipeline to create final matches.
@@ -210,7 +208,6 @@ def create_matches(
         all_user_ids: All user IDs in the system
         matching_config: Matching configuration (b_min, b_max)
         blending_config: Blending configuration (weights)
-        graphs_dir: Directory to save final edges
         
     Returns:
         Final selected edges
@@ -232,14 +229,5 @@ def create_matches(
         b_max=matching_config['b_max'],
         all_users=set(all_user_ids)
     )
-    
-    # Save edges to file
-    graphs_path = ensure_dir(graphs_dir)
-    edges_file = graphs_path / "edges.jsonl"
-    
-    edges_data = [edge.to_dict() for edge in selected_edges]
-    save_jsonl(edges_data, edges_file)
-    
-    print(f"Saved {len(selected_edges)} edges to {edges_file}")
     
     return selected_edges

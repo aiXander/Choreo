@@ -11,6 +11,10 @@ from litellm import completion, acompletion
 from utils import get_cache_path, load_json, save_json, ensure_dir
 from cost_tracker import get_cost_tracker
 
+# Disable litellm's background logging to prevent event loop conflicts
+litellm.suppress_debug_info = True
+litellm.set_verbose = False
+
 
 class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
@@ -258,7 +262,6 @@ class LLMWrapper:
             batch_indices = uncached_indices[batch_start:batch_end]
             
             print(f"Processing batch {batch_start//batch_size + 1}: items {batch_start + 1}-{batch_end} of {len(uncached_indices)} uncached")
-            print(f"DEBUG: Creating {len(batch_indices)} tasks for batch {batch_start//batch_size + 1}")
             
             # Create tasks for this batch
             tasks = []
@@ -267,7 +270,6 @@ class LLMWrapper:
                 cache_key = cache_keys[i]
                 schema_hint = schema_hints[i]
                 
-                print(f"DEBUG: Creating task for item {i + 1}")
                 task = asyncio.create_task(self._async_json_complete_with_retry(
                     prompt=prompt,
                     model=model,
@@ -278,20 +280,16 @@ class LLMWrapper:
                 ))
                 tasks.append(task)
             
-            print(f"DEBUG: Starting execution of {len(tasks)} tasks with asyncio.gather")
             # Execute batch
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            print(f"DEBUG: Received {len(batch_results)} results from batch")
             
-            # Store results
+            # Store results, handling exceptions
             for i, result in zip(batch_indices, batch_results):
                 if isinstance(result, Exception):
-                    print(f"DEBUG: Task {i + 1} returned exception: {result}")
+                    print(f"Task failed for prompt {i}: {result}")
+                    results[i] = result  # Keep exception in results for caller to handle
                 else:
-                    print(f"DEBUG: Task {i + 1} completed successfully")
-                results[i] = result
-            
-            print(f"DEBUG: Completed batch {batch_start//batch_size + 1}")
+                    results[i] = result
         
         print(f"Completed processing all {n_prompts} prompts")
         return results
@@ -306,18 +304,24 @@ class LLMWrapper:
         retry_delay_base: float = 1.0
     ) -> Dict[str, Any]:
         """Single async JSON completion with retry logic."""
-        print(f"DEBUG: Starting async completion for cache_key: {cache_key}")
+        # Check cache first
+        if cache_key:
+            cache_path = get_cache_path(self.cache_dir, cache_key)
+            if cache_path.exists():
+                try:
+                    return load_json(cache_path)
+                except Exception as e:
+                    print(f"Warning: Failed to load cache {cache_path}: {e}")
+        
         json_prompt = self._prepare_json_prompt(prompt, schema_hint)
         
         for attempt in range(max_retries + 1):
             try:
-                print(f"DEBUG: Making acompletion call (attempt {attempt + 1}) for cache_key: {cache_key}")
                 # Make async LLM call
                 response = await acompletion(
                     model=model,
                     messages=[{"role": "user", "content": json_prompt}]
                 )
-                print(f"DEBUG: Received response from acompletion for cache_key: {cache_key}")
                 
                 # Track cost
                 try:
@@ -338,29 +342,24 @@ class LLMWrapper:
                     print(f"Warning: Could not track cost for async completion call with model {model}")
                 
                 # Extract content
-                print(f"DEBUG: Extracting content from response for cache_key: {cache_key}")
                 content = response.choices[0].message.content
                 if not content:
                     raise ValueError("Empty response from LLM")
                 
                 # Parse JSON
-                print(f"DEBUG: Parsing JSON response for cache_key: {cache_key}")
                 result = self._extract_json(content.strip())
-                print(f"DEBUG: Successfully parsed JSON for cache_key: {cache_key}")
                 
                 # Cache result
                 if cache_key:
                     try:
                         cache_path = get_cache_path(self.cache_dir, cache_key)
                         save_json(result, cache_path)
-                        print(f"DEBUG: Cached result for cache_key: {cache_key}")
                     except Exception as e:
                         print(f"Warning: Failed to save cache {cache_path}: {e}")
                 
                 # Update call count (thread-safe increment)
                 self.call_count += 1
                 
-                print(f"DEBUG: Returning result for cache_key: {cache_key}")
                 return result
                 
             except Exception as e:
