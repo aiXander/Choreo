@@ -1,0 +1,38 @@
+models:
+  embedding: "text-embedding-3-small"     # or bge-small
+  extraction_llm: "gpt-5-mini"
+  pair_llm: "gpt-5-mini"
+
+instruction_prompt:
+  goal: "We are building a social connectivity graph based on user profiles at the start of our community residency. These people do not know each other and we are looking to create introductions and build relationships between them so they can start working on relevant projects together. We are looking to find matches that are aligned on interests, goals and skills revolving around the topic of inclusive community building, agentic AI and digital creativity."
+
+budgets:
+  extraction_llm_calls: 100   # max = n_profiles (all sections extracted in same call)
+  max_pair_llm_calls:   300   # small multiple of n_profiles
+  max_n_llm_evaluations_per_profile: 10    # max number of LLM evaluations per profile
+
+recipe:
+  instruction: "Score this match based on alignment: shared interests and goals but complementary skills"
+  section_weights:          # Make sure these match the section names in section_prompt.yaml !!!
+    capabilities: -0.20     # negative weight for inverse scoring (different = good)
+    interests:     0.40
+    goals:         0.30
+    persona:       0.10
+
+blending:  # final = w*embed + (1-w)*llm_score
+  embed_weight: 0.6         
+  llm_weight:   0.4
+
+matching:
+  b_min: 2
+  b_max: 4
+
+report:
+  top_matches_per_user: 5
+
+io:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  embeds_dir: "data/embeds"
+  outputs_dir: "data/outputs"
+  cache_dir: "data/cache"

@@ -1,0 +1,27 @@
+sections:
+  capabilities:
+    guideline: "Extract the concrete skills, tools, and resources this person can contribute to others and the group. Use action-oriented, specific terms (e.g., Python, fundraising, facilitation, woodworking, video editing)."
+    max_words: 80
+  interests:
+    guideline: "Extract the main topics, themes, and domains this person is curious about, follows, or enjoys discussing—regardless of expertise."
+    max_words: 80
+  goals:
+    guideline: "Summarize this person's current projects and near- to mid-term goals. Capture what they are building, seeking, or aiming toward. What drives them?"
+    max_words: 80
+  persona:
+    guideline: "Capture broader psychological, contextual, and human factors about this person not captured in the previous sections: personality traits, collaboration tendencies, values, cultural background, location/timezone, logistical constraints, quirks, or personal trivia that are relevant for the goal."
+    max_words: 120
+
+sections_prompt: |
+  Context: {goal}
+  
+  Your goal is to extract structured information from the following user profile:
+  <profile>
+  {profile_text}
+  </profile>
+
+  Task: 
+  Extract the following sections:
+  {sections_list}
+
+  Try to be comprehensive but stay within the given word limits. Do not invent / hallucinate any information that wasn't actually in the profile. If information is missing, extract what you can or use "Not specified" for missing sections.
