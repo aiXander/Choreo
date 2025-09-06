@@ -24,8 +24,8 @@ blending:  # final = w*embed + (1-w)*llm_score
   llm_weight:   0.5
 
 matching:
-  b_min: 2
-  b_max: 4
+  b_min: 3
+  b_max: 3
 
 io:
   raw_dir: "data/raw"
