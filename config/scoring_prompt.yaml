@@ -1,23 +1,12 @@
 pair_scoring: |
   Context: {goal}
   
-  Your task is to analyze the value of a conversation / introduction / collaboration between {user_a_name} and {user_b_name} given the above context and the following instruction:
+  Your task is to analyze and score multiple potential user pairs for conversation / introduction / collaboration given the above context and the following instruction:
   "{instruction}"
 
-  You will generate a 'score' that reflects how valuable this match would be based on the context and instruction above. A score of 1.0 indicates a perfect match, while 0.0 indicates no particular value. Don't be afraid to give a score lower than 0.5 if the match is not particularly valuable, there are many other candidates in the group.
-  Additionally, you will generate an open-ended introduction for the match which {user_a_name} can use to introduce themselves to {user_b_name}.
-  Finally, you will generate a short bullet point list of 1-5 starter topics that would be interesting to discuss by these two people, given the context and instruction above.
+  You will generate a 'score' for each user pair that reflects how valuable this match would be based on the context and instruction above. A score of 1.0 indicates a perfect match, while 0.0 indicates no particular value. Don't be afraid to give scores lower than 0.5 if matches are not particularly valuable, there are many other candidates in the group.
 
-  Here are the two user profiles:
-  <profiles>
-  {user1_text}
-  ---
-  {user2_text}
-  </profiles>
+  {user_profiles_xml_formatted}
 
-  Return compact JSON:
-  {{{{
-    "score": 0..1,
-    "intro": "Introduction from {user_a_name} to {user_b_name}",
-    "starter_topics": "• topic1 • topic2 • topic3 ..."
-  }}}}
+  Return compact JSON with scores for all pairs:
+  {json_format_hint}

@@ -138,3 +138,173 @@ def generate_json_structure_from_sections(sections_config: Dict[str, Any]) -> st
 def get_section_names_list(sections_config: Dict[str, Any]) -> List[str]:
     """Get ordered list of section names from sections config."""
     return list(sections_config['sections'].keys())
+
+
+def normalize_scores_with_reference_distribution(
+    reference_scores: np.ndarray,
+    target_scores: np.ndarray,
+    selected_reference_scores: np.ndarray
+) -> np.ndarray:
+    """
+    Normalize target scores using reference distribution as the baseline.
+    
+    This function implements a statistically principled score normalization:
+    1. Normalize reference scores to 0-1 range
+    2. Find the range that selected reference scores occupy in normalized space
+    3. Map target scores to occupy the same range as selected reference scores
+    
+    Args:
+        reference_scores: Full distribution of reference scores (e.g., all matrix scores)
+        target_scores: Scores to be normalized (e.g., LLM scores)
+        selected_reference_scores: Subset of reference scores that correspond to target scores
+        
+    Returns:
+        Normalized target scores mapped to the same range as selected reference scores
+    """
+    # Step 1: Normalize reference scores to 0-1
+    ref_min, ref_max = reference_scores.min(), reference_scores.max()
+    if ref_max == ref_min:
+        # Handle edge case where all reference scores are identical
+        return np.full_like(target_scores, 0.5)
+    
+    # Step 2: Find range of selected reference scores in normalized space
+    selected_normalized = (selected_reference_scores - ref_min) / (ref_max - ref_min)
+    selected_min, selected_max = selected_normalized.min(), selected_normalized.max()
+    
+    # Step 3: Map target scores to occupy the same range as selected reference scores
+    target_min, target_max = target_scores.min(), target_scores.max()
+    if target_max == target_min:
+        # Handle edge case where all target scores are identical
+        target_normalized = np.full_like(target_scores, (selected_min + selected_max) / 2)
+    else:
+        # Linear mapping: target_scores [target_min, target_max] -> [selected_min, selected_max]
+        target_normalized = selected_min + (target_scores - target_min) / (target_max - target_min) * (selected_max - selected_min)
+    
+    return target_normalized
+
+
+def get_score_normalization_stats(
+    reference_scores: np.ndarray,
+    target_scores: np.ndarray,
+    selected_reference_scores: np.ndarray,
+    normalized_target_scores: np.ndarray
+) -> Dict[str, Any]:
+    """
+    Get statistics about the score normalization process for debugging/analysis.
+    
+    Returns:
+        Dictionary with normalization statistics
+    """
+    ref_min, ref_max = reference_scores.min(), reference_scores.max()
+    selected_normalized = (selected_reference_scores - ref_min) / (ref_max - ref_min)
+    
+    return {
+        'reference_range': (float(ref_min), float(ref_max)),
+        'reference_normalized_range': (0.0, 1.0),
+        'selected_reference_range': (float(selected_reference_scores.min()), float(selected_reference_scores.max())),
+        'selected_normalized_range': (float(selected_normalized.min()), float(selected_normalized.max())),
+        'target_original_range': (float(target_scores.min()), float(target_scores.max())),
+        'target_normalized_range': (float(normalized_target_scores.min()), float(normalized_target_scores.max())),
+        'n_reference_scores': len(reference_scores),
+        'n_selected_scores': len(selected_reference_scores),
+        'n_target_scores': len(target_scores)
+    }
+
+
+def prepare_normalized_scores(
+    candidates: List,  # List[CandidatePair] - avoiding import here
+    llm_scores: Dict[str, Any],  # Dict[str, PairScore] - avoiding import here
+    full_similarity_matrix: np.ndarray = None,
+    all_user_ids: List[str] = None
+) -> Tuple[Dict[str, float], Dict[str, float], bool]:
+    """
+    Prepare normalized embedding and LLM scores for final weight computation.
+    
+    Args:
+        candidates: All candidate pairs
+        llm_scores: LLM scores by pair_id
+        full_similarity_matrix: Full similarity matrix for reference distribution (optional)
+        all_user_ids: All user IDs corresponding to similarity matrix (optional)
+        
+    Returns:
+        Tuple of (normalized_embed_lookup, normalized_llm_lookup, normalization_applied)
+    """
+    # Check if we can apply normalization
+    should_normalize = (
+        full_similarity_matrix is not None and 
+        all_user_ids is not None and 
+        len(llm_scores) > 0
+    )
+    
+    normalized_embed_lookup = {}
+    normalized_llm_lookup = {}
+    
+    if not should_normalize:
+        # Return original scores without normalization
+        for candidate in candidates:
+            normalized_embed_lookup[candidate.pair_id] = candidate.similarity_score
+            if candidate.pair_id in llm_scores:
+                normalized_llm_lookup[candidate.pair_id] = llm_scores[candidate.pair_id].score
+        return normalized_embed_lookup, normalized_llm_lookup, False
+    
+    print("Applying reference distribution normalization...")
+    
+    # Extract all scores from full similarity matrix (upper triangle only)
+    n_users = len(all_user_ids)
+    all_matrix_scores = []
+    for i in range(n_users):
+        for j in range(i + 1, n_users):
+            all_matrix_scores.append(full_similarity_matrix[i, j])
+    all_matrix_scores = np.array(all_matrix_scores)
+    
+    # Get reference range
+    ref_min, ref_max = all_matrix_scores.min(), all_matrix_scores.max()
+    
+    if ref_max <= ref_min:
+        print("Warning: All matrix scores identical, skipping normalization")
+        # Fallback to original scores
+        for candidate in candidates:
+            normalized_embed_lookup[candidate.pair_id] = candidate.similarity_score
+            if candidate.pair_id in llm_scores:
+                normalized_llm_lookup[candidate.pair_id] = llm_scores[candidate.pair_id].score
+        return normalized_embed_lookup, normalized_llm_lookup, False
+    
+    # Normalize all embedding scores to 0-1
+    for candidate in candidates:
+        embed_score_normalized = (candidate.similarity_score - ref_min) / (ref_max - ref_min)
+        normalized_embed_lookup[candidate.pair_id] = embed_score_normalized
+    
+    # Process LLM scores if available
+    if llm_scores:
+        # Extract embedding and LLM scores for candidates that have both
+        candidates_with_llm = [c for c in candidates if c.pair_id in llm_scores]
+        
+        if candidates_with_llm:
+            selected_embed_scores = np.array([c.similarity_score for c in candidates_with_llm])
+            actual_llm_scores = np.array([llm_scores[c.pair_id].score for c in candidates_with_llm])
+            
+            # Normalize LLM scores to match the selected embedding score range
+            normalized_llm_scores = normalize_scores_with_reference_distribution(
+                reference_scores=all_matrix_scores,
+                target_scores=actual_llm_scores,
+                selected_reference_scores=selected_embed_scores
+            )
+            
+            # Create lookup for normalized LLM scores
+            for candidate, norm_llm_score in zip(candidates_with_llm, normalized_llm_scores):
+                normalized_llm_lookup[candidate.pair_id] = float(norm_llm_score)
+            
+            # Print normalization statistics
+            stats = get_score_normalization_stats(
+                reference_scores=all_matrix_scores,
+                target_scores=actual_llm_scores,
+                selected_reference_scores=selected_embed_scores,
+                normalized_target_scores=normalized_llm_scores
+            )
+            print(f"📊 Score normalization stats:")
+            print(f"   Matrix range: [{stats['reference_range'][0]:.3f}, {stats['reference_range'][1]:.3f}]")
+            print(f"   Selected matrix range (normalized): [{stats['selected_normalized_range'][0]:.3f}, {stats['selected_normalized_range'][1]:.3f}]")
+            print(f"   LLM original range: [{stats['target_original_range'][0]:.3f}, {stats['target_original_range'][1]:.3f}]")
+            print(f"   LLM normalized range: [{stats['target_normalized_range'][0]:.3f}, {stats['target_normalized_range'][1]:.3f}]")
+    
+    return normalized_embed_lookup, normalized_llm_lookup, True

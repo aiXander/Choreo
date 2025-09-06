@@ -206,9 +206,10 @@ class LLMWrapper:
         model: str,
         cache_keys: Optional[List[Optional[str]]] = None,
         schema_hints: Optional[List[Optional[str]]] = None,
-        batch_size: int = 16,
+        batch_size: int = 8,
         max_retries: int = 3,
-        retry_delay_base: float = 1.0
+        retry_delay_base: float = 1.0,
+        verbosity: int = 0
     ) -> List[Dict[str, Any]]:
         """
         Process multiple prompts in parallel batches with rate limit retry handling.
@@ -276,7 +277,8 @@ class LLMWrapper:
                     cache_key=cache_key,
                     schema_hint=schema_hint,
                     max_retries=max_retries,
-                    retry_delay_base=retry_delay_base
+                    retry_delay_base=retry_delay_base,
+                    verbosity=verbosity
                 ))
                 tasks.append(task)
             
@@ -301,7 +303,8 @@ class LLMWrapper:
         cache_key: Optional[str] = None,
         schema_hint: Optional[str] = None,
         max_retries: int = 3,
-        retry_delay_base: float = 1.0
+        retry_delay_base: float = 1.0,
+        verbosity: int = 0
     ) -> Dict[str, Any]:
         """Single async JSON completion with retry logic."""
         # Check cache first
@@ -317,7 +320,11 @@ class LLMWrapper:
         
         for attempt in range(max_retries + 1):
             try:
-                # Make async LLM call
+                if verbosity > 1:
+                    print("-----------------------------------------------------------")
+                    print(f"Calling LLM {model} with prompt:\n{json_prompt}")
+                    print("-----------------------------------------------------------")
+
                 response = await acompletion(
                     model=model,
                     messages=[{"role": "user", "content": json_prompt}]

@@ -1,11 +1,13 @@
 """Greedy b-matching algorithm to create final matches."""
 
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
+import numpy as np
 
 from candidate import CandidatePair
 from score import PairScore
+from utils import prepare_normalized_scores
 
 
 @dataclass
@@ -17,8 +19,8 @@ class Edge:
     final_weight: float
     embed_score: float
     llm_score: float
-    intro: str
-    starter_topics: str
+    intro: str = ""
+    starter_topics: str = ""
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
@@ -38,54 +40,62 @@ def compute_final_weights(
     candidates: List[CandidatePair],
     llm_scores: Dict[str, PairScore],
     embed_weight: float,
-    llm_weight: float
+    llm_weight: float,
+    full_similarity_matrix: np.ndarray = None,
+    all_user_ids: List[str] = None
 ) -> List[Edge]:
     """
-    Compute final weights blending embedding and LLM scores.
+    Compute final weights blending embedding and LLM scores with proper normalization.
     
     Args:
         candidates: All candidate pairs
         llm_scores: LLM scores by pair_id
         embed_weight: Weight for embedding score in final blend
         llm_weight: Weight for LLM score in final blend
+        full_similarity_matrix: Full similarity matrix for reference distribution (optional)
+        all_user_ids: All user IDs corresponding to similarity matrix (optional)
         
     Returns:
         List of Edge objects with final weights
     """
+    # Get normalized scores using reference distribution
+    normalized_embed_lookup, normalized_llm_lookup, normalization_applied = prepare_normalized_scores(
+        candidates=candidates,
+        llm_scores=llm_scores,
+        full_similarity_matrix=full_similarity_matrix,
+        all_user_ids=all_user_ids
+    )
+    
     edges = []
     
     for candidate in candidates:
         pair_id = candidate.pair_id
-        embed_score = candidate.similarity_score
+        
+        # Get normalized embedding score
+        embed_score_normalized = normalized_embed_lookup.get(pair_id, candidate.similarity_score)
         
         # Get LLM score if available
         llm_score_obj = llm_scores.get(pair_id)
         
         if llm_score_obj:
-            # Use LLM score
-            llm_score = llm_score_obj.score
-            intro = llm_score_obj.intro
-            starter_topics = llm_score_obj.starter_topics
+            # Get normalized LLM score
+            llm_score_normalized = normalized_llm_lookup.get(pair_id, llm_score_obj.score)
             
-            # Blend scores
-            final_weight = embed_weight * embed_score + llm_weight * llm_score
+            # Blend normalized scores
+            final_weight = embed_weight * embed_score_normalized + llm_weight * llm_score_normalized
+            llm_score_raw = llm_score_obj.score
         else:
             # Use only embedding score
-            llm_score = 0.0
-            intro = f"Suggested match based on profile similarity"
-            starter_topics = "• Discuss shared interests • Talk about goals • Share experiences"
-            
-            final_weight = embed_score  # Only embedding score
+            llm_score_raw = 0.0
+            final_weight = embed_score_normalized  # Only embedding score
         
         edge = Edge(
             user1=candidate.user1,
             user2=candidate.user2,
             pair_id=pair_id,
             final_weight=final_weight,
-            embed_score=embed_score,
-            llm_score=llm_score,
-            intro=intro,
-            starter_topics=starter_topics
+            embed_score=candidate.similarity_score,  # Keep original for reference
+            llm_score=llm_score_raw  # Keep original for reference
         )
         edges.append(edge)
     
@@ -197,8 +207,9 @@ def create_matches(
     llm_scores: Dict[str, PairScore],
     all_user_ids: List[str],
     matching_config: Dict,
-    blending_config: Dict
-) -> List[Edge]:
+    blending_config: Dict,
+    similarity_matrix: np.ndarray = None
+) -> Tuple[List[Edge], Dict[str, float], Dict[str, float]]:
     """
     Full pipeline to create final matches.
     
@@ -208,16 +219,27 @@ def create_matches(
         all_user_ids: All user IDs in the system
         matching_config: Matching configuration (b_min, b_max)
         blending_config: Blending configuration (weights)
+        similarity_matrix: Full similarity matrix for normalization (optional)
         
     Returns:
-        Final selected edges
+        Tuple of (final_edges, normalized_embed_scores, normalized_llm_scores)
     """
-    # Compute final weights
+    # Get normalized scores for plotting
+    normalized_embed_lookup, normalized_llm_lookup, _ = prepare_normalized_scores(
+        candidates=candidates,
+        llm_scores=llm_scores,
+        full_similarity_matrix=similarity_matrix,
+        all_user_ids=all_user_ids
+    )
+    
+    # Compute final weights with normalization
     edges = compute_final_weights(
         candidates=candidates,
         llm_scores=llm_scores,
         embed_weight=blending_config['embed_weight'],
-        llm_weight=blending_config['llm_weight']
+        llm_weight=blending_config['llm_weight'],
+        full_similarity_matrix=similarity_matrix,
+        all_user_ids=all_user_ids
     )
     
     print(f"Computed final weights for {len(edges)} edges")
@@ -230,4 +252,4 @@ def create_matches(
         all_users=set(all_user_ids)
     )
     
-    return selected_edges
+    return selected_edges, normalized_embed_lookup, normalized_llm_lookup

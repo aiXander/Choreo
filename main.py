@@ -8,6 +8,7 @@ print(f"Starting!")
 
 import os
 import sys
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -22,7 +23,9 @@ from extract import extract_sections_from_profiles
 from embed import create_section_embeddings
 from candidate import generate_similarity_matrix, CandidatePair
 from score import score_pairs_with_llm, create_sections_dict
+from score_correlation import create_normalized_score_correlation_plot, create_normalized_detailed_score_analysis
 from match import create_matches
+from introduction import generate_introductions_for_matches
 from report import generate_all_reports
 from cost_tracker import get_cost_tracker
 from visualize_similarity import create_similarity_plots
@@ -52,6 +55,7 @@ def main(group_name: str = None, force: bool = False):
         config['io']['cache_dir'] = f"{base_data_dir}/cache"
     sections_config_path = "config/section_prompt.yaml"
     prompts_config_path = "config/scoring_prompt.yaml"
+    introduction_config_path = "config/introduction_prompt.yaml"
     
     # Initialize LLM wrapper
     llm_wrapper = LLMWrapper(cache_dir=config['io']['cache_dir'])
@@ -137,9 +141,13 @@ def main(group_name: str = None, force: bool = False):
             model=config['models']['pair_llm'],
             max_n_llm_evaluations_per_profile=config['budgets']['max_n_llm_evaluations_per_profile'],
             global_cap=config['budgets']['max_pair_llm_calls'],
+            n_profiles_to_score_together=config['budgets']['n_profiles_to_score_together'],
             force=force
         )
         print(f"✅ Scored {len(llm_scores)} pairs with LLM")
+        
+        # Note: Score correlation plots are now generated after matching to show normalized scores
+        
     except Exception as e:
         print(f"❌ Error scoring pairs: {e}")
         return 1
@@ -152,19 +160,73 @@ def main(group_name: str = None, force: bool = False):
             for score in llm_scores.values()
         ]
         
-        final_edges = create_matches(
+        final_edges, normalized_embed_scores, normalized_llm_scores = create_matches(
             candidates=scored_candidates,
             llm_scores=llm_scores,
             all_user_ids=user_ids_sorted,
             matching_config=config['matching'],
-            blending_config=config['blending']
+            blending_config=config['blending'],
+            similarity_matrix=similarity_matrix
         )
         print(f"✅ Created {len(final_edges)} final matches")
+        
+        # Generate score correlation visualization with normalized scores
+        
+        if normalized_embed_scores and normalized_llm_scores:
+            try:
+                correlation_plot_path = create_normalized_score_correlation_plot(
+                    normalized_embed_scores=normalized_embed_scores,
+                    normalized_llm_scores=normalized_llm_scores,
+                    output_dir=config['io']['outputs_dir'],
+                    group_name=group_name
+                )
+                detailed_plot_path = create_normalized_detailed_score_analysis(
+                    normalized_embed_scores=normalized_embed_scores,
+                    normalized_llm_scores=normalized_llm_scores,
+                    output_dir=config['io']['outputs_dir'],
+                    group_name=group_name
+                )
+                print(f"✅ Generated score correlation plots")
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to generate correlation plots: {e}")
+        else:
+            print("⚠️ Skipping correlation plots: normalized scores not available")
+        
     except Exception as e:
         print(f"❌ Error creating matches: {e}")
         return 1
     
-    print("\n📝 Step 7: Generating reports...")
+    print("\n💬 Step 7: Generating introductions for matches...")
+    try:
+        introductions = generate_introductions_for_matches(
+            final_edges=final_edges,
+            sections_dict=sections_dict,
+            instruction=instruction,
+            goal=goal,
+            introduction_config_path=introduction_config_path,
+            llm_wrapper=llm_wrapper,
+            model=config['models']['pair_llm'],
+            force=force
+        )
+        
+        # Update edges with introduction data
+        introduction_lookup = {intro.pair_id: intro for intro in introductions.values()}
+        for edge in final_edges:
+            if edge.pair_id in introduction_lookup:
+                intro_obj = introduction_lookup[edge.pair_id]
+                edge.intro = intro_obj.intro
+                edge.starter_topics = intro_obj.starter_topics
+            else:
+                # Fallback intro if generation failed
+                edge.intro = f"Hi {edge.user2}! I'm {edge.user1}. Looking forward to connecting with you."
+                edge.starter_topics = "• Share your background • Discuss common interests • Talk about your goals"
+        
+        print(f"✅ Generated introductions for {len(introductions)} matches")
+    except Exception as e:
+        print(f"❌ Error generating introductions: {e}")
+        return 1
+    
+    print("\n📝 Step 8: Generating reports...")
     try:
         generate_all_reports(
             all_edges=final_edges,
@@ -189,7 +251,7 @@ def main(group_name: str = None, force: bool = False):
     cost_report_path = Path(config['io']['outputs_dir']) / "cost_report.json"
     cost_tracker.save_detailed_report(str(cost_report_path))
     
-    print("\n🎨 Step 8: Creating similarity visualizations...")
+    print("\n🎨 Step 9: Creating similarity visualizations...")
     try:
         plots_results = create_similarity_plots(
             matrices_dict=matrices_dict,

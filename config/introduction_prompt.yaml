@@ -1,0 +1,22 @@
+introduction_generation: |
+  Context: {goal}
+  
+  Your task is to generate personalized introductions and conversation starters for a matched pair of users given the above context and the following instruction:
+  "{instruction}"
+
+  This pair has already been identified as a good match. Now you need to create:
+  1. An concise, open-ended introduction that {user_a_name} can use to introduce themselves to {user_b_name}
+  2. A short bullet point list of 1-5 starter topics that would be interesting for these two people to start a conversation about
+
+  Here are the two user profiles:
+  <profiles>
+  {user1_text}
+  ---
+  {user2_text}
+  </profiles>
+
+  Return compact JSON:
+  {{
+    "intro": "Introduction from {user_a_name} to {user_b_name}",
+    "starter_topics": "• topic1 • topic2 • topic3 ..."
+  }}
