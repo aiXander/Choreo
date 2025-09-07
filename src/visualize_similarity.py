@@ -7,7 +7,6 @@ Creates individual section plots and a combined visualization.
 import os
 import sys
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 from dotenv import load_dotenv
 import argparse
@@ -31,6 +30,9 @@ def create_similarity_plots(
 ):
     """Create and save similarity matrix visualizations using precomputed matrices."""
     
+    # Lazy import for matplotlib
+    import matplotlib.pyplot as plt
+    
     # Create output directory
     plots_dir = Path(output_dir) / "plots"
     ensure_dir(plots_dir)
@@ -39,8 +41,6 @@ def create_similarity_plots(
     section_matrices = matrices_dict['section_matrices']
     section_weights = matrices_dict['section_weights']
     combined_matrix = matrices_dict['combined_matrix']
-    
-    print("Creating individual section similarity plots...")
     
     # Create individual plots for each section
     for section_name, similarity_matrix in section_matrices.items():
@@ -64,9 +64,6 @@ def create_similarity_plots(
         print(f"Saved {section_name} similarity plot: {plot_path}")
     
     # Create individual combined plot
-    print("Creating combined similarity plot...")
-    
-    # Create individual combined plot
     plt.figure(figsize=(10, 10))  # Square figure
     plt.imshow(combined_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')  # Equal aspect ratio
     plt.colorbar(label='Combined Similarity Score')
@@ -84,10 +81,8 @@ def create_similarity_plots(
     combined_path = plots_dir / 'combined_similarity.png'
     plt.savefig(combined_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Saved combined similarity plot: {combined_path}")
     
     # Create final combined visualization
-    print("Creating final combined visualization...")
     n_sections = len(section_matrices)
     grid_cols = 2
     grid_rows = (n_sections + 1) // 2  # +1 for ceiling division
@@ -145,95 +140,3 @@ def create_similarity_plots(
         'combined_matrix': combined_matrix,
         'plots_dir': plots_dir
     }
-
-
-def main(group_name: str = None, force: bool = False):
-    """Main function to generate similarity visualizations."""
-    
-    load_dotenv()
-    
-    print("🎨 Starting similarity matrix visualization...")
-    
-    # Load configurations
-    config = load_yaml("config/config.yaml")
-    
-    # Update paths for group-specific data if group_name provided
-    if group_name:
-        print(f"📁 Using group-specific data: {group_name}")
-        base_data_dir = f"data/{group_name}"
-        config['io']['raw_dir'] = f"{base_data_dir}/raw"
-        config['io']['processed_dir'] = f"{base_data_dir}/processed"
-        config['io']['embeds_dir'] = f"{base_data_dir}/embeds"
-        config['io']['outputs_dir'] = f"{base_data_dir}/outputs"
-        config['io']['cache_dir'] = f"{base_data_dir}/cache"
-    
-    sections_config_path = "config/section_prompt.yaml"
-    
-    # Initialize LLM wrapper
-    llm_wrapper = LLMWrapper(cache_dir=config['io']['cache_dir'])
-    
-    print("\n📁 Step 1: Loading profiles...")
-    profiles = load_profiles(config['io']['raw_dir'])
-    print(f"✅ Loaded {len(profiles)} profiles")
-    
-    print("\n🧠 Step 2: Loading/extracting sections...")
-    try:
-        goal = config['instruction_prompt']['goal']
-        extracted_sections = extract_sections_from_profiles(
-            profiles=profiles,
-            sections_config_path=sections_config_path,
-            model=config['models']['extraction_llm'],
-            llm_wrapper=llm_wrapper,
-            processed_dir=config['io']['processed_dir'],
-            budgets=config['budgets'],
-            goal=goal,
-            force=force
-        )
-        print(f"✅ Loaded sections for {len(extracted_sections)} profiles")
-    except Exception as e:
-        print(f"❌ Error loading sections: {e}")
-        return 1
-    
-    print("\n🔢 Step 3: Loading/creating embeddings...")
-    user_ids, section_names, embeddings = create_section_embeddings(
-        extracted_sections=extracted_sections,
-        embedding_model=config['models']['embedding'],
-        embeds_dir=config['io']['embeds_dir'],
-        force=force
-    )
-    print(f"✅ Loaded embeddings: {embeddings.shape}")
-    
-    print("\n🎨 Step 4: Creating similarity visualizations...")
-    
-    # Generate similarity matrices using the same logic as main pipeline
-    _, user_ids_sorted, matrices_dict = generate_similarity_matrix(
-        embeddings=embeddings,
-        user_ids=user_ids,
-        section_names=section_names,
-        recipe_config=config['recipe']
-    )
-    
-    results = create_similarity_plots(
-        matrices_dict=matrices_dict,
-        user_ids=user_ids_sorted,
-        recipe_config=config['recipe'],
-        output_dir=config['io']['outputs_dir'],
-        group_name=group_name
-    )
-    
-    print(f"\n🎉 Visualization completed successfully!")
-    print(f"📁 Plots saved to: {results['plots_dir']}")
-    print(f"📊 Section matrices: {len(results['section_matrices'])} plots")
-    print(f"📈 Combined matrix shape: {results['combined_matrix'].shape}")
-    
-    return 0
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visualize similarity matrices")
-    parser.add_argument("--group", type=str, help="Group name for data organization")
-    parser.add_argument("--force", action="store_true", help="Force re-run all steps")
-    
-    args = parser.parse_args()
-    exit_code = main(group_name=args.group, force=args.force)
-    sys.exit(exit_code)

@@ -1,10 +1,8 @@
 """Create correlation visualization between embedding scores and LLM scores."""
 
-import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
-from scipy import stats
 
 from score import PairScore
 from utils import ensure_dir
@@ -28,6 +26,10 @@ def create_normalized_score_correlation_plot(
     Returns:
         Path to saved plot file
     """
+    # Lazy imports for heavy dependencies
+    import matplotlib.pyplot as plt
+    from scipy import stats
+    
     if not normalized_embed_scores or not normalized_llm_scores:
         print("No normalized scores to plot")
         return ""
@@ -112,11 +114,7 @@ def create_normalized_score_correlation_plot(
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"📊 Saved normalized score correlation plot: {plot_path}")
-    print(f"   Normalized correlation: r = {correlation_coeff:.3f}")
-    print(f"   Normalized R-squared: {r_squared:.3f}")
-    print(f"   Significance: p = {p_value:.4f}")
-    print(f"   Pairs plotted: {len(embed_scores)}")
+    print(f"📊 Saved normalized score correlation plot: {plot_path}.  Pairs plotted: {len(embed_scores)}")
     
     return str(plot_path)
 
@@ -139,6 +137,10 @@ def create_normalized_detailed_score_analysis(
     Returns:
         Path to saved plot file
     """
+    # Lazy imports for heavy dependencies
+    import matplotlib.pyplot as plt
+    from scipy import stats
+    
     if not normalized_embed_scores or not normalized_llm_scores:
         print("No normalized scores to analyze")
         return ""

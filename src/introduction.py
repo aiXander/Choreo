@@ -135,14 +135,11 @@ def generate_introductions_for_matches(
                 return responses
             finally:
                 # Force cleanup of any remaining tasks
-                print("Cleaning up introduction generation async tasks...")
                 tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
                 if tasks:
-                    print(f"Cancelling {len(tasks)} remaining tasks...")
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    print("Introduction generation cleanup completed")
 
         try:
             responses = asyncio.run(_async_generate_with_cleanup())

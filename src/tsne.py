@@ -3,10 +3,6 @@
 import numpy as np
 from pathlib import Path
 from typing import List, Tuple
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from sklearn.metrics.pairwise import cosine_distances
-import seaborn as sns
 
 from utils import ensure_dir
 
@@ -33,6 +29,11 @@ def create_tsne_plots(
     Returns:
         Dictionary with plot paths and metadata
     """
+    # Lazy imports for heavy dependencies
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    import seaborn as sns
+    
     plots_dir = ensure_dir(Path(output_dir) / "plots")
     
     n_users, n_sections, dim = embeddings.shape
@@ -177,6 +178,9 @@ def compute_combined_distances(embeddings: np.ndarray, metric: str = 'cosine') -
     Returns:
         Combined distance matrix of shape (n_users, n_users)
     """
+    # Lazy import for sklearn
+    from sklearn.metrics.pairwise import cosine_distances
+    
     n_users, n_sections, dim = embeddings.shape
     
     # Initialize combined distance matrix
@@ -218,6 +222,10 @@ def visualize_section_relationships(
     Returns:
         Path to the saved plot
     """
+    # Lazy imports for heavy dependencies
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    
     plots_dir = ensure_dir(Path(output_dir) / "plots")
     
     n_users, n_sections, dim = embeddings.shape

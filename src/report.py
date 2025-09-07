@@ -70,11 +70,15 @@ def generate_user_report(
             # Determine the other user
             other_user = match.user2 if match.user1 == user_id else match.user1
             
+            # Use normalized scores if available, otherwise fall back to raw scores
+            embed_display = match.embed_score_normalized if match.embed_score_normalized is not None else match.embed_score
+            llm_display = match.llm_score_normalized if match.llm_score_normalized is not None else match.llm_score
+            
             # Format match information
             lines.extend([
                 f"### {i}. {other_user}",
                 "",
-                f"**Match Score:** {match.final_weight:.3f} (embedding: {match.embed_score:.3f}, LLM: {match.llm_score:.3f})",
+                f"**Match Score:** {match.final_weight:.3f} (embedding: {embed_display:.3f}, LLM: {llm_display:.3f})",
                 "",
                 f"**Introduction:** {match.intro}",
                 "",

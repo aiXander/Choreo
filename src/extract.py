@@ -143,22 +143,15 @@ def extract_sections_from_profiles(
                 )
                 return responses
             finally:
-                # Force cleanup of any remaining tasks (like connection pools from litellm)
-                print("Cleaning up remaining async tasks...")
+                # Force cleanup of any remaining tasks
                 tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
                 if tasks:
-                    print(f"Cancelling {len(tasks)} remaining tasks...")
                     for task in tasks:
                         task.cancel()
-                    # Gather with return_exceptions=True to suppress logging worker errors
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    print("Task cleanup completed")
 
         try:
-            print(f"Entering async batch batch_json_complete...")
             responses = asyncio.run(_async_batch_with_cleanup())
-            print(f"Async batch completed, received {len(responses)} responses")
-            print(f"Generated {len(responses)} LLM extractions, now processing results...")
             
             # Process batch responses
             for profile, response in zip(uncached_profiles, responses):

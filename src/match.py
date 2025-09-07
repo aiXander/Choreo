@@ -19,6 +19,8 @@ class Edge:
     final_weight: float
     embed_score: float
     llm_score: float
+    embed_score_normalized: float = None
+    llm_score_normalized: float = None
     intro: str = ""
     starter_topics: str = ""
     
@@ -31,6 +33,8 @@ class Edge:
             'final_weight': self.final_weight,
             'embed_score': self.embed_score,
             'llm_score': self.llm_score,
+            'embed_score_normalized': self.embed_score_normalized,
+            'llm_score_normalized': self.llm_score_normalized,
             'intro': self.intro,
             'starter_topics': self.starter_topics
         }
@@ -95,7 +99,9 @@ def compute_final_weights(
             pair_id=pair_id,
             final_weight=final_weight,
             embed_score=candidate.similarity_score,  # Keep original for reference
-            llm_score=llm_score_raw  # Keep original for reference
+            llm_score=llm_score_raw,  # Keep original for reference
+            embed_score_normalized=embed_score_normalized,  # Store normalized for display
+            llm_score_normalized=llm_score_normalized if llm_score_obj else 0.0  # Store normalized for display
         )
         edges.append(edge)
     

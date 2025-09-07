@@ -9,7 +9,7 @@ instruction_prompt:
 budgets:
   extraction_llm_calls: 100   # max = n_profiles (all sections extracted in same call)
   max_pair_llm_calls:   300   # small multiple of n_profiles
-  max_n_llm_evaluations_per_profile: 10    # max number of LLM evaluations per profile
+  max_n_llm_evaluations_per_profile: 16    # max number of LLM evaluations per profile
   n_profiles_to_score_together: 4          # number of profiles scored together (generates n*(n-1)/2 pairs per call)
 
 recipe:
@@ -21,8 +21,8 @@ recipe:
     persona:       0.10
 
 blending:  # final = w*embed + (1-w)*llm_score
-  embed_weight: 0.5
-  llm_weight:   0.5
+  embed_weight: 0.4
+  llm_weight:   0.6
 
 matching:
   b_min: 3

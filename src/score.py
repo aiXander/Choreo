@@ -369,19 +369,17 @@ def score_pairs_with_llm(
             responses = await llm_wrapper.batch_json_complete(
                 prompts=group_prompts,
                 model=model,
-                cache_keys=group_cache_keys
+                cache_keys=group_cache_keys,
+                verbosity=2
             )
             return responses
         finally:
             # Force cleanup of any remaining tasks
-            print("Cleaning up batch scoring async tasks...")
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             if tasks:
-                print(f"Cancelling {len(tasks)} remaining tasks...")
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-                print("Batch scoring cleanup completed")
     
     try:
         responses = asyncio.run(_async_score_all_groups())
