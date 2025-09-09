@@ -1,5 +1,5 @@
 models:
-  embedding: "text-embedding-3-small"     # or bge-small
+  embedding: "text-embedding-3-large"
   extraction_llm: "gpt-5-mini"
   pair_llm: "gpt-5-mini"
 
@@ -26,7 +26,7 @@ blending:  # final = w*embed + (1-w)*llm_score
 
 matching:
   b_min: 3
-  b_max: 3
+  b_max: 4
 
 io:
   raw_dir: "data/raw"
