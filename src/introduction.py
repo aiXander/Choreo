@@ -130,6 +130,7 @@ def generate_introductions_for_matches(
                 responses = await llm_wrapper.batch_json_complete(
                     prompts=prompts,
                     model=model,
+                    reasoning_effort="low",
                     cache_keys=cache_keys
                 )
                 return responses

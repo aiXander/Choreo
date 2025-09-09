@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, List, Callable
 import litellm
-from litellm import completion, acompletion
+from litellm import responses, aresponses
 
 from utils import get_cache_path, load_json, save_json, ensure_dir
 from cost_tracker import get_cost_tracker
@@ -30,6 +30,56 @@ class LLMWrapper:
     def set_component(self, component: str):
         """Set the current component for cost tracking."""
         self.current_component = component
+    
+    def _prepare_json_prompt(self, prompt: str, schema_hint: Optional[str]) -> str:
+        """Prepare prompt for JSON output."""
+        json_instruction = "Respond with valid JSON only. No additional text or explanations."
+        
+        if schema_hint:
+            json_instruction += f"\nExpected JSON structure: {schema_hint}"
+        
+        return f"{prompt}\n\n{json_instruction}"
+    
+    def _extract_json(self, response: str) -> Dict[str, Any]:
+        """Extract JSON from response, handling various formats."""
+        response = response.strip()
+        
+        # Try direct JSON parse first
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
+        
+        # Look for JSON within markdown code blocks
+        if "```json" in response:
+            start = response.find("```json") + 7
+            end = response.find("```", start)
+            if end > start:
+                json_str = response[start:end].strip()
+                return json.loads(json_str)
+        
+        # Look for JSON within regular code blocks
+        if "```" in response:
+            start = response.find("```") + 3
+            end = response.find("```", start)
+            if end > start:
+                json_str = response[start:end].strip()
+                return json.loads(json_str)
+        
+        # Look for anything that looks like JSON (starts with { or [)
+        for line in response.split('\n'):
+            line = line.strip()
+            if line.startswith(('{', '[')):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        
+        raise ValueError(f"Could not extract valid JSON from response: {response[:200]}...")
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get usage statistics."""
+        return {"total_calls": self.call_count}
     
     def json_complete(
         self,
@@ -85,15 +135,6 @@ class LLMWrapper:
         
         return result
     
-    def _prepare_json_prompt(self, prompt: str, schema_hint: Optional[str]) -> str:
-        """Prepare prompt for JSON output."""
-        json_instruction = "Respond with valid JSON only. No additional text or explanations."
-        
-        if schema_hint:
-            json_instruction += f"\nExpected JSON structure: {schema_hint}"
-        
-        return f"{prompt}\n\n{json_instruction}"
-    
     def _call_with_retries(
         self,
         model: str,
@@ -113,16 +154,22 @@ class LLMWrapper:
                 self.call_count += 1
                 
                 # Use litellm for unified API
-                response = completion(
+                response = responses(
+                    input=[{"role": "user", "content": prompt}],
                     model=model,
-                    messages=[{"role": "user", "content": prompt}]
+                    stream=False,
+                    background=False
                 )
                 
                 # Track cost using LiteLLM's response_cost
                 try:
                     cost = response._hidden_params["response_cost"]
-                    input_tokens = getattr(response.usage, 'prompt_tokens', 0) if hasattr(response, 'usage') else 0
-                    output_tokens = getattr(response.usage, 'completion_tokens', 0) if hasattr(response, 'usage') else 0
+                    input_tokens = getattr(response.usage, 'input_tokens', 0) if hasattr(response, 'usage') else 0
+                    output_tokens = getattr(response.usage, 'output_tokens', 0) if hasattr(response, 'usage') else 0
+                    
+                    # Warn about missing or zero cost
+                    if cost is None or cost == 0:
+                        print(f"⚠️  WARNING: API call returned zero or missing cost! Model: {model}, Cost: {cost}, Input tokens: {input_tokens}, Output tokens: {output_tokens}")
                     
                     component = self.current_component if self.current_component else "unknown"
                     self.cost_tracker.record_call(
@@ -131,13 +178,13 @@ class LLMWrapper:
                         model=model,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        cost=cost
+                        cost=cost if cost is not None else 0.0
                     )
-                except (AttributeError, KeyError):
+                except (AttributeError, KeyError) as e:
                     # If cost tracking fails, continue without it
-                    print(f"Warning: Could not track cost for completion call with model {model}")
+                    print(f"⚠️  WARNING: Could not track cost for completion call with model {model}: {e}")
                 
-                content = response.choices[0].message.content
+                content = response.output[1].content[0].text
                 if not content:
                     raise ValueError("Empty response from LLM")
 
@@ -158,48 +205,7 @@ class LLMWrapper:
                     print(f"LLM call failed after {self.max_retries} attempts: {e}")
         
         raise last_error
-    
-    def _extract_json(self, response: str) -> Dict[str, Any]:
-        """Extract JSON from response, handling various formats."""
-        response = response.strip()
-        
-        # Try direct JSON parse first
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            pass
-        
-        # Look for JSON within markdown code blocks
-        if "```json" in response:
-            start = response.find("```json") + 7
-            end = response.find("```", start)
-            if end > start:
-                json_str = response[start:end].strip()
-                return json.loads(json_str)
-        
-        # Look for JSON within regular code blocks
-        if "```" in response:
-            start = response.find("```") + 3
-            end = response.find("```", start)
-            if end > start:
-                json_str = response[start:end].strip()
-                return json.loads(json_str)
-        
-        # Look for anything that looks like JSON (starts with { or [)
-        for line in response.split('\n'):
-            line = line.strip()
-            if line.startswith(('{', '[')):
-                try:
-                    return json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-        
-        raise ValueError(f"Could not extract valid JSON from response: {response[:200]}...")
-    
-    def get_stats(self) -> Dict[str, int]:
-        """Get usage statistics."""
-        return {"total_calls": self.call_count}
-    
+
     async def batch_json_complete(
         self,
         prompts: List[str],
@@ -208,8 +214,10 @@ class LLMWrapper:
         schema_hints: Optional[List[Optional[str]]] = None,
         batch_size: int = 8,
         max_retries: int = 3,
+        reasoning_effort: str = "low",
         retry_delay_base: float = 1.0,
-        verbosity: int = 0
+        verbosity: int = 0,
+        print_reasoning_summary: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Process multiple prompts in parallel batches with rate limit retry handling.
@@ -278,7 +286,9 @@ class LLMWrapper:
                     schema_hint=schema_hint,
                     max_retries=max_retries,
                     retry_delay_base=retry_delay_base,
-                    verbosity=verbosity
+                    reasoning_effort=reasoning_effort,
+                    verbosity=verbosity,
+                    print_reasoning_summary=print_reasoning_summary
                 ))
                 tasks.append(task)
             
@@ -294,6 +304,7 @@ class LLMWrapper:
                     results[i] = result
         
         print(f"Completed processing all {n_prompts} prompts")
+        await cleanup_background_tasks()
         return results
     
     async def _async_json_complete_with_retry(
@@ -304,7 +315,9 @@ class LLMWrapper:
         schema_hint: Optional[str] = None,
         max_retries: int = 3,
         retry_delay_base: float = 1.0,
-        verbosity: int = 0
+        reasoning_effort: str = "low",
+        verbosity: int = 0,
+        print_reasoning_summary: bool = False
     ) -> Dict[str, Any]:
         """Single async JSON completion with retry logic."""
         # Check cache first
@@ -325,16 +338,25 @@ class LLMWrapper:
                     print(f"Calling LLM {model} with prompt:\n{json_prompt}")
                     print("-----------------------------------------------------------")
 
-                response = await acompletion(
+                response = await aresponses(
+                    input=[{"role": "user", "content": json_prompt}],
                     model=model,
-                    messages=[{"role": "user", "content": json_prompt}]
+                    stream=False,
+                    background=False,
+                    reasoning = {
+                        "effort": reasoning_effort
+                    }
                 )
                 
                 # Track cost
                 try:
                     cost = response._hidden_params["response_cost"]
-                    input_tokens = getattr(response.usage, 'prompt_tokens', 0) if hasattr(response, 'usage') else 0
-                    output_tokens = getattr(response.usage, 'completion_tokens', 0) if hasattr(response, 'usage') else 0
+                    input_tokens = getattr(response.usage, 'input_tokens', 0) if hasattr(response, 'usage') else 0
+                    output_tokens = getattr(response.usage, 'output_tokens', 0) if hasattr(response, 'usage') else 0
+                    
+                    # Warn about missing or zero cost
+                    if cost is None or cost == 0:
+                        print(f"⚠️  WARNING: Async API call returned zero or missing cost! Model: {model}, Cost: {cost}, Input tokens: {input_tokens}, Output tokens: {output_tokens}")
                     
                     component = self.current_component if self.current_component else "unknown"
                     self.cost_tracker.record_call(
@@ -343,13 +365,20 @@ class LLMWrapper:
                         model=model,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        cost=cost
+                        cost=cost if cost is not None else 0.0
                     )
-                except (AttributeError, KeyError):
-                    print(f"Warning: Could not track cost for async completion call with model {model}")
+                except (AttributeError, KeyError) as e:
+                    print(f"⚠️  WARNING: Could not track cost for async completion call with model {model}: {e}")
+                
+                print(f"Response: {response}")
+                
+                # Print reasoning summary if requested
+                if print_reasoning_summary and hasattr(response, 'reasoning') and response.reasoning:
+                    if hasattr(response.reasoning, 'summary') and response.reasoning.summary:
+                        print(f"🧠 Reasoning Summary: {response.reasoning.summary}")
                 
                 # Extract content
-                content = response.choices[0].message.content
+                content = response.output[1].content[0].text
                 if not content:
                     raise ValueError("Empty response from LLM")
                 
@@ -389,3 +418,16 @@ class LLMWrapper:
             "quota exceeded", "rate exceeded", "throttle", "throttled"
         ]
         return any(indicator in error_str for indicator in rate_limit_indicators)
+
+
+async def cleanup_background_tasks():
+    """Cancel any lingering background tasks to ensure clean exit."""
+    pending = asyncio.all_tasks()
+    current = asyncio.current_task()
+    background_tasks = [task for task in pending if task != current and not task.done()]
+    
+    if background_tasks:
+        print(f"Cleaning up {len(background_tasks)} background tasks")
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.sleep(0.1)  # Give tasks time to cancel

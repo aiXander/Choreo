@@ -370,7 +370,9 @@ def score_pairs_with_llm(
                 prompts=group_prompts,
                 model=model,
                 cache_keys=group_cache_keys,
-                verbosity=2
+                reasoning_effort="medium",
+                print_reasoning_summary = True,
+                verbosity=0
             )
             return responses
         finally:

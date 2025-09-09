@@ -4,6 +4,7 @@
 
 TODO:
 
+- activate reasoning for LLM pair scoring to give it more tokens before scoring
 - run LLM pairing on the actual profile instead of the sections?
 - properly scan code for dependencies (remove unneeded ones) and update pyproject.toml
 - add ability for bigger projects / brainstorms / ideas to emerge from the profile + context

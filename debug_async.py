@@ -6,7 +6,7 @@ Minimal test script to debug the async batch processing issue.
 import asyncio
 import json
 from typing import List, Dict, Any, Optional
-from litellm import acompletion
+from litellm import aresponses
 
 class SimpleAsyncTester:
     """Minimal version of the async batch processing logic."""
@@ -72,17 +72,26 @@ class SimpleAsyncTester:
         print(f"Starting async call for prompt: {prompt[:50]}...")
         
         try:
-            # Make async LLM call
-            response = await acompletion(
+            # Make async LLM call via Responses API
+            response = await aresponses(
+                input=[{ 'role': 'developer', 'content': prompt }],
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}
+                stream=False,
+                background=False,
+                reasoning = {
+                    "effort": "low"
+                },
             )
             
-            print(f"Got response for prompt: {prompt[:30]}...")
+            print(f"Got response for prompt: {prompt}...")
+            print(response.output[1].content[0].text)
             
-            # Extract content
-            content = response.choices[0].message.content
+            # Extract content from Responses API response
+            content: Optional[str] = None
+
+
+            content = response.output[1].content[0].text
+
             if not content:
                 raise ValueError("Empty response from LLM")
             
@@ -113,14 +122,12 @@ async def async_main():
         "Return a JSON object with a 'test' field set to 4. Reply with only the json, nothing else."
     ]
     
-    model = "gpt-4o-mini"  # Use a fast, cheap model
-    
-    tester = SimpleAsyncTester()
+    model = "gpt-5-mini"  # Use a fast, cheap model
     
     print("About to call batch_json_complete...")
     
     try:
-        # This should be the problematic call
+        tester = SimpleAsyncTester()
         results = await tester.batch_json_complete(
             prompts=test_prompts,
             model=model,
@@ -139,15 +146,19 @@ async def async_main():
         traceback.print_exc()
     
     print("=== Test completed ===")
+    await cleanup_background_tasks()
+
+async def cleanup_background_tasks():
+    """Cancel any lingering background tasks to ensure clean exit."""
+    pending = asyncio.all_tasks()
+    current = asyncio.current_task()
+    background_tasks = [task for task in pending if task != current and not task.done()]
     
-    # Force cleanup of any remaining tasks
-    print("Cleaning up remaining tasks...")
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    if tasks:
-        print(f"Cancelling {len(tasks)} remaining tasks...")
-        for task in tasks:
+    if background_tasks:
+        print(f"Cleaning up {len(background_tasks)} background tasks")
+        for task in background_tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.1)  # Give tasks time to cancel
 
 def main():
     """Test the async batch processing with proper cleanup."""

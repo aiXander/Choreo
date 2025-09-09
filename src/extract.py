@@ -138,6 +138,7 @@ def extract_sections_from_profiles(
                     prompts=prompts,
                     model=model,
                     cache_keys=cache_keys,
+                    reasoning_effort="low",
                     schema_hints=schema_hints,
                     batch_size=16
                 )
