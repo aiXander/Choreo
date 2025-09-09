@@ -5,15 +5,92 @@ import time
 import asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, List, Callable
-import litellm
-from litellm import responses, aresponses
+from concurrent.futures import ThreadPoolExecutor
+from openai import OpenAI
 
 from utils import get_cache_path, load_json, save_json, ensure_dir
 from cost_tracker import get_cost_tracker
 
-# Disable litellm's background logging to prevent event loop conflicts
-litellm.suppress_debug_info = True
-litellm.set_verbose = False
+# Initialize OpenAI client
+openai_client = OpenAI()
+
+# Thread pool for async operations
+_executor = ThreadPoolExecutor(max_workers=10)
+
+# Pricing per 1M tokens (input/output) in USD
+pricing = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4.1": {"input": 5.00, "output": 15.00},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "o1-mini": {"input": 3.00, "output": 12.00},
+    "o1-preview": {"input": 15.00, "output": 60.00},
+    "o3-mini": {"input": 1.25, "output": 5.00},
+
+    "gpt-5":      {"input": 1.25, "output": 10.0},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00},
+    "gpt-5-nano": {"input": 0.05, "output": 0.40},
+}
+
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Calculate cost based on model pricing and token usage."""
+    if model not in pricing:
+        print(f"⚠️  WARNING: No pricing information for model {model}")
+        return 0.0
+    
+    model_pricing = pricing[model]
+    input_cost = (input_tokens / 1_000_000) * model_pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * model_pricing["output"]
+    
+    return input_cost + output_cost
+
+
+def _sync_openai_response(input_messages: List[Dict[str, str]], model: str, 
+                         reasoning_effort: str = "low", **kwargs) -> Any:
+    """Synchronous OpenAI response call."""
+    # Convert input format from litellm to OpenAI format
+    if input_messages and len(input_messages) == 1 and input_messages[0].get("role") == "user":
+        input_text = input_messages[0]["content"]
+    else:
+        # Handle multi-turn conversations by joining them
+        input_text = "\n".join([msg.get("content", "") for msg in input_messages if msg.get("content")])
+    
+    # Build OpenAI API call parameters
+    params = {
+        "model": model,
+        "input": input_text,
+        "reasoning": {"effort": reasoning_effort} #, "summary": 'detailed'}
+    }
+    
+    # Add any additional kwargs that are valid for OpenAI
+    for key, value in kwargs.items():
+        if key in ["temperature", "max_output_tokens", "stream", "background"]:
+            params[key] = value
+    
+    return openai_client.responses.create(**params)
+
+
+async def async_openai_response(input_messages: List[Dict[str, str]], model: str, 
+                               reasoning_effort: str = "low", **kwargs) -> Any:
+    """Async wrapper for OpenAI responses.create()."""
+    loop = asyncio.get_event_loop()
+    # run_in_executor doesn't accept keyword arguments, so we need to use a wrapper
+    def wrapper():
+        return _sync_openai_response(input_messages, model, reasoning_effort, **kwargs)
+    
+    return await loop.run_in_executor(_executor, wrapper)
+
+
+async def async_gather_responses(tasks: List) -> List:
+    """Gather multiple async OpenAI response tasks with proper cleanup."""
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    finally:
+        # Ensure all tasks are properly cleaned up
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
 
 class LLMWrapper:
@@ -153,23 +230,23 @@ class LLMWrapper:
             try:
                 self.call_count += 1
                 
-                # Use litellm for unified API
-                response = responses(
-                    input=[{"role": "user", "content": prompt}],
+                # Use OpenAI client
+                response = _sync_openai_response(
+                    input_messages=[{"role": "user", "content": prompt}],
                     model=model,
                     stream=False,
                     background=False
                 )
                 
-                # Track cost using LiteLLM's response_cost
+                # Track cost using OpenAI response
                 try:
-                    cost = response._hidden_params["response_cost"]
-                    input_tokens = getattr(response.usage, 'input_tokens', 0) if hasattr(response, 'usage') else 0
-                    output_tokens = getattr(response.usage, 'output_tokens', 0) if hasattr(response, 'usage') else 0
+                    # OpenAI response format has usage information
+                    usage = getattr(response, 'usage', None)
+                    input_tokens = getattr(usage, 'input_tokens', 0) if usage else 0
+                    output_tokens = getattr(usage, 'output_tokens', 0) if usage else 0
                     
-                    # Warn about missing or zero cost
-                    if cost is None or cost == 0:
-                        print(f"⚠️  WARNING: API call returned zero or missing cost! Model: {model}, Cost: {cost}, Input tokens: {input_tokens}, Output tokens: {output_tokens}")
+                    # Calculate cost using our pricing dictionary
+                    cost = calculate_cost(model, input_tokens, output_tokens)
                     
                     component = self.current_component if self.current_component else "unknown"
                     self.cost_tracker.record_call(
@@ -178,15 +255,22 @@ class LLMWrapper:
                         model=model,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        cost=cost if cost is not None else 0.0
+                        cost=cost
                     )
                 except (AttributeError, KeyError) as e:
                     # If cost tracking fails, continue without it
                     print(f"⚠️  WARNING: Could not track cost for completion call with model {model}: {e}")
                 
-                content = response.output[1].content[0].text
-                if not content:
-                    raise ValueError("Empty response from LLM")
+                # Extract content from OpenAI response format
+                # Find the message output (skip reasoning items)
+                content = None
+                for output_item in response.output:
+                    if hasattr(output_item, 'type') and output_item.type == 'message':
+                        content = output_item.content[0].text
+                        break
+                
+                if content is None:
+                    raise ValueError("No message content found in response")
 
                 if verbosity > 1:
                     print('-----------------------------------------------------------')
@@ -338,25 +422,23 @@ class LLMWrapper:
                     print(f"Calling LLM {model} with prompt:\n{json_prompt}")
                     print("-----------------------------------------------------------")
 
-                response = await aresponses(
-                    input=[{"role": "user", "content": json_prompt}],
+                response = await async_openai_response(
+                    input_messages=[{"role": "user", "content": json_prompt}],
                     model=model,
                     stream=False,
                     background=False,
-                    reasoning = {
-                        "effort": reasoning_effort
-                    }
+                    reasoning_effort=reasoning_effort
                 )
                 
-                # Track cost
+                # Track cost using OpenAI response
                 try:
-                    cost = response._hidden_params["response_cost"]
-                    input_tokens = getattr(response.usage, 'input_tokens', 0) if hasattr(response, 'usage') else 0
-                    output_tokens = getattr(response.usage, 'output_tokens', 0) if hasattr(response, 'usage') else 0
+                    # OpenAI response format has usage information
+                    usage = getattr(response, 'usage', None)
+                    input_tokens = getattr(usage, 'input_tokens', 0) if usage else 0
+                    output_tokens = getattr(usage, 'output_tokens', 0) if usage else 0
                     
-                    # Warn about missing or zero cost
-                    if cost is None or cost == 0:
-                        print(f"⚠️  WARNING: Async API call returned zero or missing cost! Model: {model}, Cost: {cost}, Input tokens: {input_tokens}, Output tokens: {output_tokens}")
+                    # Calculate cost using our pricing dictionary
+                    cost = calculate_cost(model, input_tokens, output_tokens)
                     
                     component = self.current_component if self.current_component else "unknown"
                     self.cost_tracker.record_call(
@@ -365,22 +447,29 @@ class LLMWrapper:
                         model=model,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        cost=cost if cost is not None else 0.0
+                        cost=cost
                     )
                 except (AttributeError, KeyError) as e:
                     print(f"⚠️  WARNING: Could not track cost for async completion call with model {model}: {e}")
                 
-                print(f"Response: {response}")
+                if verbosity > 1:
+                    print(f"Response: {response}")
                 
                 # Print reasoning summary if requested
                 if print_reasoning_summary and hasattr(response, 'reasoning') and response.reasoning:
                     if hasattr(response.reasoning, 'summary') and response.reasoning.summary:
                         print(f"🧠 Reasoning Summary: {response.reasoning.summary}")
                 
-                # Extract content
-                content = response.output[1].content[0].text
-                if not content:
-                    raise ValueError("Empty response from LLM")
+                # Extract content from OpenAI response format
+                # Find the message output (skip reasoning items)
+                content = None
+                for output_item in response.output:
+                    if hasattr(output_item, 'type') and output_item.type == 'message':
+                        content = output_item.content[0].text
+                        break
+                
+                if content is None:
+                    raise ValueError("No message content found in response")
                 
                 # Parse JSON
                 result = self._extract_json(content.strip())

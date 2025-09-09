@@ -21,8 +21,8 @@ recipe:
     persona:       0.10
 
 blending:  # final = w*embed + (1-w)*llm_score
-  embed_weight: 0.4
-  llm_weight:   0.6
+  embed_weight: 0.35
+  llm_weight:   0.65
 
 matching:
   b_min: 3
