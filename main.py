@@ -33,16 +33,34 @@ from tsne import create_tsne_plots
 
 print(f"Loaded all modules, ready to go!")
 
-def main(group_name: str = None, force: bool = False):
-    """Main pipeline execution."""
-    
-    # Load environment variables
-    load_dotenv()
-    
+def run_matching_pipeline(
+    user_profiles_dir: str,
+    config_dict: dict,
+    sections_config_path: str = "config/section_prompt.yaml",
+    prompts_config_path: str = "config/scoring_prompt.yaml",
+    introduction_config_path: str = "config/introduction_prompt.yaml",
+    force: bool = False,
+    group_name: str = None
+):
+    """
+    Main entrypoint function for the matching pipeline.
+
+    Args:
+        user_profiles_dir: Directory containing raw user profile text files
+        config_dict: Configuration dictionary with all pipeline settings
+        sections_config_path: Path to section extraction prompts config
+        prompts_config_path: Path to scoring prompts config
+        introduction_config_path: Path to introduction prompts config
+        force: Whether to force re-run all steps
+        group_name: Optional group name for organization
+
+    Returns:
+        dict: Results containing final matches, reports, and metadata
+    """
     print("🚀 Starting prompt-mesh matching pipeline...")
-    
-    # Load configurations
-    config = load_yaml("config/config.yaml")
+
+    # Use provided config directly
+    config = config_dict
     
     # Update paths for group-specific data if group_name provided
     if group_name:
@@ -64,7 +82,7 @@ def main(group_name: str = None, force: bool = False):
         print("🔄 Force flag set - all steps will be re-run, ignoring existing data")
     
     print("\n📁 Step 1: Ingesting profiles...")
-    profiles = load_profiles(config['io']['raw_dir'])
+    profiles = load_profiles(user_profiles_dir)
     print(f"✅ Loaded {len(profiles)} profiles")
     
     print("\n🧠 Step 2: Extracting sections with LLM...")
@@ -83,7 +101,7 @@ def main(group_name: str = None, force: bool = False):
         print(f"✅ Extracted sections for {len(extracted_sections)} profiles")
     except Exception as e:
         print(f"❌ Error extracting sections: {e}")
-        return 1
+        return {"success": False, "error": f"Error extracting sections: {e}"}
     
     print("\n🔢 Step 3: Creating embeddings...")
     user_ids, section_names, embeddings = create_section_embeddings(
@@ -107,7 +125,7 @@ def main(group_name: str = None, force: bool = False):
         print(f"✅ Created t-SNE plots: {tsne_results['plots_dir']}")
     except Exception as e:
         print(f"❌ Error creating t-SNE visualizations: {e}")
-        return 1
+        return {"success": False, "error": f"Error creating t-SNE visualizations: {e}"}
     
     print("\n🎯 Step 4: Generating similarity matrix...")
     try:
@@ -120,7 +138,7 @@ def main(group_name: str = None, force: bool = False):
         print(f"✅ Generated similarity matrix for {len(user_ids_sorted)} users")
     except Exception as e:
         print(f"❌ Error generating similarity matrix: {e}")
-        return 1
+        return {"success": False, "error": f"Error generating similarity matrix: {e}"}
     
     print("\n⚡ Step 5: LLM pair scoring...")
     try:
@@ -150,7 +168,7 @@ def main(group_name: str = None, force: bool = False):
         
     except Exception as e:
         print(f"❌ Error scoring pairs: {e}")
-        return 1
+        return {"success": False, "error": f"Error scoring pairs: {e}"}
     
     print("\n🔗 Step 6: Greedy b-matching...")
     try:
@@ -194,7 +212,7 @@ def main(group_name: str = None, force: bool = False):
         
     except Exception as e:
         print(f"❌ Error creating matches: {e}")
-        return 1
+        return {"success": False, "error": f"Error creating matches: {e}"}
     
     print("\n💬 Step 7: Generating introductions for matches...")
     try:
@@ -224,7 +242,7 @@ def main(group_name: str = None, force: bool = False):
         print(f"✅ Generated introductions for {len(introductions)} matches")
     except Exception as e:
         print(f"❌ Error generating introductions: {e}")
-        return 1
+        return {"success": False, "error": f"Error generating introductions: {e}"}
     
     print("\n📝 Step 8: Generating reports...")
     try:
@@ -237,7 +255,7 @@ def main(group_name: str = None, force: bool = False):
         print(f"✅ Generated reports for all users")
     except Exception as e:
         print(f"❌ Error generating reports: {e}")
-        return 1
+        return {"success": False, "error": f"Error generating reports: {e}"}
     
     # Print LLM usage statistics
     stats = llm_wrapper.get_stats()
@@ -263,7 +281,7 @@ def main(group_name: str = None, force: bool = False):
         print(f"✅ Created similarity visualizations: {plots_results['plots_dir']}")
     except Exception as e:
         print(f"❌ Error creating visualizations: {e}")
-        return 1
+        return {"success": False, "error": f"Error creating visualizations: {e}"}
     
     print("\n🎉 Pipeline completed successfully!")
     print(f"📁 Check outputs in: {config['io']['outputs_dir']}")
@@ -271,8 +289,55 @@ def main(group_name: str = None, force: bool = False):
     print(f"💰 Cost report: {cost_report_path}")
     print(f"📊 t-SNE plots: {tsne_results['plots_dir']}")
     print(f"🎨 Similarity plots: {plots_results['plots_dir']}")
-    
-    return 0
+
+    # Return structured results
+    return {
+        "success": True,
+        "matches": final_edges,
+        "profiles_count": len(profiles),
+        "outputs_dir": config['io']['outputs_dir'],
+        "cost_report_path": str(cost_report_path),
+        "tsne_plots_dir": tsne_results['plots_dir'],
+        "similarity_plots_dir": plots_results['plots_dir'],
+        "stats": {
+            "llm_calls": stats['total_calls'],
+            "matches_created": len(final_edges)
+        }
+    }
+
+
+def main(group_name: str = None, force: bool = False):
+    """CLI wrapper function for backward compatibility."""
+    # Load environment variables
+    load_dotenv()
+
+    # Load configurations
+    config = load_yaml("config/config.yaml")
+
+    # Update paths for group-specific data if group_name provided
+    if group_name:
+        print(f"📁 Using group-specific data: {group_name}")
+        base_data_dir = f"data/{group_name}"
+        config['io']['raw_dir'] = f"{base_data_dir}/raw"
+        config['io']['processed_dir'] = f"{base_data_dir}/processed"
+        config['io']['embeds_dir'] = f"{base_data_dir}/embeds"
+        config['io']['outputs_dir'] = f"{base_data_dir}/outputs"
+        config['io']['cache_dir'] = f"{base_data_dir}/cache"
+
+    # Call the main pipeline function
+    result = run_matching_pipeline(
+        user_profiles_dir=config['io']['raw_dir'],
+        config_dict=config,
+        force=force,
+        group_name=group_name
+    )
+
+    # Return appropriate exit code
+    if result.get("success", False):
+        return 0
+    else:
+        print(f"❌ Pipeline failed: {result.get('error', 'Unknown error')}")
+        return 1
 
 
 if __name__ == "__main__":
