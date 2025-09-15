@@ -22,9 +22,6 @@ pricing = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4.1": {"input": 5.00, "output": 15.00},
     "gpt-4o": {"input": 2.50, "output": 10.00},
-    "o1-mini": {"input": 3.00, "output": 12.00},
-    "o1-preview": {"input": 15.00, "output": 60.00},
-    "o3-mini": {"input": 1.25, "output": 5.00},
 
     "gpt-5":      {"input": 1.25, "output": 10.0},
     "gpt-5-mini": {"input": 0.25, "output": 2.00},

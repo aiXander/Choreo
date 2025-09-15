@@ -1,17 +1,13 @@
-
-
-
-
 TODO:
 
-- activate reasoning for LLM pair scoring to give it more tokens before scoring
-- run LLM pairing on the actual profile instead of the sections?
 - properly scan code for dependencies (remove unneeded ones) and update pyproject.toml
 - add ability for bigger projects / brainstorms / ideas to emerge from the profile + context
 - create "teams" / "groups" and assign them brainstorm prompts / topics.
 
 #####################################################################################
 
+# Usage:
+python main.py --group test4 --force
 
 # AI-Powered Profile Matching
 
