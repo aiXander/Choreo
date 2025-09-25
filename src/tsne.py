@@ -68,8 +68,7 @@ def create_tsne_plots(
             n_components=2,
             metric=metric,
             perplexity=min(perplexity, n_users - 1),  # Ensure perplexity is valid
-            random_state=42,
-            n_iter=1000
+            random_state=42
         )
         
         tsne_coords = tsne.fit_transform(section_embeddings)
@@ -121,8 +120,7 @@ def create_tsne_plots(
         metric='precomputed',
         init='random',  # Required when using precomputed distances
         perplexity=min(perplexity, n_users - 1),
-        random_state=42,
-        n_iter=1000
+        random_state=42
     )
     
     tsne_coords_combined = tsne_combined.fit_transform(combined_distances)

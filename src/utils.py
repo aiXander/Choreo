@@ -6,24 +6,6 @@ import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 import numpy as np
-from numba import jit
-
-
-@jit(nopython=True)
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two vectors."""
-    # Ensure contiguous arrays for better performance
-    a = np.ascontiguousarray(a)
-    b = np.ascontiguousarray(b)
-    
-    dot_product = np.dot(a, b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    
-    return dot_product / (norm_a * norm_b)
 
 
 def cosine_matrix(vectors: np.ndarray) -> np.ndarray:

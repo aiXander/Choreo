@@ -5,13 +5,14 @@ description = "User profile matching system using LLM embeddings and processing"
 authors = [{name = "Xander", email = "xander@eden.art"}]
 requires-python = ">=3.9"
 dependencies = [
+    "numpy>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "matplotlib>=3.10.6",
+    "seaborn>=0.13.0",
     "litellm>=1.76.2",
-    "numpy>=1.21.0",
-    "pyyaml>=6.0",
-    "tqdm>=4.62.0",
-    "tsne>=0.3.1",
-    "python-dotenv>=0.19.0",
-    "numba>=0.56.0",
+    "pyyaml>=6.0.2",
+    "tqdm>=4.66.2",
+    "python-dotenv>=1.0.1"
 ]
 
 [project.optional-dependencies]
