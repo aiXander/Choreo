@@ -4,7 +4,53 @@ TODO:
 - add ability for bigger projects / brainstorms / ideas to emerge from the profile + context
 - create "teams" / "groups" and assign them brainstorm prompts / topics.
 
+
+
+Idea generation Pipeline
+
+1. Embedding based cohort sampling (eg make sure every user is part of 3-5 cohorts):
+- Based on each users' embeddings for skills/interests/goals/persona
+- Run a greedy loop over all users, where at each step you sample the best "team match" based on embedding matrix (using appropriate weights like aligned interests/goals but complementary skills) and keeping count of how often each user has already been paired (b-min spread)
+- Add some algorithmic noise into the "team match" ranking scores at each sampling step to add entropy (sometimes match less aligned people also). "alignment_noise" parameter (0-1)
+
+2. Cohort-level ideation (N idea seeds x n_cohorts):
+
+Prompt per cohort: “Given these 3–5 profiles and this venue/context brief, propose N short, concrete project seeds with target outcomes in about 50 words.”
+Temperature sweep: T ∈ {0.7, 0.9, 1.1} across shards to inject entropy.
+
+3. Seed embedding & dedup (cheap):
+
+Embed all seed briefs; cluster via HDBSCAN or agglomerative; within each cluster choose medoid; optionally keep 1–3 variants as “modes”.
+
+Seed consolidation (medium LLM):
+
+For each cluster, call LLM to merge similar seeds into a crisp brief (title, purpose, deliverables in 48–72 hours, resource needs, success signals, roles).
+
+Seed scoring (cheap+medium):
+
+Compute novelty: distance from theme centroids + KL divergence vs global topic distribution.
+
+Compute context fit: cosine(sim(seed, event_context_embeddings)).
+
+Quick LLM rubric check (short JSON): feasibility/excitement/impact (0–1).
+
+Pareto select K seeds across novelty × context_fit × feasibility (submodular coverage; see below).
+
+Assignment (medium):
+
+For each seed, rank users by fused similarity (Interests 40 / Goals 30 / Skills 20 / Personality 10) times role-fit heuristics from the brief (e.g., “needs audio dev + facilitator”). Then run coverage-aware b-matching (users→seeds) with constraints:
+
+Each user assigned to at least a_min seeds (e.g., 1–2).
+
+Each seed gets a minimum viable team (roles filled) and a soft cap.
+
+Why it works: The novelty comes from combinatorial sampling of contrasting but coherent micro-cohorts; the reduce stage trims chaos into a tidy set of briefs.
+
+
+
+
 #####################################################################################
+
 
 # Usage:
 python main.py --group test4 --force
