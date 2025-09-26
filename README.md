@@ -6,7 +6,7 @@ TODO:
 
 
 
-Idea generation Pipeline
+Idea generation Pipeline (Yet To build)
 
 1. Embedding based cohort sampling (eg make sure every user is part of 3-5 cohorts):
 - Based on each users' embeddings for skills/interests/goals/persona
@@ -48,9 +48,11 @@ Why it works: The novelty comes from combinatorial sampling of contrasting but c
 
 
 
-
+#####################################################################################
 #####################################################################################
 
+
+Current repo guidelines:
 
 # Usage:
 python main.py --group test4 --force
