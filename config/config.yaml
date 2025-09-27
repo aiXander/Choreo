@@ -1,10 +1,10 @@
 models:
-  embedding: "text-embedding-3-large"
-  extraction_llm: "gpt-5-mini"
-  pair_llm: "gpt-5-mini"
+  embedding: "text-embedding-3-small"
+  extraction_llm: "gpt-5"
+  pair_llm: "gpt-5"
 
 instruction_prompt:
-  goal: "We are building a social connectivity graph based on user profiles at the start of our community residency. These people do not know each other and we are looking to create introductions and build relationships between them so they can start working on relevant projects together. We are looking to find matches that are aligned on interests, goals and skills revolving around the topic of inclusive community building, agentic AI and digital creativity."
+  goal: "We are building a social connectivity graph based on user profiles at the start of our community residency. These people do not know each other and we are looking to create introductions and build relationships between them so they can start working on relevant projects together. We are looking to find matches that are aligned on interests, goals and skills revolving around the topic of inclusive community building, social cohesion, creative events, art and activism. We want to make the world a better place by getting people out of their comfort zones and into new, exciting, creative and challenging situations that collectively benefit the world. Collective participation and empowerment is the key to success."
 
 budgets:
   extraction_llm_calls: 100   # max = n_profiles (all sections extracted in same call)

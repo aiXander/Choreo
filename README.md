@@ -8,44 +8,60 @@ TODO:
 
 Idea generation Pipeline (Yet To build)
 
+initialization:
+- from each user profile/bio, use LLM to extract skills/interests/goals/persona sections (text, max 100 words per section)
+- For persona, it might be a good idea to also task the LLM with extracting 3 adjectives from a fixed list (e.g., facilitator, finisher, explorer…) instead of inventing persona descriptions free-form (too open-ended)
+- embed each section using an embedding model like text-embedding-3-large
+
 1. Embedding based cohort sampling (eg make sure every user is part of 3-5 cohorts):
-- Based on each users' embeddings for skills/interests/goals/persona
-- Run a greedy loop over all users, where at each step you sample the best "team match" based on embedding matrix (using appropriate weights like aligned interests/goals but complementary skills) and keeping count of how often each user has already been paired (b-min spread)
-- Add some algorithmic noise into the "team match" ranking scores at each sampling step to add entropy (sometimes match less aligned people also). "alignment_noise" parameter (0-1)
+- Based on each users' embeddings for skills/interests/goals/persona, assemble cohorts (teams) of 3-5 people that would work well together. Think about the fact that “Complementary skills” via negative cosine is relatively weak; complementarity is coverage, not simple dissimilarity ---> can we do better than pure negative cosine sim?
+- To do this, run a greedy loop over all users, where at each step you sample the best "team match" based on a combined embedding matrix (using appropriate weights like aligned interests/goals but complementary skills) and keeping count of how often each user has already been assigned to teams with other people, try to create diverse cohorts that mix and match different subgroups
+- b-min spread formally: a bipartite b-matching where each user has cap b_user (e.g., 3–5 cohorts) and each other user has exposure limits to avoid the same pairs repeating (pairwise cap).
+- Add some algorithmic noise into the "team match" ranking scores at each sampling step to add entropy (sometimes match less aligned people also). "alignment_noise" parameter (0-1). Sample with Gumbel-top-k instead of ad-hoc noise: draw teams proportional to exp(Score/τ). This gives principled entropy without pathological choices.
+
 
 2. Cohort-level ideation (N idea seeds x n_cohorts):
 
-Prompt per cohort: “Given these 3–5 profiles and this venue/context brief, propose N short, concrete project seeds with target outcomes in about 50 words.”
-Temperature sweep: T ∈ {0.7, 0.9, 1.1} across shards to inject entropy.
+Prompt per cohort: “Given these 3–5 profiles and this venue/context brief, propose N short, concrete project seeds with target outcomes in 50 words.”
+Important: embeddings are very sensitive to text length (longer text leads to more averaged embeddings) so we have to make sure these seed descriptions are all very similar in length.
+Temperature sweep: T ∈ {0.7, 0.9, 1.1} across shards to inject entropy. The idea here is that running the same LLM call N times will lead to very similar results, but asking the LLM to generate N different ideas in one pass will force it to diversify. Keep the ideas high level and basic, we don't need details yet at this point, just high level narrative / outcomes.
 
-3. Seed embedding & dedup (cheap):
+upgrades:
+- Prompt ensemble (“three voices”): for each cohort, generate with 3 distinct rubrics:
+  - Feasible-in-72h PM (resources, stakeholders, demo).
+  - Wild artist (provocation, narrative, spectacle).
+  - Systems/impact (measurements, externalities, handoff).
+Ask for 2 ideas per rubric → 6 seeds/ cohort with built-in diversity.
 
-Embed all seed briefs; cluster via HDBSCAN or agglomerative; within each cluster choose medoid; optionally keep 1–3 variants as “modes”.
+3. Seed idea embedding & dedup (embeddings):
 
-Seed consolidation (medium LLM):
+Embed all seed briefs (full cosine similarity matrix)
+Create a full seed graph, where edge weights are the similarity scores for each pair
+Then run community detection: groups of closely connected ideas (themes).
 
-For each cluster, call LLM to merge similar seeds into a crisp brief (title, purpose, deliverables in 48–72 hours, resource needs, success signals, roles).
+Run Leiden algorithm: “are these nodes more connected to each other than to the rest?”
+Output = partition of seeds into clusters (communities).
+Implemented in igraph, networkx, or leidenalg in Python.
 
-Seed scoring (cheap+medium):
+Seed consolidation (LLM):
 
-Compute novelty: distance from theme centroids + KL divergence vs global topic distribution.
+For each cluster, call LLM to consolidate / merge similar seeds into a crisp brief (title, purpose, deliverables in 48–72 hours, resource needs, success signals, roles). This lets the LLM leverage the entropy (diversity) of the previous step and combine strengths from different seeds into stronger versions.
+Its fine in this step if some seeds are included in multiple clusters.
 
-Compute context fit: cosine(sim(seed, event_context_embeddings)).
+Idea scoring (LLM):
+Run LLM calls to rank multiple refined ideas in one pass, creating relative rankings eg B > C > A.
+Run enough LLM calls to have each idea scored a few times. Assign points to relative rankings and create a global idea rank.
 
-Quick LLM rubric check (short JSON): feasibility/excitement/impact (0–1).
+Algorithm outputs the final top-n ideas.
 
-Pareto select K seeds across novelty × context_fit × feasibility (submodular coverage; see below).
+(Optional) Assignment:
 
-Assignment (medium):
-
-For each seed, rank users by fused similarity (Interests 40 / Goals 30 / Skills 20 / Personality 10) times role-fit heuristics from the brief (e.g., “needs audio dev + facilitator”). Then run coverage-aware b-matching (users→seeds) with constraints:
+For each final idea, rank users by fused similarity (Interests 40 / Goals 30 / Skills 20 / Personality 10) times role-fit heuristics from the brief (e.g., “needs audio dev + facilitator”). Then run coverage-aware b-matching (users→seeds) with constraints:
 
 Each user assigned to at least a_min seeds (e.g., 1–2).
-
 Each seed gets a minimum viable team (roles filled) and a soft cap.
 
 Why it works: The novelty comes from combinatorial sampling of contrasting but coherent micro-cohorts; the reduce stage trims chaos into a tidy set of briefs.
-
 
 
 #####################################################################################

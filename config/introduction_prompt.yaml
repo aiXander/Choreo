@@ -5,7 +5,7 @@ introduction_generation: |
   "{instruction}"
 
   This pair has already been identified as a good match. Now you need to create:
-  1. A concise, open-ended introduction that {user_a_name} can use to introduce themselves to {user_b_name} (no need to mention the pair score). 
+  1. A concise, open-ended introduction that {user_b_name} can use to introduce themselves to {user_a_name} (no need to mention the pair score). 
   2. A short bullet point list of 1-5 starter topics that would be interesting for these two people to start a conversation around.
 
   Here are the two user profiles:
@@ -17,6 +17,6 @@ introduction_generation: |
 
   Return compact JSON:
   {{
-    "intro": "Introduction from {user_a_name} to {user_b_name}",
+    "intro": "Introduction from {user_b_name} to {user_a_name}",
     "starter_topics": "• topic1 • topic2 • topic3 ..."
   }}
