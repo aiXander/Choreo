@@ -339,7 +339,7 @@ def _execute_matching_pipeline(
 
     print("\n📝 Step 8: Generating reports...")
     try:
-        generate_all_reports(
+        cohort_summary = generate_all_reports(
             all_edges=final_edges,
             extracted_sections=extracted_sections,
             outputs_dir=io_config.get("outputs_dir"),
@@ -390,6 +390,7 @@ def _execute_matching_pipeline(
         "cost_report_path": str(cost_report_path),
         "tsne_plots_dir": tsne_results["plots_dir"],
         "similarity_plots_dir": plots_results["plots_dir"],
+        "cohort_summary": cohort_summary,
         "stats": {
             "llm_calls": stats["total_calls"],
             "matches_created": len(final_edges),

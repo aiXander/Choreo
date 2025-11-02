@@ -28,6 +28,8 @@ import tempfile
 import hashlib
 import io
 import mimetypes
+import shutil
+import uuid
 
 # Modal app setup
 root_dir = Path(__file__).parent
@@ -123,6 +125,52 @@ def upload_file_to_s3(s3_client, file_path: str, bucket_name: str, name: Optiona
     file_url = f"https://{bucket_name}.s3.amazonaws.com/{filename}"
     return file_url, sha_hash
 
+
+def zip_and_upload_outputs(s3_client, outputs_dir: str, bucket_name: str, group_name: Optional[str] = None) -> Optional[str]:
+    """
+    Zip the outputs directory and upload it to S3.
+
+    Args:
+        s3_client: Boto3 S3 client
+        outputs_dir: Path to the outputs directory to zip
+        bucket_name: S3 bucket name
+        group_name: Optional group name for naming the zip file
+
+    Returns:
+        S3 URL of the uploaded zip file, or None if upload fails
+    """
+    # Create a temporary zip file
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_zip:
+        temp_zip_path = temp_zip.name
+
+    try:
+        # Create zip archive of outputs directory
+        zip_base_name = temp_zip_path.replace(".zip", "")
+        shutil.make_archive(zip_base_name, 'zip', outputs_dir)
+
+        # Generate a name for the zip file
+        zip_name = f"outputs_{group_name}" if group_name else "outputs_default"
+
+        # Upload zip to S3
+        outputs_zip_url, _ = upload_file_to_s3(
+            s3_client=s3_client,
+            file_path=temp_zip_path,
+            bucket_name=bucket_name,
+            name=zip_name
+        )
+
+        print(f"✅ Uploaded outputs zip to S3: {outputs_zip_url}")
+        return outputs_zip_url
+
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to upload outputs zip to S3: {e}")
+        return None
+
+    finally:
+        # Clean up temporary zip file
+        if os.path.exists(temp_zip_path):
+            os.remove(temp_zip_path)
+
 # Create Modal volume for persistent storage
 volume = modal.Volume.from_name("data_01", create_if_missing=True)
 
@@ -184,10 +232,12 @@ def run_matching_pipeline(
                 f.write(profile_text)
 
         # Update config to use persistent volume for outputs
+        # Generate unique UUID for this run to avoid conflicts
+        run_uuid = str(uuid.uuid4())
         if group_name:
-            base_data_dir = f"/app/data/{group_name}"
+            base_data_dir = f"/app/data/{group_name}_{run_uuid}"
         else:
-            base_data_dir = "/app/data/default"
+            base_data_dir = f"/app/data/default_{run_uuid}"
 
         config_dict['io']['processed_dir'] = f"{base_data_dir}/processed"
         config_dict['io']['embeds_dir'] = f"{base_data_dir}/embeds"
@@ -203,30 +253,50 @@ def run_matching_pipeline(
         ]:
             os.makedirs(dir_path, exist_ok=True)
 
-        # Run the matching pipeline
-        result = run_matching_pipeline(
-            user_profiles_dir=profiles_dir,
-            config_dict=config_dict,
-            force=force,
-            group_name=group_name
-        )
+        try:
+            # Run the matching pipeline
+            result = run_matching_pipeline(
+                user_profiles_dir=profiles_dir,
+                config_dict=config_dict,
+                force=force,
+                group_name=group_name
+            )
 
-        # Serialize matches to be JSON-serializable
-        if result.get("success") and result.get("matches"):
-            serialized_matches = []
-            for match in result["matches"]:
-                match_dict = {
-                    "user1": match.user1,
-                    "user2": match.user2,
-                    "score": float(match.score) if hasattr(match, 'score') else 0.0,
-                    "intro": getattr(match, 'intro', ""),
-                    "starter_topics": getattr(match, 'starter_topics', ""),
-                    "pair_id": getattr(match, 'pair_id', f"{match.user1}_{match.user2}")
+            # Commit volume changes
+            volume.commit()
+
+            # Zip outputs directory and upload to S3
+            outputs_zip_url = None
+            if result.get("success") and result.get("outputs_dir"):
+                outputs_zip_url = zip_and_upload_outputs(
+                    s3_client=s3_client,
+                    outputs_dir=result["outputs_dir"],
+                    bucket_name=bucket_name,
+                    group_name=group_name
+                )
+
+            # Return only the cohort_summary dictionary with outputs_zip_url
+            if result.get("success") and result.get("cohort_summary"):
+                cohort_summary = result["cohort_summary"]
+                cohort_summary["outputs_zip_url"] = outputs_zip_url
+                return_value = cohort_summary
+            elif result.get("success"):
+                return_value = {
+                    "error": "Pipeline succeeded but cohort_summary not found in result",
+                    "outputs_zip_url": outputs_zip_url
                 }
-                serialized_matches.append(match_dict)
-            result["matches"] = serialized_matches
+            else:
+                return_value = {
+                    "error": result.get("error", "Pipeline execution failed")
+                }
 
-        # Commit volume changes
-        volume.commit()
+            return return_value
 
-        return result
+        finally:
+            # Clean up the unique data directory
+            if os.path.exists(base_data_dir):
+                try:
+                    shutil.rmtree(base_data_dir)
+                    print(f"✅ Cleaned up temporary directory: {base_data_dir}")
+                except Exception as e:
+                    print(f"⚠️ Warning: Failed to clean up directory {base_data_dir}: {e}")

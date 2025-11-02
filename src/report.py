@@ -150,11 +150,11 @@ def create_cohort_summary(
     
     def safe_stats(scores):
         if not scores:
-            return {"min": 0, "max": 0, "avg": 0}
+            return {"min": 0.0, "max": 0.0, "avg": 0.0}
         return {
-            "min": min(scores),
-            "max": max(scores), 
-            "avg": sum(scores) / len(scores)
+            "min": round(min(scores), 3),
+            "max": round(max(scores), 3),
+            "avg": round(sum(scores) / len(scores), 3)
         }
     
     summary = {
@@ -176,7 +176,7 @@ def create_cohort_summary(
                 "matches": [
                     {
                         "partner": edge.user2 if edge.user1 == user_id else edge.user1,
-                        "weight": edge.final_weight,
+                        "weight": round(edge.final_weight, 3),
                         "intro": edge.intro
                     }
                     for edge in all_edges
@@ -195,15 +195,18 @@ def generate_all_reports(
     extracted_sections: List[ExtractedSections],
     outputs_dir: str,
     top_matches_per_user: int = 5
-) -> None:
+) -> Dict[str, Any]:
     """
     Generate all user reports and cohort summary.
-    
+
     Args:
         all_edges: All final edges
         extracted_sections: All user sections
         outputs_dir: Output directory
         top_matches_per_user: Maximum matches per user (from b_max parameter)
+
+    Returns:
+        Cohort summary dictionary
     """
     outputs_path = ensure_dir(outputs_dir)
     
@@ -270,3 +273,5 @@ def generate_all_reports(
     if score_stats['llm_scores']['avg'] > 0:
         print(f"  LLM scores: {score_stats['llm_scores']['min']:.3f} - {score_stats['llm_scores']['max']:.3f}")
     print("="*50)
+
+    return cohort_summary

@@ -1,22 +1,25 @@
 introduction_generation: |
   Context: {goal}
   
-  Your task is to generate personalized introductions and conversation starters for a matched pair of users given the above context and the following instruction:
+  Your task is to generate personalized connection guidance and conversation starters for a matched pair of users given the above context and the following instruction:
   "{instruction}"
 
-  This pair has already been identified as a good match. Now you need to create:
-  1. A concise, open-ended introduction that {user_b_name} can use to introduce themselves to {user_a_name} (no need to mention the pair score). 
+  This pair ({user_a_name} and {user_b_name}) has already been identified as a good match. Now you need to create:
+  1. A concise, mutual introduction statement that explains why these two users are a good match and highlights their complementary skills/interests. This should be framed neutrally (not from one person's perspective) so it can appear in both users' reports.
   2. A short bullet point list of 1-5 starter topics that would be interesting for these two people to start a conversation around.
 
   Here are the two user profiles:
   <profiles>
+  {user_a_name} profile:
   {user1_text}
   ---
+  {user_b_name} profile:
   {user2_text}
   </profiles>
 
   Return compact JSON:
   {{
-    "intro": "Introduction from {user_b_name} to {user_a_name}",
+    "intro": "A mutual introduction explaining why {user_a_name} and {user_b_name} are a great match (neutral framing, no directional addressing)",
     "starter_topics": "• topic1 • topic2 • topic3 ..."
   }}
+

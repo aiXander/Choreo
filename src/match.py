@@ -30,11 +30,11 @@ class Edge:
             'user1': self.user1,
             'user2': self.user2,
             'pair_id': self.pair_id,
-            'final_weight': self.final_weight,
-            'embed_score': self.embed_score,
-            'llm_score': self.llm_score,
-            'embed_score_normalized': self.embed_score_normalized,
-            'llm_score_normalized': self.llm_score_normalized,
+            'final_weight': round(self.final_weight, 3),
+            'embed_score': round(self.embed_score, 3),
+            'llm_score': round(self.llm_score, 3),
+            'embed_score_normalized': round(self.embed_score_normalized, 3) if self.embed_score_normalized is not None else None,
+            'llm_score_normalized': round(self.llm_score_normalized, 3) if self.llm_score_normalized is not None else None,
             'intro': self.intro,
             'starter_topics': self.starter_topics
         }
