@@ -58,7 +58,7 @@ def create_similarity_plots(
             plt.yticks(range(len(user_ids)), user_ids)
         
         plt.tight_layout()
-        plot_path = plots_dir / f'{section_name}_similarity.png'
+        plot_path = plots_dir / f'{section_name}_similarity.jpg'
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Saved {section_name} similarity plot: {plot_path}")
@@ -78,7 +78,7 @@ def create_similarity_plots(
         plt.yticks(range(len(user_ids)), user_ids)
     
     plt.tight_layout()
-    combined_path = plots_dir / 'combined_similarity.png'
+    combined_path = plots_dir / 'combined_similarity.jpg'
     plt.savefig(combined_path, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -130,7 +130,7 @@ def create_similarity_plots(
     fig.suptitle(f'Similarity Matrix Analysis{group_str}', fontsize=16, y=0.98)
     
     plt.tight_layout()
-    final_path = plots_dir / 'similarity_analysis.png'
+    final_path = plots_dir / 'similarity_analysis.jpg'
     plt.savefig(final_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved final combined visualization: {final_path}")
@@ -138,5 +138,5 @@ def create_similarity_plots(
     return {
         'section_matrices': section_matrices,
         'combined_matrix': combined_matrix,
-        'plots_dir': plots_dir
+        'plots_dir': str(plots_dir)
     }

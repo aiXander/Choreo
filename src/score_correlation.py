@@ -108,8 +108,8 @@ def create_normalized_score_correlation_plot(
     filename = "normalized_embedding_llm_score_correlation"
     if group_name:
         filename += f"_{group_name}"
-    filename += ".png"
-    
+    filename += ".jpg"
+
     plot_path = plots_dir / filename
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -219,8 +219,8 @@ def create_normalized_detailed_score_analysis(
     filename = "normalized_detailed_score_analysis"
     if group_name:
         filename += f"_{group_name}"
-    filename += ".png"
-    
+    filename += ".jpg"
+
     plot_path = plots_dir / filename
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()

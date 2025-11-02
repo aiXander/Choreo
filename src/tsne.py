@@ -99,9 +99,9 @@ def create_tsne_plots(
         plt.xlabel('t-SNE 1', fontsize=12)
         plt.ylabel('t-SNE 2', fontsize=12)
         plt.grid(True, alpha=0.3)
-        
+
         # Save plot
-        plot_path = plots_dir / f"tsne_{section_name.lower().replace(' ', '_')}.png"
+        plot_path = plots_dir / f"tsne_{section_name.lower().replace(' ', '_')}.jpg"
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -153,9 +153,9 @@ def create_tsne_plots(
     plt.xlabel('t-SNE 1', fontsize=12)
     plt.ylabel('t-SNE 2', fontsize=12)
     plt.grid(True, alpha=0.3)
-    
+
     # Save combined plot
-    combined_plot_path = plots_dir / "tsne_combined_all_sections.png"
+    combined_plot_path = plots_dir / "tsne_combined_all_sections.jpg"
     plt.savefig(combined_plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -253,8 +253,8 @@ def visualize_section_relationships(
     plt.xlabel('t-SNE 1')
     plt.ylabel('t-SNE 2')
     plt.grid(True, alpha=0.3)
-    
-    plot_path = plots_dir / "tsne_section_relationships.png"
+
+    plot_path = plots_dir / "tsne_section_relationships.jpg"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     

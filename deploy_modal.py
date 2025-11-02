@@ -25,6 +25,9 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import json
 import tempfile
+import hashlib
+import io
+import mimetypes
 
 # Modal app setup
 root_dir = Path(__file__).parent
@@ -38,7 +41,8 @@ image = (
         "litellm>=1.76.2",
         "pyyaml>=6.0.2",
         "tqdm>=4.66.2",
-        "python-dotenv>=1.0.1"
+        "python-dotenv>=1.0.1",
+        "boto3>=1.34.0"
     ])
     .add_local_dir("src", "/app/src", copy=True)
     .add_local_dir("config", "/app/config", copy=True)
@@ -50,8 +54,74 @@ image = (
 
 app = modal.App(
     name="profile-matching",
-    secrets=[modal.Secret.from_name("api-keys")]
+    secrets=[modal.Secret.from_name("eve-secrets-PROD")]
 )
+
+
+def upload_file_to_s3(s3_client, file_path: str, bucket_name: str, name: Optional[str] = None) -> tuple[str, str]:
+    """
+    Minimal S3 upload function - uploads a file and returns (file_url, sha_hash).
+
+    Args:
+        s3_client: Boto3 S3 client
+        file_path: Path to file to upload
+        bucket_name: S3 bucket name
+        name: Optional custom name (otherwise uses SHA256 hash)
+
+    Returns:
+        Tuple of (file_url, sha_hash)
+    """
+    # Read file
+    with open(file_path, "rb") as f:
+        buffer = f.read()
+
+    # Generate SHA256 hash
+    hasher = hashlib.sha256()
+    hasher.update(buffer)
+    sha_hash = hasher.hexdigest()
+
+    # Use provided name or SHA256 hash
+    if not name:
+        name = sha_hash
+
+    # Detect file extension
+    file_extension = Path(file_path).suffix
+    if not file_extension:
+        # Try to guess from mimetype
+        mime_type, _ = mimetypes.guess_type(file_path)
+        file_extension = mimetypes.guess_extension(mime_type) if mime_type else ""
+
+    filename = f"{name}{file_extension}"
+
+    # Detect content type
+    content_type, _ = mimetypes.guess_type(filename)
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    # Check if file already exists
+    try:
+        s3_client.head_object(Bucket=bucket_name, Key=filename)
+        # File exists, return URL
+        file_url = f"https://{bucket_name}.s3.amazonaws.com/{filename}"
+        return file_url, sha_hash
+    except s3_client.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "404":
+            raise e
+
+    # Upload file
+    file_bytes = io.BytesIO(buffer)
+    s3_client.upload_fileobj(
+        file_bytes,
+        bucket_name,
+        filename,
+        ExtraArgs={
+            "ContentType": content_type,
+            "ContentDisposition": "inline"
+        }
+    )
+
+    file_url = f"https://{bucket_name}.s3.amazonaws.com/{filename}"
+    return file_url, sha_hash
 
 # Create Modal volume for persistent storage
 volume = modal.Volume.from_name("data_01", create_if_missing=True)
@@ -83,7 +153,17 @@ def run_matching_pipeline(
         Dict containing results, matches, and metadata
     """
     import yaml
+    import boto3
     from main import run_matching_pipeline
+
+    # Initialize S3 client
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION_NAME"),
+    )
+    bucket_name = os.getenv("AWS_BUCKET_NAME")
 
     # Parse user profiles from JSON string
     user_profiles = json.loads(user_profiles_json)
