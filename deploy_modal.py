@@ -155,8 +155,7 @@ def zip_and_upload_outputs(s3_client, outputs_dir: str, bucket_name: str, group_
         outputs_zip_url, _ = upload_file_to_s3(
             s3_client=s3_client,
             file_path=temp_zip_path,
-            bucket_name=bucket_name,
-            name=zip_name
+            bucket_name=bucket_name
         )
 
         print(f"✅ Uploaded outputs zip to S3: {outputs_zip_url}")
@@ -179,7 +178,7 @@ volume = modal.Volume.from_name("data_01", create_if_missing=True)
     volumes={"/app/data": volume},
     cpu=2.0,
     max_containers=1,
-    timeout=180,
+    timeout=3600,
     min_containers=0
 )
 def run_matching_pipeline(
@@ -262,6 +261,9 @@ def run_matching_pipeline(
                 group_name=group_name
             )
 
+            print(f"✅ Pipeline result:")
+            print(result)
+
             # Commit volume changes
             volume.commit()
 
@@ -275,22 +277,21 @@ def run_matching_pipeline(
                     group_name=group_name
                 )
 
-            # Return only the cohort_summary dictionary with outputs_zip_url
+            # Return clean, consistent format
             if result.get("success") and result.get("cohort_summary"):
+                # Add outputs_zip_url to cohort_summary
                 cohort_summary = result["cohort_summary"]
                 cohort_summary["outputs_zip_url"] = outputs_zip_url
-                return_value = cohort_summary
+                return cohort_summary
             elif result.get("success"):
-                return_value = {
+                return {
                     "error": "Pipeline succeeded but cohort_summary not found in result",
                     "outputs_zip_url": outputs_zip_url
                 }
             else:
-                return_value = {
+                return {
                     "error": result.get("error", "Pipeline execution failed")
                 }
-
-            return return_value
 
         finally:
             # Clean up the unique data directory

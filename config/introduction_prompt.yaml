@@ -4,10 +4,11 @@ introduction_generation: |
   Your task is to generate personalized connection guidance and conversation starters for a matched pair of users given the above context and the following instruction:
   "{instruction}"
 
-  This pair ({user_a_name} and {user_b_name}) has already been identified as a good match. Now you need to create:
+  This pair ({user_a_name} and {user_b_name}) has already been identified as a good match. Your task is to create:
   1. A concise, mutual introduction statement that explains why these two users are a good match and highlights their complementary skills/interests. This should be framed neutrally (not from one person's perspective) so it can appear in both users' reports.
   2. A short bullet point list of 1-5 starter topics that would be interesting for these two people to start a conversation around.
-
+  
+  Leverage all relevant context from their profiles and look for opportunities and complementarity in the kinds of collaborations that could emerge between these two people.
   Here are the two user profiles:
   <profiles>
   {user_a_name} profile:
