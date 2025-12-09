@@ -179,6 +179,22 @@ def _execute_matching_pipeline(
     profiles = load_profiles(user_profiles_dir)
     print(f"✅ Loaded {len(profiles)} profiles")
 
+    # Early check for minimum group size
+    MIN_PROFILES_REQUIRED = 6
+    if len(profiles) < MIN_PROFILES_REQUIRED:
+        message = (
+            f"Insufficient profiles for matching. Found {len(profiles)} profile(s), "
+            f"but at least {MIN_PROFILES_REQUIRED} are required. "
+            "This matching tool is designed for larger groups where meaningful connections can be discovered."
+        )
+        print(f"❌ {message}")
+        return {
+            "success": False,
+            "error": message,
+            "profiles_count": len(profiles),
+            "min_required": MIN_PROFILES_REQUIRED,
+        }
+
     print("\n🧠 Step 2: Extracting sections with LLM...")
     try:
         goal = config.get("instruction_prompt", {}).get("goal")
@@ -208,6 +224,7 @@ def _execute_matching_pipeline(
     print(f"✅ Created embeddings: {embeddings.shape}")
 
     print("\n📊 Step 3.5: Creating t-SNE visualizations...")
+    tsne_results = None
     try:
         tsne_results = create_tsne_plots(
             embeddings=embeddings,
@@ -219,9 +236,8 @@ def _execute_matching_pipeline(
         )
         print(f"✅ Created t-SNE plots: {tsne_results['plots_dir']}")
     except Exception as exc:  # pylint: disable=broad-except
-        message = f"Error creating t-SNE visualizations: {exc}"
-        print(f"❌ {message}")
-        return {"success": False, "error": message}
+        # t-SNE visualization is non-essential, don't fail the pipeline
+        print(f"⚠️ Warning: Could not create t-SNE visualizations: {exc}")
 
     print("\n🎯 Step 4: Generating similarity matrix...")
     try:
@@ -361,6 +377,7 @@ def _execute_matching_pipeline(
     cost_tracker.save_detailed_report(str(cost_report_path))
 
     print("\n🎨 Step 9: Creating similarity visualizations...")
+    plots_results = None
     try:
         plots_results = create_similarity_plots(
             matrices_dict=matrices_dict,
@@ -371,31 +388,38 @@ def _execute_matching_pipeline(
         )
         print(f"✅ Created similarity visualizations: {plots_results['plots_dir']}")
     except Exception as exc:  # pylint: disable=broad-except
-        message = f"Error creating visualizations: {exc}"
-        print(f"❌ {message}")
-        return {"success": False, "error": message}
+        # Similarity visualizations are non-essential, don't fail the pipeline
+        print(f"⚠️ Warning: Could not create similarity visualizations: {exc}")
 
     print("\n🎉 Pipeline completed successfully!")
     print(f"📁 Check outputs in: {io_config.get('outputs_dir')}")
     print(f"📊 Cohort summary: {io_config.get('outputs_dir')}/cohort.json")
     print(f"💰 Cost report: {cost_report_path}")
-    print(f"📊 t-SNE plots: {tsne_results['plots_dir']}")
-    print(f"🎨 Similarity plots: {plots_results['plots_dir']}")
+    if tsne_results:
+        print(f"📊 t-SNE plots: {tsne_results['plots_dir']}")
+    if plots_results:
+        print(f"🎨 Similarity plots: {plots_results['plots_dir']}")
 
-    return {
+    result = {
         "success": True,
         "matches": final_edges,
         "profiles_count": len(profiles),
         "outputs_dir": io_config.get("outputs_dir"),
         "cost_report_path": str(cost_report_path),
-        "tsne_plots_dir": tsne_results["plots_dir"],
-        "similarity_plots_dir": plots_results["plots_dir"],
         "cohort_summary": cohort_summary,
         "stats": {
             "llm_calls": stats["total_calls"],
             "matches_created": len(final_edges),
         },
     }
+
+    # Add optional visualization paths if they were created successfully
+    if tsne_results:
+        result["tsne_plots_dir"] = tsne_results["plots_dir"]
+    if plots_results:
+        result["similarity_plots_dir"] = plots_results["plots_dir"]
+
+    return result
 
 
 class MatchingPipeline(BasePipeline):

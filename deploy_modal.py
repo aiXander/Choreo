@@ -203,101 +203,147 @@ def run_matching_pipeline(
     import boto3
     from main import run_matching_pipeline
 
-    # Initialize S3 client
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION_NAME"),
-    )
-    bucket_name = os.getenv("AWS_BUCKET_NAME")
+    base_data_dir = None  # Track for cleanup in outer exception handler
 
-    # Parse user profiles from JSON string
-    user_profiles = json.loads(user_profiles_json)
+    try:
+        # Initialize S3 client
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.getenv("AWS_REGION_NAME"),
+        )
+        bucket_name = os.getenv("AWS_BUCKET_NAME")
 
-    # Load config file
-    with open(config_path, "r") as f:
-        config_dict = yaml.safe_load(f)
-
-    # Create temporary directory for user profiles
-    with tempfile.TemporaryDirectory() as temp_dir:
-        profiles_dir = os.path.join(temp_dir, "profiles")
-        os.makedirs(profiles_dir, exist_ok=True)
-
-        # Write user profiles to temporary files
-        for user_id, profile_text in user_profiles.items():
-            profile_path = os.path.join(profiles_dir, f"{user_id}.txt")
-            with open(profile_path, "w", encoding="utf-8") as f:
-                f.write(profile_text)
-
-        # Update config to use persistent volume for outputs
-        # Generate unique UUID for this run to avoid conflicts
-        run_uuid = str(uuid.uuid4())
-        if group_name:
-            base_data_dir = f"/app/data/{group_name}_{run_uuid}"
-        else:
-            base_data_dir = f"/app/data/default_{run_uuid}"
-
-        config_dict['io']['processed_dir'] = f"{base_data_dir}/processed"
-        config_dict['io']['embeds_dir'] = f"{base_data_dir}/embeds"
-        config_dict['io']['outputs_dir'] = f"{base_data_dir}/outputs"
-        config_dict['io']['cache_dir'] = f"{base_data_dir}/cache"
-
-        # Ensure output directories exist
-        for dir_path in [
-            config_dict['io']['processed_dir'],
-            config_dict['io']['embeds_dir'],
-            config_dict['io']['outputs_dir'],
-            config_dict['io']['cache_dir']
-        ]:
-            os.makedirs(dir_path, exist_ok=True)
-
+        # Parse user profiles from JSON string
         try:
-            # Run the matching pipeline
-            result = run_matching_pipeline(
-                user_profiles_dir=profiles_dir,
-                config_dict=config_dict,
-                force=force,
-                group_name=group_name
-            )
+            user_profiles = json.loads(user_profiles_json)
+        except json.JSONDecodeError as e:
+            return {
+                "success": False,
+                "error": f"Invalid JSON in user_profiles_json: {e}"
+            }
 
-            print(f"✅ Pipeline result:")
-            print(result)
+        # Validate we have profiles
+        if not user_profiles:
+            return {
+                "success": False,
+                "error": "No user profiles provided. Please provide at least 6 user profiles."
+            }
 
-            # Commit volume changes
-            volume.commit()
+        # Load config file
+        try:
+            with open(config_path, "r") as f:
+                config_dict = yaml.safe_load(f)
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "error": f"Configuration file not found: {config_path}"
+            }
+        except yaml.YAMLError as e:
+            return {
+                "success": False,
+                "error": f"Invalid YAML in configuration file: {e}"
+            }
 
-            # Zip outputs directory and upload to S3
-            outputs_zip_url = None
-            if result.get("success") and result.get("outputs_dir"):
-                outputs_zip_url = zip_and_upload_outputs(
-                    s3_client=s3_client,
-                    outputs_dir=result["outputs_dir"],
-                    bucket_name=bucket_name,
+        # Create temporary directory for user profiles
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_dir = os.path.join(temp_dir, "profiles")
+            os.makedirs(profiles_dir, exist_ok=True)
+
+            # Write user profiles to temporary files
+            for user_id, profile_text in user_profiles.items():
+                profile_path = os.path.join(profiles_dir, f"{user_id}.txt")
+                with open(profile_path, "w", encoding="utf-8") as f:
+                    f.write(profile_text)
+
+            # Update config to use persistent volume for outputs
+            # Generate unique UUID for this run to avoid conflicts
+            run_uuid = str(uuid.uuid4())
+            if group_name:
+                base_data_dir = f"/app/data/{group_name}_{run_uuid}"
+            else:
+                base_data_dir = f"/app/data/default_{run_uuid}"
+
+            config_dict['io']['processed_dir'] = f"{base_data_dir}/processed"
+            config_dict['io']['embeds_dir'] = f"{base_data_dir}/embeds"
+            config_dict['io']['outputs_dir'] = f"{base_data_dir}/outputs"
+            config_dict['io']['cache_dir'] = f"{base_data_dir}/cache"
+
+            # Ensure output directories exist
+            for dir_path in [
+                config_dict['io']['processed_dir'],
+                config_dict['io']['embeds_dir'],
+                config_dict['io']['outputs_dir'],
+                config_dict['io']['cache_dir']
+            ]:
+                os.makedirs(dir_path, exist_ok=True)
+
+            try:
+                # Run the matching pipeline
+                result = run_matching_pipeline(
+                    user_profiles_dir=profiles_dir,
+                    config_dict=config_dict,
+                    force=force,
                     group_name=group_name
                 )
 
-            # Return clean, consistent format
-            if result.get("success") and result.get("cohort_summary"):
-                # Add outputs_zip_url to cohort_summary
-                cohort_summary = result["cohort_summary"]
-                cohort_summary["outputs_zip_url"] = outputs_zip_url
-                return cohort_summary
-            elif result.get("success"):
-                return {
-                    "error": "Pipeline succeeded but cohort_summary not found in result",
-                    "outputs_zip_url": outputs_zip_url
-                }
-            else:
-                return {
-                    "error": result.get("error", "Pipeline execution failed")
-                }
+                print(f"✅ Pipeline result:")
+                print(result)
 
-        finally:
-            # Clean up the unique data directory
-            if os.path.exists(base_data_dir):
-                try:
-                    shutil.rmtree(base_data_dir)
-                    print(f"✅ Cleaned up temporary directory: {base_data_dir}")
-                except Exception as e:
-                    print(f"⚠️ Warning: Failed to clean up directory {base_data_dir}: {e}")
+                # Commit volume changes
+                volume.commit()
+
+                # Zip outputs directory and upload to S3
+                outputs_zip_url = None
+                if result.get("success") and result.get("outputs_dir"):
+                    outputs_zip_url = zip_and_upload_outputs(
+                        s3_client=s3_client,
+                        outputs_dir=result["outputs_dir"],
+                        bucket_name=bucket_name,
+                        group_name=group_name
+                    )
+
+                # Return clean, consistent format
+                if result.get("success") and result.get("cohort_summary"):
+                    # Add outputs_zip_url to cohort_summary
+                    cohort_summary = result["cohort_summary"]
+                    cohort_summary["success"] = True
+                    cohort_summary["outputs_zip_url"] = outputs_zip_url
+                    return cohort_summary
+                elif result.get("success"):
+                    return {
+                        "success": True,
+                        "error": "Pipeline succeeded but cohort_summary not found in result",
+                        "outputs_zip_url": outputs_zip_url
+                    }
+                else:
+                    # Build error response with all relevant info from the failed result
+                    error_response = {
+                        "success": False,
+                        "error": result.get("error", "Pipeline execution failed"),
+                    }
+                    # Include additional context if available
+                    if "profiles_count" in result:
+                        error_response["profiles_count"] = result["profiles_count"]
+                    if "min_required" in result:
+                        error_response["min_required"] = result["min_required"]
+                    return error_response
+
+            finally:
+                # Clean up the unique data directory
+                if base_data_dir and os.path.exists(base_data_dir):
+                    try:
+                        shutil.rmtree(base_data_dir)
+                        print(f"✅ Cleaned up temporary directory: {base_data_dir}")
+                    except Exception as e:
+                        print(f"⚠️ Warning: Failed to clean up directory {base_data_dir}: {e}")
+
+    except Exception as e:
+        # Catch any unexpected errors and return a consistent error format
+        error_message = f"Unexpected error in matching pipeline: {type(e).__name__}: {e}"
+        print(f"❌ {error_message}")
+        return {
+            "success": False,
+            "error": error_message
+        }
