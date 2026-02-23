@@ -180,7 +180,7 @@ def _execute_matching_pipeline(
     print(f"✅ Loaded {len(profiles)} profiles")
 
     # Early check for minimum group size
-    MIN_PROFILES_REQUIRED = 6
+    MIN_PROFILES_REQUIRED = 4
     if len(profiles) < MIN_PROFILES_REQUIRED:
         message = (
             f"Insufficient profiles for matching. Found {len(profiles)} profile(s), "

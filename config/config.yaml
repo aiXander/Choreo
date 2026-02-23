@@ -1,7 +1,7 @@
 models:
-  embedding: "text-embedding-3"
-  extraction_llm: "gpt-5"
-  pair_llm: "gpt-5"
+  embedding: "text-embedding-3-small"
+  extraction_llm: "gpt-5.2"
+  pair_llm: "gpt-5.2"
 
 instruction_prompt:
   goal: "We are building a social connectivity graph based on user profiles. These people do not know each other and so we are looking to create introductions and build relationships between them so they can start working on new projects together. We are looking to find matches that are aligned on interests and goals and have complementary skills and could lead to interesting, novel collaborations with open ended outcomes and emergent properties."
