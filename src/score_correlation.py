@@ -4,7 +4,6 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
 
-from score import PairScore
 from utils import ensure_dir
 
 

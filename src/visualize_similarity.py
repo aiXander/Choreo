@@ -4,21 +4,12 @@ Visualize similarity matrices from the candidate generation algorithm.
 Creates individual section plots and a combined visualization.
 """
 
-import os
 import sys
-import numpy as np
 from pathlib import Path
-from dotenv import load_dotenv
-import argparse
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from utils import load_yaml, ensure_dir
-from ingest import load_profiles
-from extract import extract_sections_from_profiles
-from embed import create_section_embeddings
-from candidate import generate_similarity_matrix
-from llm import LLMWrapper
+from utils import ensure_dir
 
 
 def create_similarity_plots(

@@ -1,6 +1,5 @@
 """Generate per-user reports and cohort summary."""
 
-from pathlib import Path
 from typing import List, Dict, Any
 from collections import defaultdict
 
@@ -257,7 +256,7 @@ def generate_all_reports(
         print(f"  {count} users with {degree} matches")
     
     score_stats = cohort_summary['score_statistics']
-    print(f"\nScore ranges:")
+    print("\nScore ranges:")
     print(f"  Final weights: {score_stats['final_weights']['min']:.3f} - {score_stats['final_weights']['max']:.3f}")
     print(f"  Embedding scores: {score_stats['embedding_scores']['min']:.3f} - {score_stats['embedding_scores']['max']:.3f}")
     if score_stats['llm_scores']['avg'] > 0:

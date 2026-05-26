@@ -2,7 +2,7 @@
 
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 from utils import ensure_dir
 
@@ -148,7 +148,7 @@ def create_tsne_plots(
             fontweight='bold'
         )
     
-    plt.title(f't-SNE Visualization: Combined Distance Matrix (All Sections)', 
+    plt.title('t-SNE Visualization: Combined Distance Matrix (All Sections)', 
               fontsize=16, fontweight='bold')
     plt.xlabel('t-SNE 1', fontsize=12)
     plt.ylabel('t-SNE 2', fontsize=12)

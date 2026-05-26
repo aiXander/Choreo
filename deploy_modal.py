@@ -20,7 +20,6 @@ modal app stop choreo-matching
 
 import modal
 import os
-import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 import json
@@ -40,7 +39,7 @@ image = (
         "scikit-learn>=1.7.2",
         "matplotlib>=3.10.6",
         "seaborn>=0.13.0",
-        "litellm>=1.76.2",
+        "openai>=1.30.0",
         "pyyaml>=6.0.2",
         "tqdm>=4.66.2",
         "python-dotenv>=1.0.1",
@@ -54,6 +53,8 @@ image = (
     .env({"PYTHONPATH": "/app:/app/src"})
 )
 
+# NOTE: the referenced secret must contain OPENROUTER_API_KEY (used by the LLM
+# and embedding calls). AWS_* keys are still used for uploading output artifacts.
 app = modal.App(
     name="profile-matching",
     secrets=[modal.Secret.from_name("eve-secrets-PROD")]
@@ -126,7 +127,7 @@ def upload_file_to_s3(s3_client, file_path: str, bucket_name: str, name: Optiona
     return file_url, sha_hash
 
 
-def zip_and_upload_outputs(s3_client, outputs_dir: str, bucket_name: str, group_name: Optional[str] = None) -> Optional[str]:
+def zip_and_upload_outputs(s3_client, outputs_dir: str, bucket_name: str) -> Optional[str]:
     """
     Zip the outputs directory and upload it to S3.
 
@@ -134,7 +135,6 @@ def zip_and_upload_outputs(s3_client, outputs_dir: str, bucket_name: str, group_
         s3_client: Boto3 S3 client
         outputs_dir: Path to the outputs directory to zip
         bucket_name: S3 bucket name
-        group_name: Optional group name for naming the zip file
 
     Returns:
         S3 URL of the uploaded zip file, or None if upload fails
@@ -148,10 +148,7 @@ def zip_and_upload_outputs(s3_client, outputs_dir: str, bucket_name: str, group_
         zip_base_name = temp_zip_path.replace(".zip", "")
         shutil.make_archive(zip_base_name, 'zip', outputs_dir)
 
-        # Generate a name for the zip file
-        zip_name = f"outputs_{group_name}" if group_name else "outputs_default"
-
-        # Upload zip to S3
+        # Upload zip to S3 (object key is the file's SHA256 hash)
         outputs_zip_url, _ = upload_file_to_s3(
             s3_client=s3_client,
             file_path=temp_zip_path,
@@ -184,7 +181,6 @@ volume = modal.Volume.from_name("data_01", create_if_missing=True)
 def run_matching_pipeline(
     user_profiles_json: str,
     config_path: str = "config/config.yaml",
-    group_name: Optional[str] = None,
     force: bool = False
 ) -> Dict[str, Any]:
     """
@@ -193,7 +189,6 @@ def run_matching_pipeline(
     Args:
         user_profiles_json: JSON string containing user profiles dict
         config_path: Path to config YAML file
-        group_name: Optional group name for organization
         force: Whether to force re-run all steps
 
     Returns:
@@ -228,7 +223,7 @@ def run_matching_pipeline(
         if not user_profiles:
             return {
                 "success": False,
-                "error": "No user profiles provided. Please provide at least 6 user profiles."
+                "error": "No user profiles provided."
             }
 
         # Load config file
@@ -260,10 +255,7 @@ def run_matching_pipeline(
             # Update config to use persistent volume for outputs
             # Generate unique UUID for this run to avoid conflicts
             run_uuid = str(uuid.uuid4())
-            if group_name:
-                base_data_dir = f"/app/data/{group_name}_{run_uuid}"
-            else:
-                base_data_dir = f"/app/data/default_{run_uuid}"
+            base_data_dir = f"/app/data/run_{run_uuid}"
 
             config_dict['io']['processed_dir'] = f"{base_data_dir}/processed"
             config_dict['io']['embeds_dir'] = f"{base_data_dir}/embeds"
@@ -285,10 +277,9 @@ def run_matching_pipeline(
                     user_profiles_dir=profiles_dir,
                     config_dict=config_dict,
                     force=force,
-                    group_name=group_name
                 )
 
-                print(f"✅ Pipeline result:")
+                print("✅ Pipeline result:")
                 print(result)
 
                 # Commit volume changes
@@ -301,7 +292,6 @@ def run_matching_pipeline(
                         s3_client=s3_client,
                         outputs_dir=result["outputs_dir"],
                         bucket_name=bucket_name,
-                        group_name=group_name
                     )
 
                 # Return clean, consistent format

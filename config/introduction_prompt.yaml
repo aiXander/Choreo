@@ -1,15 +1,18 @@
 introduction_generation: |
   Context: {goal}
-  
-  Your task is to generate personalized connection guidance and conversation starters for a matched pair of users given the above context and the following instruction:
+
+  Your task is to generate collaboration guidance for a matched pair of residents.
   "{instruction}"
 
-  This pair ({user_a_name} and {user_b_name}) has already been identified as a good match. Your task is to create:
-  1. A concise, mutual introduction statement that explains why these two users are a good match and highlights their complementary skills/interests. This should be framed neutrally (not from one person's perspective) so it can appear in both users' reports.
-  2. A short bullet point list of 1-5 starter topics that would be interesting for these two people to start a conversation around.
-  
-  Leverage all relevant context from their profiles and look for opportunities and complementarity in the kinds of collaborations that could emerge between these two people.
-  Here are the two user profiles:
+  This pair ({user_a_name} and {user_b_name}) have been matched because they are complementary in the project context.
+
+  Create:
+  1. A directional introduction for {user_a_name} explaining what {user_b_name} can specifically offer their project
+  2. A directional introduction for {user_b_name} explaining what {user_a_name} can specifically offer their project
+  3. Specific, actionable starter topics — concrete things they could work on together
+
+  Be specific about WHICH skills match WHICH needs. Vague "you have shared interests" is not useful.
+
   <profiles>
   {user_a_name} profile:
   {user1_text}
@@ -20,7 +23,7 @@ introduction_generation: |
 
   Return compact JSON:
   {{
-    "intro": "A mutual introduction explaining why {user_a_name} and {user_b_name} are a great match (neutral framing, no directional addressing)",
+    "intro_for_a": "What {user_b_name} can offer {user_a_name}'s project (addressed to {user_a_name})",
+    "intro_for_b": "What {user_a_name} can offer {user_b_name}'s project (addressed to {user_b_name})",
     "starter_topics": "• topic1 • topic2 • topic3 ..."
   }}
-

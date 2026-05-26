@@ -1,4 +1,4 @@
-"""Cost tracking for LiteLLM API calls."""
+"""Cost tracking for OpenRouter LLM and embedding API calls."""
 
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
@@ -15,6 +15,10 @@ class APICall:
     output_tokens: int
     cost: float
     timestamp: str
+    # OpenRouter usage-accounting details (0 when not applicable/reported).
+    cached_tokens: int = 0       # prompt tokens served from cache
+    reasoning_tokens: int = 0    # tokens spent on reasoning (reasoning models)
+    upstream_cost: float = 0.0   # upstream provider cost for BYOK requests
 
 
 class CostTracker:
@@ -33,13 +37,16 @@ class CostTracker:
         input_tokens: int = 0,
         output_tokens: int = 0,
         cost: float = 0.0,
-        timestamp: Optional[str] = None
+        timestamp: Optional[str] = None,
+        cached_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        upstream_cost: float = 0.0,
     ):
         """Record an API call with its cost."""
         if timestamp is None:
             from datetime import datetime
             timestamp = datetime.now().isoformat()
-            
+
         call = APICall(
             component=component,
             call_type=call_type,
@@ -47,7 +54,10 @@ class CostTracker:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost=cost,
-            timestamp=timestamp
+            timestamp=timestamp,
+            cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            upstream_cost=upstream_cost,
         )
         
         self.calls.append(call)
@@ -83,16 +93,22 @@ class CostTracker:
         # Token statistics
         total_input_tokens = sum(call.input_tokens for call in self.calls)
         total_output_tokens = sum(call.output_tokens for call in self.calls)
-        
+        total_cached_tokens = sum(call.cached_tokens for call in self.calls)
+        total_reasoning_tokens = sum(call.reasoning_tokens for call in self.calls)
+        total_upstream_cost = sum(call.upstream_cost for call in self.calls)
+
         # Call type breakdown
         completion_calls = sum(1 for call in self.calls if call.call_type == 'completion')
         embedding_calls = sum(1 for call in self.calls if call.call_type == 'embedding')
-        
+
         return {
             'total_cost': round(total_cost, 4),
             'total_calls': total_calls,
             'total_input_tokens': total_input_tokens,
             'total_output_tokens': total_output_tokens,
+            'total_cached_tokens': total_cached_tokens,
+            'total_reasoning_tokens': total_reasoning_tokens,
+            'total_upstream_cost': round(total_upstream_cost, 4),
             'completion_calls': completion_calls,
             'embedding_calls': embedding_calls,
             'component_costs': {k: round(v, 4) for k, v in self.get_component_costs().items()},
@@ -104,24 +120,31 @@ class CostTracker:
         """Print a formatted cost summary."""
         stats = self.get_stats()
         
-        print(f"\n💰 COST SUMMARY")
+        print("\n💰 COST SUMMARY")
         print("=" * 50)
         print(f"Total Cost: ${stats['total_cost']:.4f}")
         print(f"Total API Calls: {stats['total_calls']}")
         print(f"Total Input Tokens: {stats['total_input_tokens']:,}")
         print(f"Total Output Tokens: {stats['total_output_tokens']:,}")
-        
-        print(f"\n📊 BREAKDOWN BY CALL TYPE:")
+        # Only show OpenRouter usage-accounting extras when they're non-zero.
+        if stats.get('total_cached_tokens'):
+            print(f"Cached Tokens: {stats['total_cached_tokens']:,}")
+        if stats.get('total_reasoning_tokens'):
+            print(f"Reasoning Tokens: {stats['total_reasoning_tokens']:,}")
+        if stats.get('total_upstream_cost'):
+            print(f"Upstream (BYOK) Cost: ${stats['total_upstream_cost']:.4f}")
+
+        print("\n📊 BREAKDOWN BY CALL TYPE:")
         for call_type, cost in stats['call_type_costs'].items():
             call_count = stats.get(f'{call_type}_calls', 0)
             print(f"  {call_type.title()}: ${cost:.4f} ({call_count} calls)")
         
-        print(f"\n🧩 BREAKDOWN BY COMPONENT:")
+        print("\n🧩 BREAKDOWN BY COMPONENT:")
         for component, cost in sorted(stats['component_costs'].items()):
             percentage = (cost / stats['total_cost'] * 100) if stats['total_cost'] > 0 else 0
             print(f"  {component}: ${cost:.4f} ({percentage:.1f}%)")
         
-        print(f"\n🤖 BREAKDOWN BY MODEL:")
+        print("\n🤖 BREAKDOWN BY MODEL:")
         for model, cost in sorted(stats['model_costs'].items()):
             percentage = (cost / stats['total_cost'] * 100) if stats['total_cost'] > 0 else 0
             print(f"  {model}: ${cost:.4f} ({percentage:.1f}%)")
@@ -139,7 +162,10 @@ class CostTracker:
                     'model': call.model,
                     'input_tokens': call.input_tokens,
                     'output_tokens': call.output_tokens,
+                    'cached_tokens': call.cached_tokens,
+                    'reasoning_tokens': call.reasoning_tokens,
                     'cost': call.cost,
+                    'upstream_cost': call.upstream_cost,
                     'timestamp': call.timestamp
                 }
                 for call in self.calls

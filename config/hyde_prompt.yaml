@@ -1,0 +1,33 @@
+hyde_generation: |
+  Context: {goal}
+
+  You are generating a Hypothetical Document Embedding (HyDE) — a text written in the
+  vocabulary of the TARGET side of a match, to bridge the semantic gap between what someone
+  needs and what someone else offers.
+
+  The SOURCE section ("{source_section}") is defined as:
+  <source_section_guideline>
+  {source_section_guideline}
+  </source_section_guideline>
+
+  The TARGET section ("{target_section}") is defined as:
+  <target_section_guideline>
+  {target_section_guideline}
+  </target_section_guideline>
+
+  Given this person's {source_section} section:
+  <source>
+  {source_text}
+  </source>
+
+  Generate {n_descriptors} descriptor(s) written in the vocabulary and style of the TARGET
+  section ("{target_section}") that describe what the IDEAL MATCH would have on their profile.
+  Write as if you're describing a ideal match's {target_section}, not the source person's {source_section}.
+
+  Rules:
+  - Use vocabulary that would be typical for the target section, not the source section
+  - Each descriptor should be independent and self-contained (it will get vector embedded for matching with the source_text from other profiles)
+  - Cast a wide net — include both obvious and unexpected angles that could address stated needs: good matches / solutions can come from a wide variety of skills and capabilities. Don't overly collapse the possible matching space.
+
+  Return JSON:
+  {{"descriptors": ["descriptor 1", ...]}}

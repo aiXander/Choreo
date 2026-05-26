@@ -1,109 +1,248 @@
-"""LLM wrapper with caching and retry logic."""
+"""LLM wrapper for OpenRouter (OpenAI-compatible API) with caching and retry logic.
 
+All LLM calls are routed through OpenRouter (https://openrouter.ai) using the
+OpenAI Python SDK pointed at OpenRouter's base URL. This lets us swap providers
+and run different pipeline phases with different models simply by changing the
+model strings in config.yaml under `models:` (e.g. "google/gemini-3.1-flash-lite",
+"anthropic/claude-3.5-sonnet", "openai/gpt-5").
+"""
+
+import os
 import json
-import time
 import asyncio
-from pathlib import Path
-from typing import Dict, Any, Optional, Union, List, Callable
-from concurrent.futures import ThreadPoolExecutor
-from openai import OpenAI
+from typing import Dict, Any, Optional, List
+
+from openai import OpenAI, AsyncOpenAI
+from dotenv import load_dotenv
 
 from utils import get_cache_path, load_json, save_json, ensure_dir
 from cost_tracker import get_cost_tracker
 
-# Initialize OpenAI client
-openai_client = OpenAI()
+# Load environment variables (OPENROUTER_API_KEY) from the repo-root .env if present.
+load_dotenv()
 
-# Thread pool for async operations
-_executor = ThreadPoolExecutor(max_workers=10)
+# OpenRouter exposes an OpenAI-compatible REST API.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Pricing per 1M tokens (input/output) in USD
-pricing = {
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gpt-4.1": {"input": 5.00, "output": 15.00},
-    "gpt-4o": {"input": 2.50, "output": 10.00},
+# Default models. These are overridden per-phase from config.yaml (`models:`),
+# but act as fallbacks when a model is not specified.
+DEFAULT_MODEL = "google/gemini-3.1-flash-lite"
+DEFAULT_EMBEDDING_MODEL = "google/gemini-embedding-2-preview"
 
-    "gpt-5":      {"input": 1.25, "output": 10.0},
-    "gpt-5-mini": {"input": 0.25, "output": 2.00},
-    "gpt-5-nano": {"input": 0.05, "output": 0.40},
+# Optional attribution headers shown on OpenRouter dashboards (harmless to keep).
+_DEFAULT_HEADERS = {
+    "HTTP-Referer": "https://github.com/xandersteenbrugge/Choreo",
+    "X-Title": "Choreo",
 }
 
-
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculate cost based on model pricing and token usage."""
-    if model not in pricing:
-        print(f"⚠️  WARNING: No pricing information for model {model}")
-        return 0.0
-    
-    model_pricing = pricing[model]
-    input_cost = (input_tokens / 1_000_000) * model_pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * model_pricing["output"]
-    
-    return input_cost + output_cost
+# Lazily-initialized singleton sync OpenRouter client (constructed after .env loads).
+_client: Optional[OpenAI] = None
 
 
-def _sync_openai_response(input_messages: List[Dict[str, str]], model: str, 
-                         reasoning_effort: str = "low", **kwargs) -> Any:
-    """Synchronous OpenAI response call."""
-    # Convert input format from litellm to OpenAI format
-    if input_messages and len(input_messages) == 1 and input_messages[0].get("role") == "user":
-        input_text = input_messages[0]["content"]
-    else:
-        # Handle multi-turn conversations by joining them
-        input_text = "\n".join([msg.get("content", "") for msg in input_messages if msg.get("content")])
-    
-    # Build OpenAI API call parameters
-    params = {
-        "model": model,
-        "input": input_text,
-        "reasoning": {"effort": reasoning_effort} #, "summary": 'detailed'}
+def _client_kwargs() -> Dict[str, Any]:
+    """Shared constructor kwargs for the sync and async OpenRouter clients."""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY not found. Add it to the .env file at the repo root."
+        )
+    return {
+        "base_url": OPENROUTER_BASE_URL,
+        "api_key": api_key,
+        "default_headers": _DEFAULT_HEADERS,
     }
-    
-    # Add any additional kwargs that are valid for OpenAI
-    for key, value in kwargs.items():
-        if key in ["temperature", "max_output_tokens", "stream", "background"]:
-            params[key] = value
-    
-    return openai_client.responses.create(**params)
 
 
-async def async_openai_response(input_messages: List[Dict[str, str]], model: str, 
-                               reasoning_effort: str = "low", **kwargs) -> Any:
-    """Async wrapper for OpenAI responses.create()."""
-    loop = asyncio.get_event_loop()
-    # run_in_executor doesn't accept keyword arguments, so we need to use a wrapper
-    def wrapper():
-        return _sync_openai_response(input_messages, model, reasoning_effort, **kwargs)
-    
-    return await loop.run_in_executor(_executor, wrapper)
+def get_openrouter_client() -> OpenAI:
+    """Return a shared sync OpenRouter client (used for embeddings)."""
+    global _client
+    if _client is None:
+        _client = OpenAI(**_client_kwargs())
+    return _client
 
 
-async def async_gather_responses(tasks: List) -> List:
-    """Gather multiple async OpenAI response tasks with proper cleanup."""
-    try:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
-    finally:
-        # Ensure all tasks are properly cleaned up
-        for task in tasks:
-            if not task.done():
-                task.cancel()
+def make_async_openrouter_client() -> AsyncOpenAI:
+    """Create a fresh async OpenRouter client; the caller must close it.
+
+    A new client is created per async batch run rather than shared as a module
+    singleton: the underlying httpx transport binds to the running event loop,
+    and this pipeline opens a fresh event loop (``asyncio.run``) for each phase.
+    """
+    return AsyncOpenAI(**_client_kwargs())
+
+
+def _get_nested(obj: Any, name: str) -> Any:
+    """Read a field from an SDK pydantic object or a plain dict, tolerant of both.
+
+    Non-standard OpenRouter fields (cost, cost_details, ...) land in the OpenAI
+    SDK's ``model_extra`` rather than as declared attributes, so check there too.
+    """
+    if obj is None:
+        return None
+    val = getattr(obj, name, None)
+    if val is None:
+        extra = getattr(obj, "model_extra", None)
+        if isinstance(extra, dict):
+            val = extra.get(name)
+    if val is None and isinstance(obj, dict):
+        val = obj.get(name)
+    return val
+
+
+def extract_usage(response: Any) -> Dict[str, Any]:
+    """Extract OpenRouter's usage accounting from a chat/embedding response.
+
+    OpenRouter always returns full usage details — including the real ``cost``
+    (in USD credits) — on every response, with no extra request param or API
+    call needed. See:
+    https://openrouter.ai/docs/cookbook/administration/usage-accounting
+
+    Returns a dict with token counts, cost, and nested details (cached/reasoning
+    tokens, upstream BYOK cost). ``cost`` is ``None`` only if not reported.
+    """
+    usage = getattr(response, "usage", None)
+
+    prompt_tokens = int(_get_nested(usage, "prompt_tokens") or 0)
+    completion_tokens = int(_get_nested(usage, "completion_tokens") or 0)
+    total_tokens = int(_get_nested(usage, "total_tokens") or (prompt_tokens + completion_tokens))
+
+    cost = _get_nested(usage, "cost")
+
+    prompt_details = _get_nested(usage, "prompt_tokens_details")
+    completion_details = _get_nested(usage, "completion_tokens_details")
+    cost_details = _get_nested(usage, "cost_details")
+
+    cached_tokens = int(_get_nested(prompt_details, "cached_tokens") or 0)
+    reasoning_tokens = int(_get_nested(completion_details, "reasoning_tokens") or 0)
+    upstream_cost = float(_get_nested(cost_details, "upstream_inference_cost") or 0.0)
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cost": float(cost) if cost is not None else None,
+        "cached_tokens": cached_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "upstream_inference_cost": upstream_cost,
+    }
+
+
+def _build_extra_body(reasoning_effort: Optional[str], enable_reasoning: bool) -> Dict[str, Any]:
+    """Assemble OpenRouter-specific request extensions.
+
+    Note: OpenRouter usage accounting (cost + token details) is always on, so no
+    ``usage: {include: true}`` flag is needed — it returns automatically.
+    """
+    extra_body: Dict[str, Any] = {}
+    # Only forward a reasoning effort to reasoning-capable models when enabled;
+    # the default (gemini-flash-lite) is not a reasoning model.
+    if enable_reasoning and reasoning_effort:
+        extra_body["reasoning"] = {"effort": reasoning_effort}
+    return extra_body
+
+
+def _build_chat_params(
+    messages: List[Dict[str, str]],
+    model: str,
+    reasoning_effort: Optional[str] = None,
+    enable_reasoning: bool = False,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Build the chat.completions request params shared by sync and async paths."""
+    params: Dict[str, Any] = {
+        "model": model or DEFAULT_MODEL,
+        "messages": messages,
+    }
+
+    extra_body = _build_extra_body(reasoning_effort, enable_reasoning)
+    if extra_body:
+        params["extra_body"] = extra_body
+
+    # Forward standard sampling params if explicitly provided.
+    for key in ("temperature", "max_tokens", "top_p"):
+        if kwargs.get(key) is not None:
+            params[key] = kwargs[key]
+
+    return params
+
+
+def _extract_message_content(response: Any) -> str:
+    """Extract assistant text from an OpenAI-style chat completion response."""
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise ValueError("No choices found in response")
+    content = choices[0].message.content
+    if content is None:
+        raise ValueError("No message content found in response")
+    return content
+
+
+async def async_chat_completion(
+    client: AsyncOpenAI,
+    messages: List[Dict[str, str]],
+    model: str,
+    reasoning_effort: Optional[str] = None,
+    enable_reasoning: bool = False,
+    **kwargs,
+) -> Any:
+    """Native async OpenRouter chat completion using a caller-provided client."""
+    return await client.chat.completions.create(
+        **_build_chat_params(messages, model, reasoning_effort, enable_reasoning, **kwargs)
+    )
 
 
 class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
     
-    def __init__(self, cache_dir: str, max_retries: int = 3):
+    def __init__(self, cache_dir: str, max_retries: int = 3, enable_reasoning: bool = False):
         self.cache_dir = ensure_dir(cache_dir) / "llm"
         ensure_dir(self.cache_dir)
         self.max_retries = max_retries
         self.call_count = 0
         self.cost_tracker = get_cost_tracker()
         self.current_component = None  # Will be set by calling code
-        
+        # Whether to forward reasoning effort to the model (only useful for
+        # reasoning-capable models; default model is non-reasoning).
+        self.enable_reasoning = enable_reasoning
+        # Async client, created/closed per batch_json_complete run (see note in
+        # make_async_openrouter_client about per-event-loop lifecycle).
+        self._async_client: Optional[AsyncOpenAI] = None
+
     def set_component(self, component: str):
         """Set the current component for cost tracking."""
         self.current_component = component
+
+    def _record_usage(self, response: Any, model: str, call_type: str = "completion"):
+        """Record token usage and cost for a completed call.
+
+        Uses OpenRouter's native usage accounting (authoritative real cost in USD
+        credits, returned automatically on every response).
+        """
+        try:
+            usage = extract_usage(response)
+            input_tokens = usage["prompt_tokens"]
+            output_tokens = usage["completion_tokens"]
+
+            cost = usage["cost"]
+            if cost is None:
+                # OpenRouter normally always reports cost; 0.0 is a safe default.
+                print(f"⚠️  WARNING: OpenRouter reported no cost for {call_type} call with model {model}")
+                cost = 0.0
+
+            component = self.current_component if self.current_component else "unknown"
+            self.cost_tracker.record_call(
+                component=component,
+                call_type=call_type,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost=cost,
+                cached_tokens=usage["cached_tokens"],
+                reasoning_tokens=usage["reasoning_tokens"],
+                upstream_cost=usage["upstream_inference_cost"],
+            )
+        except (AttributeError, KeyError, TypeError) as e:
+            print(f"⚠️  WARNING: Could not track cost for {call_type} call with model {model}: {e}")
     
     def _prepare_json_prompt(self, prompt: str, schema_hint: Optional[str]) -> str:
         """Prepare prompt for JSON output."""
@@ -154,138 +293,6 @@ class LLMWrapper:
     def get_stats(self) -> Dict[str, int]:
         """Get usage statistics."""
         return {"total_calls": self.call_count}
-    
-    def json_complete(
-        self,
-        prompt: str,
-        model: str,
-        cache_key: Optional[str] = None,
-        schema_hint: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Complete a prompt expecting JSON response.
-        
-        Args:
-            prompt: The prompt to send
-            model: Model name (e.g., "gpt-4o-mini")
-            cache_key: Cache key (if None, no caching)
-            schema_hint: Optional hint about expected JSON structure
-            
-        Returns:
-            Parsed JSON response
-        """
-        # Check cache first
-        if cache_key:
-            cache_path = get_cache_path(self.cache_dir, cache_key)
-            if cache_path.exists():
-                try:
-                    return load_json(cache_path)
-                except Exception as e:
-                    print(f"Warning: Failed to load cache {cache_path}: {e}")
-        
-        # Enhance prompt for JSON output
-        json_prompt = self._prepare_json_prompt(prompt, schema_hint)
-        
-        # Make LLM call with retries
-        response = self._call_with_retries(
-            model=model,
-            prompt=json_prompt
-        )
-        
-        # Parse JSON response
-        try:
-            result = self._extract_json(response)
-        except Exception as e:
-            print(f"Warning: Failed to parse JSON response: {e}")
-            print(f"Raw response: {response[:200]}...")
-            raise
-        
-        # Cache result
-        if cache_key:
-            try:
-                save_json(result, cache_path)
-            except Exception as e:
-                print(f"Warning: Failed to save cache {cache_path}: {e}")
-        
-        return result
-    
-    def _call_with_retries(
-        self,
-        model: str,
-        prompt: str,
-        verbosity: int = 0
-    ) -> str:
-        """Make LLM call with retry logic."""
-        last_error = None
-
-        if verbosity > 1:
-            print('-----------------------------------------------------------')
-            print(f"Calling LLM {model} with prompt:\n{prompt}")
-            print('-----------------------------------------------------------')
-        
-        for attempt in range(self.max_retries):
-            try:
-                self.call_count += 1
-                
-                # Use OpenAI client
-                response = _sync_openai_response(
-                    input_messages=[{"role": "user", "content": prompt}],
-                    model=model,
-                    stream=False,
-                    background=False
-                )
-                
-                # Track cost using OpenAI response
-                try:
-                    # OpenAI response format has usage information
-                    usage = getattr(response, 'usage', None)
-                    input_tokens = getattr(usage, 'input_tokens', 0) if usage else 0
-                    output_tokens = getattr(usage, 'output_tokens', 0) if usage else 0
-                    
-                    # Calculate cost using our pricing dictionary
-                    cost = calculate_cost(model, input_tokens, output_tokens)
-                    
-                    component = self.current_component if self.current_component else "unknown"
-                    self.cost_tracker.record_call(
-                        component=component,
-                        call_type="completion",
-                        model=model,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cost=cost
-                    )
-                except (AttributeError, KeyError) as e:
-                    # If cost tracking fails, continue without it
-                    print(f"⚠️  WARNING: Could not track cost for completion call with model {model}: {e}")
-                
-                # Extract content from OpenAI response format
-                # Find the message output (skip reasoning items)
-                content = None
-                for output_item in response.output:
-                    if hasattr(output_item, 'type') and output_item.type == 'message':
-                        content = output_item.content[0].text
-                        break
-                
-                if content is None:
-                    raise ValueError("No message content found in response")
-
-                if verbosity > 1:
-                    print('-----------------------------------------------------------')
-                    print(f"Response: {content.strip()}")
-                    print('-----------------------------------------------------------')
-                        
-                return content.strip()
-                
-            except Exception as e:
-                last_error = e
-                if attempt < self.max_retries - 1:
-                    wait_time = 2 ** attempt  # exponential backoff
-                    print(f"LLM call failed (attempt {attempt + 1}), retrying in {wait_time}s: {e}")
-                    time.sleep(wait_time)
-                else:
-                    print(f"LLM call failed after {self.max_retries} attempts: {e}")
-        
-        raise last_error
 
     async def batch_json_complete(
         self,
@@ -342,48 +349,55 @@ class LLMWrapper:
         cached_count = n_prompts - len(uncached_indices)
         if cached_count > 0:
             print(f"Found {cached_count} cached results")
-        
+
         if not uncached_indices:
             return results
-        
-        # Process uncached prompts in batches
-        for batch_start in range(0, len(uncached_indices), batch_size):
-            batch_end = min(batch_start + batch_size, len(uncached_indices))
-            batch_indices = uncached_indices[batch_start:batch_end]
-            
-            print(f"Processing batch {batch_start//batch_size + 1}: items {batch_start + 1}-{batch_end} of {len(uncached_indices)} uncached")
-            
-            # Create tasks for this batch
-            tasks = []
-            for i in batch_indices:
-                prompt = prompts[i]
-                cache_key = cache_keys[i]
-                schema_hint = schema_hints[i]
-                
-                task = asyncio.create_task(self._async_json_complete_with_retry(
-                    prompt=prompt,
-                    model=model,
-                    cache_key=cache_key,
-                    schema_hint=schema_hint,
-                    max_retries=max_retries,
-                    retry_delay_base=retry_delay_base,
-                    reasoning_effort=reasoning_effort,
-                    verbosity=verbosity,
-                    print_reasoning_summary=print_reasoning_summary
-                ))
-                tasks.append(task)
-            
-            # Execute batch
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Store results, handling exceptions
-            for i, result in zip(batch_indices, batch_results):
-                if isinstance(result, Exception):
-                    print(f"Task failed for prompt {i}: {result}")
-                    results[i] = result  # Keep exception in results for caller to handle
-                else:
-                    results[i] = result
-        
+
+        # Open one async client for this run (bound to the current event loop)
+        # and close it when done — see make_async_openrouter_client.
+        self._async_client = make_async_openrouter_client()
+        try:
+            # Process uncached prompts in batches
+            for batch_start in range(0, len(uncached_indices), batch_size):
+                batch_end = min(batch_start + batch_size, len(uncached_indices))
+                batch_indices = uncached_indices[batch_start:batch_end]
+
+                print(f"Processing batch {batch_start//batch_size + 1}: items {batch_start + 1}-{batch_end} of {len(uncached_indices)} uncached")
+
+                # Create tasks for this batch
+                tasks = []
+                for i in batch_indices:
+                    prompt = prompts[i]
+                    cache_key = cache_keys[i]
+                    schema_hint = schema_hints[i]
+
+                    task = asyncio.create_task(self._async_json_complete_with_retry(
+                        prompt=prompt,
+                        model=model,
+                        cache_key=cache_key,
+                        schema_hint=schema_hint,
+                        max_retries=max_retries,
+                        retry_delay_base=retry_delay_base,
+                        reasoning_effort=reasoning_effort,
+                        verbosity=verbosity,
+                        print_reasoning_summary=print_reasoning_summary
+                    ))
+                    tasks.append(task)
+
+                # Execute batch
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Store results, handling exceptions
+                for i, result in zip(batch_indices, batch_results):
+                    if isinstance(result, Exception):
+                        print(f"Task failed for prompt {i}: {result}")
+                        results[i] = result  # Keep exception in results for caller to handle
+                    else:
+                        results[i] = result
+        finally:
+            await self._async_client.close()
+            self._async_client = None
+
         print(f"Completed processing all {n_prompts} prompts")
         await cleanup_background_tasks()
         return results
@@ -419,55 +433,29 @@ class LLMWrapper:
                     print(f"Calling LLM {model} with prompt:\n{json_prompt}")
                     print("-----------------------------------------------------------")
 
-                response = await async_openai_response(
-                    input_messages=[{"role": "user", "content": json_prompt}],
+                response = await async_chat_completion(
+                    self._async_client,
+                    messages=[{"role": "user", "content": json_prompt}],
                     model=model,
-                    stream=False,
-                    background=False,
-                    reasoning_effort=reasoning_effort
+                    reasoning_effort=reasoning_effort,
+                    enable_reasoning=self.enable_reasoning,
                 )
-                
-                # Track cost using OpenAI response
-                try:
-                    # OpenAI response format has usage information
-                    usage = getattr(response, 'usage', None)
-                    input_tokens = getattr(usage, 'input_tokens', 0) if usage else 0
-                    output_tokens = getattr(usage, 'output_tokens', 0) if usage else 0
-                    
-                    # Calculate cost using our pricing dictionary
-                    cost = calculate_cost(model, input_tokens, output_tokens)
-                    
-                    component = self.current_component if self.current_component else "unknown"
-                    self.cost_tracker.record_call(
-                        component=component,
-                        call_type="completion",
-                        model=model,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cost=cost
-                    )
-                except (AttributeError, KeyError) as e:
-                    print(f"⚠️  WARNING: Could not track cost for async completion call with model {model}: {e}")
-                
+
+                # Track token usage and cost.
+                self._record_usage(response, model, "completion")
+
                 if verbosity > 1:
                     print(f"Response: {response}")
-                
-                # Print reasoning summary if requested
-                if print_reasoning_summary and hasattr(response, 'reasoning') and response.reasoning:
-                    if hasattr(response.reasoning, 'summary') and response.reasoning.summary:
-                        print(f"🧠 Reasoning Summary: {response.reasoning.summary}")
-                
-                # Extract content from OpenAI response format
-                # Find the message output (skip reasoning items)
-                content = None
-                for output_item in response.output:
-                    if hasattr(output_item, 'type') and output_item.type == 'message':
-                        content = output_item.content[0].text
-                        break
-                
-                if content is None:
-                    raise ValueError("No message content found in response")
-                
+
+                # Print reasoning trace if requested and the model returned one.
+                if print_reasoning_summary:
+                    reasoning = getattr(response.choices[0].message, "reasoning", None)
+                    if reasoning:
+                        print(f"🧠 Reasoning: {str(reasoning)[:500]}")
+
+                # Extract assistant text from the chat completion response.
+                content = _extract_message_content(response)
+
                 # Parse JSON
                 result = self._extract_json(content.strip())
                 

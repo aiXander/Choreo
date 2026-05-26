@@ -1,32 +1,52 @@
+# All models are routed through OpenRouter (https://openrouter.ai).
+# Use OpenRouter model slugs (provider/model). Swap providers or run different
+# phases on different models just by editing the strings below.
 models:
-  embedding: "text-embedding-3-small"
-  extraction_llm: "gpt-5.2"
-  pair_llm: "gpt-5.2"
+  embedding: "google/gemini-embedding-2-preview"
+  # Matryoshka (MRL) truncation, applied at computation time. gemini-embedding-2
+  # is MRL-trained: the most important information is packed into the leading
+  # dimensions, so the working vectors can be truncated to a shorter length with
+  # minimal quality loss — cheaper similarity math. Full 3072-dim vectors are
+  # always stored on disk, so this is re-tunable without re-embedding. Set to an
+  # int (e.g. 1536, 768); leave null/omit to use the full native size (3072).
+  embedding_dimensions: 768
+  extraction_llm: "google/gemini-3.1-flash-lite"
+  pair_llm: "google/gemini-3.1-flash-lite"
+  # Set true only when using reasoning-capable models, to forward the per-phase
+  # reasoning effort (extraction/intro use "low", pair scoring uses "medium").
+  # The default flash-lite model is not a reasoning model, so this stays false.
+  enable_reasoning: false
 
 instruction_prompt:
-  goal: "We are building a social connectivity graph based on user profiles. These people do not know each other and so we are looking to create introductions and build relationships between them so they can start working on new projects together. We are looking to find matches that are aligned on interests and goals and have complementary skills and could lead to interesting, novel collaborations with open ended outcomes and emergent properties."
+  goal: "We are matching community residents who are working on their finals projects. Each person has specific skills and project needs. We want to find pairs where one person's skills can directly help the other's project needs."
 
 budgets:
-  extraction_llm_calls: 100   # max = n_profiles (all sections extracted in same call)
-  max_pair_llm_calls:   300   # small multiple of n_profiles
-  max_n_llm_evaluations_per_profile: 16    # max number of LLM evaluations per profile
-  n_profiles_to_score_together: 4          # number of profiles scored together (generates n*(n-1)/2 pairs per call)
+  extraction_llm_calls: 100
+  max_pair_llm_calls: 300
+  max_n_llm_evaluations_per_profile: 16
+  n_profiles_to_score_together: 4
+
+hyde:
+  n_descriptors: 1
 
 recipe:
-  instruction: "Score this match based on alignment and possible project complementarity: shared interests and goals but complementary skills that could build towards a real project collaboration."
-  section_weights:          # Make sure these match the section names in section_prompt.yaml !!!
-    capabilities: -0.20     # negative weight for inverse scoring (different = good)
-    interests:     0.40
-    goals:         0.30
-    persona:       0.10
+  instruction: "Score this match based on how directly each person's skills can address the other's project needs. The best matches are where both people bring something the other needs but unidirectional matches are also totally fine. Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
+  section_weights:
+    skills:   -0.10
+    vision:   0.30
+    project:  0.10
+    needs:    0.00
+  cross_section_weights:
+    needs_skills: 0.80
 
-blending:  # final = w*embed + (1-w)*llm_score
+blending:
   embed_weight: 0.35
   llm_weight:   0.65
 
 matching:
-  b_min: 3
+  b_min: 2
   b_max: 4
+  min_profiles_required: 2
 
 io:
   raw_dir: "data/raw"

@@ -5,15 +5,20 @@ Minimal test script to debug the async batch processing issue.
 
 import asyncio
 import json
+import sys
+from pathlib import Path
 from typing import List, Dict, Any, Optional
-from litellm import aresponses
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+from llm import async_chat_completion, _extract_message_content, make_async_openrouter_client
 
 class SimpleAsyncTester:
     """Minimal version of the async batch processing logic."""
-    
+
     def __init__(self):
         self.call_count = 0
-    
+        self._async_client = None
+
     async def batch_json_complete(
         self,
         prompts: List[str],
@@ -23,12 +28,22 @@ class SimpleAsyncTester:
         """Simplified version of batch_json_complete."""
         if not prompts:
             return []
-        
+
         n_prompts = len(prompts)
         print(f"Processing {n_prompts} prompts in batches of {batch_size}")
-        
+
         results = [None] * n_prompts
-        
+        # Open one async client for this run; closed in the finally below.
+        self._async_client = make_async_openrouter_client()
+        try:
+            return await self._run_batches(prompts, model, batch_size, results)
+        finally:
+            await self._async_client.close()
+            self._async_client = None
+
+    async def _run_batches(self, prompts, model, batch_size, results):
+        n_prompts = len(prompts)
+
         # Process prompts in batches
         for batch_start in range(0, n_prompts, batch_size):
             batch_end = min(batch_start + batch_size, n_prompts)
@@ -72,25 +87,18 @@ class SimpleAsyncTester:
         print(f"Starting async call for prompt: {prompt[:50]}...")
         
         try:
-            # Make async LLM call via Responses API
-            response = await aresponses(
-                input=[{ 'role': 'developer', 'content': prompt }],
+            # Make async LLM call via OpenRouter chat completions
+            response = await async_chat_completion(
+                self._async_client,
+                messages=[{"role": "user", "content": prompt}],
                 model=model,
-                stream=False,
-                background=False,
-                reasoning = {
-                    "effort": "low"
-                },
             )
-            
+
             print(f"Got response for prompt: {prompt}...")
-            print(response.output[1].content[0].text)
-            
-            # Extract content from Responses API response
-            content: Optional[str] = None
 
-
-            content = response.output[1].content[0].text
+            # Extract content from the chat completion response
+            content: Optional[str] = _extract_message_content(response)
+            print(content)
 
             if not content:
                 raise ValueError("Empty response from LLM")
@@ -122,7 +130,7 @@ async def async_main():
         "Return a JSON object with a 'test' field set to 4. Reply with only the json, nothing else."
     ]
     
-    model = "gpt-5-mini"  # Use a fast, cheap model
+    model = "google/gemini-3.1-flash-lite"  # Use a fast, cheap model
     
     print("About to call batch_json_complete...")
     
@@ -140,7 +148,7 @@ async def async_main():
             print(f"  Result {i}: {result}")
         
     except Exception as e:
-        print(f"=== ERROR IN BATCH PROCESSING ===")
+        print("=== ERROR IN BATCH PROCESSING ===")
         print(f"Exception: {e}")
         import traceback
         traceback.print_exc()

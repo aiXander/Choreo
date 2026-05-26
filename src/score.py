@@ -1,8 +1,7 @@
 """LLM-based pair scoring for candidate pairs."""
 
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
-import random
 import asyncio
 import numpy as np
 from itertools import combinations
@@ -10,7 +9,7 @@ from itertools import combinations
 from candidate import CandidatePair
 from extract import ExtractedSections
 from llm import LLMWrapper
-from utils import load_yaml, stable_pair_id
+from utils import load_yaml
 
 
 @dataclass 

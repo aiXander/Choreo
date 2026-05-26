@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Any
 from dataclasses import dataclass
 
-from utils import load_yaml, save_jsonl, load_jsonl, ensure_dir, truncate_words, generate_schema_hint_from_sections, generate_json_structure_from_sections
+from utils import load_yaml, save_jsonl, load_jsonl, ensure_dir, truncate_words, generate_schema_hint_from_sections, filter_active_sections
 from llm import LLMWrapper
 from ingest import Profile
 
@@ -65,6 +65,7 @@ def extract_sections_from_profiles(
         List of ExtractedSections
     """
     sections_config = load_yaml(sections_config_path)
+    sections_config = filter_active_sections(sections_config)
     processed_path = ensure_dir(processed_dir)
     sections_file = processed_path / "sections.jsonl"
     

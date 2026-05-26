@@ -1,6 +1,6 @@
 """Introduction and conversation starter generation for matched pairs."""
 
-from typing import List, Dict, Any
+from typing import List, Dict
 from dataclasses import dataclass
 import asyncio
 
@@ -151,8 +151,13 @@ def generate_introductions_for_matches(
                     if isinstance(response, Exception):
                         raise response
                     
-                    # Validate response
-                    intro = str(response.get('intro', 'Great to meet you! Looking forward to our conversation.'))
+                    # Validate response — supports both directional and legacy formats
+                    intro_for_a = response.get('intro_for_a')
+                    intro_for_b = response.get('intro_for_b')
+                    if intro_for_a and intro_for_b:
+                        intro = f"For {edge.user1}: {intro_for_a}\n\nFor {edge.user2}: {intro_for_b}"
+                    else:
+                        intro = str(response.get('intro', 'Great to meet you! Looking forward to our conversation.'))
                     starter_topics = str(response.get('starter_topics', '• Share your background • Discuss common interests'))
                     
                     # Create Introduction
@@ -173,8 +178,13 @@ def generate_introductions_for_matches(
                         pair_id=edge.pair_id,
                         user1=edge.user1,
                         user2=edge.user2,
-                        intro=f"Hi {edge.user2}! I'm {edge.user1}. Looking forward to connecting with you.",
-                        starter_topics="• Share your background • Discuss common interests • Talk about your goals"
+                        intro=(
+                            f"For {edge.user1}: You've been matched with {edge.user2} — "
+                            f"explore how their skills could support your project.\n\n"
+                            f"For {edge.user2}: You've been matched with {edge.user1} — "
+                            f"explore how their skills could support your project."
+                        ),
+                        starter_topics="• Share what you're each building • Identify where your skills meet the other's needs • Plan a concrete next step"
                     )
                     introductions[edge.pair_id] = introduction
                     continue

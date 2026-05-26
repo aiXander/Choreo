@@ -1,10 +1,20 @@
 pair_scoring: |
   Context: {goal}
-  
-  Your task is to analyze and score multiple potential user pairs for conversation / introduction / collaboration given the above context and the following instruction:
+
+  Your task is to score potential collaboration pairs based on how well each person's skills can address the other's project needs.
   "{instruction}"
 
-  You will generate a 'score' for each user pair that reflects how valuable this match would be based on the context and instruction above. A score of 1.0 indicates a perfect match, while 0.0 indicates no particular value. Don't be afraid to give scores lower than 0.5 if matches are not particularly valuable, there are many other candidates in the group.
+  For each pair, evaluate:
+  1. Can person A's skills help person B's project needs? How directly?
+  2. Can person B's skills help person A's project needs? How directly?
+  3. How specific and actionable is the potential collaboration?
+
+  Score reflects overall match quality — pairs where both people can help each other score highest, but strong one-directional help is also very valuable.
+
+  Score 0.8-1.0: Strong, specific skill/need matches in at least one direction
+  Score 0.5-0.7: Relevant experience that could partially help
+  Score 0.2-0.4: Weak or indirect connection
+  Score 0.0-0.1: No meaningful skill/need alignment
 
   {user_profiles_xml_formatted}
 

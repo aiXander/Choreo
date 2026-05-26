@@ -17,7 +17,8 @@ from utils import load_yaml
 from llm import LLMWrapper
 from ingest import load_profiles
 from extract import extract_sections_from_profiles
-from embed import create_section_embeddings
+from embed import create_section_embeddings, truncate_embeddings, supports_mrl
+from hyde import generate_hyde_descriptors
 from candidate import generate_similarity_matrix, CandidatePair
 from score import score_pairs_with_llm, create_sections_dict
 from score_correlation import (
@@ -36,6 +37,7 @@ DEFAULT_CONFIG_PATH = "config/config.yaml"
 DEFAULT_SECTIONS_CONFIG_PATH = "config/section_prompt.yaml"
 DEFAULT_SCORING_PROMPT_PATH = "config/scoring_prompt.yaml"
 DEFAULT_INTRODUCTION_PROMPT_PATH = "config/introduction_prompt.yaml"
+DEFAULT_HYDE_PROMPT_PATH = "config/hyde_prompt.yaml"
 
 
 @dataclass
@@ -46,6 +48,7 @@ class PipelineContext:
     force: bool = False
     group_name: Optional[str] = None
     config_path: str = DEFAULT_CONFIG_PATH
+    input_dir: Optional[str] = None
 
     @property
     def user_profiles_dir(self) -> str:
@@ -89,22 +92,40 @@ class PipelineRegistry:
             yield name, self._pipelines[name]
 
 
-def apply_group_overrides(config: Dict[str, Any], group_name: Optional[str]) -> Dict[str, Any]:
-    """Update IO paths to use group-specific directories when requested."""
+def apply_io_overrides(
+    config: Dict[str, Any],
+    group_name: Optional[str] = None,
+    input_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Point all IO paths at the right working area.
 
-    if not group_name:
+    Two layouts (``input_dir`` takes precedence over ``group_name``):
+      - input_dir: profiles live directly in ``<input_dir>``; all derived
+        artifacts (processed/embeds/outputs/cache) are written to subdirs of
+        ``<input_dir>`` (e.g. ``<input_dir>/outputs``).
+      - group_name: profiles live in ``data/<group>/raw``; artifacts in
+        ``data/<group>/{processed,embeds,outputs,cache}``.
+    If neither is given, the config's existing io paths are left untouched
+    (used by the Modal entrypoint, which sets its paths explicitly).
+    """
+    io_config = config.setdefault("io", {})
+
+    if input_dir:
+        base_path = Path(input_dir).expanduser()
+        raw_dir = base_path  # .txt files live directly in the input folder
+    elif group_name:
+        base_path = Path("data") / group_name
+        raw_dir = base_path / "raw"
+    else:
         return config
 
-    io_config = config.setdefault("io", {})
-    base_path = Path("data") / group_name
-    overrides = {
-        "raw_dir": str(base_path / "raw"),
+    io_config.update({
+        "raw_dir": str(raw_dir),
         "processed_dir": str(base_path / "processed"),
         "embeds_dir": str(base_path / "embeds"),
         "outputs_dir": str(base_path / "outputs"),
         "cache_dir": str(base_path / "cache"),
-    }
-    io_config.update(overrides)
+    })
     return config
 
 
@@ -144,6 +165,12 @@ def resolve_prompt_paths(config: Dict[str, Any]) -> Dict[str, str]:
             "introduction_prompt",
             default=DEFAULT_INTRODUCTION_PROMPT_PATH,
         ),
+        "hyde": _first_existing(
+            prompt_sections,
+            "hyde_prompt_path",
+            "hyde_prompt",
+            default=DEFAULT_HYDE_PROMPT_PATH,
+        ),
     }
 
 
@@ -153,6 +180,7 @@ def _execute_matching_pipeline(
     sections_config_path: str = DEFAULT_SECTIONS_CONFIG_PATH,
     scoring_prompt_path: str = DEFAULT_SCORING_PROMPT_PATH,
     introduction_prompt_path: str = DEFAULT_INTRODUCTION_PROMPT_PATH,
+    hyde_prompt_path: str = DEFAULT_HYDE_PROMPT_PATH,
     force: bool = False,
     group_name: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -170,7 +198,10 @@ def _execute_matching_pipeline(
     if group_name:
         print(f"📁 Using group-specific data: {group_name}")
 
-    llm_wrapper = LLMWrapper(cache_dir=io_config.get("cache_dir"))
+    llm_wrapper = LLMWrapper(
+        cache_dir=io_config.get("cache_dir"),
+        enable_reasoning=config.get("models", {}).get("enable_reasoning", False),
+    )
 
     if force:
         print("🔄 Force flag set - all steps will be re-run, ignoring existing data")
@@ -180,7 +211,7 @@ def _execute_matching_pipeline(
     print(f"✅ Loaded {len(profiles)} profiles")
 
     # Early check for minimum group size
-    MIN_PROFILES_REQUIRED = 4
+    MIN_PROFILES_REQUIRED = config.get("matching", {}).get("min_profiles_required", 4)
     if len(profiles) < MIN_PROFILES_REQUIRED:
         message = (
             f"Insufficient profiles for matching. Found {len(profiles)} profile(s), "
@@ -214,14 +245,68 @@ def _execute_matching_pipeline(
         print(f"❌ {message}")
         return {"success": False, "error": message}
 
+    # HyDE generation step (only runs when cross_section_weights are configured)
+    cross_section_weights = config.get("recipe", {}).get("cross_section_weights", {})
+    hyde_descriptors = {}
+    if cross_section_weights:
+        print("\n🔮 Step 2.5: Generating HyDE descriptors...")
+        try:
+            from utils import load_yaml as _load_yaml
+            hyde_prompt_config = _load_yaml(hyde_prompt_path)
+            hyde_prompt_template = hyde_prompt_config['hyde_generation']
+            sections_config = _load_yaml(sections_config_path)
+
+            hyde_descriptors = generate_hyde_descriptors(
+                extracted_sections=extracted_sections,
+                cross_section_weights=cross_section_weights,
+                hyde_config=config.get("hyde", {}),
+                prompt_template=hyde_prompt_template,
+                goal=goal,
+                llm_wrapper=llm_wrapper,
+                model=config.get("models", {}).get("extraction_llm"),
+                cache_dir=Path(io_config.get("processed_dir")),
+                sections_config=sections_config,
+                force=force,
+            )
+            print(f"✅ Generated HyDE descriptors for {len(hyde_descriptors)} cross-section pairs")
+        except Exception as exc:
+            message = f"Error generating HyDE descriptors: {exc}"
+            print(f"❌ {message}")
+            return {"success": False, "error": message}
+
     print("\n🔢 Step 3: Creating embeddings...")
-    user_ids, section_names, embeddings = create_section_embeddings(
+    user_ids, section_names, embeddings, hyde_embeddings = create_section_embeddings(
         extracted_sections=extracted_sections,
         embedding_model=config.get("models", {}).get("embedding"),
         embeds_dir=io_config.get("embeds_dir"),
+        hyde_descriptors=hyde_descriptors if hyde_descriptors else None,
         force=force,
     )
     print(f"✅ Created embeddings: {embeddings.shape}")
+
+    # Matryoshka (MRL) truncation. Full-size vectors are always stored on disk;
+    # here we (optionally) truncate the working copy to embedding_dimensions for
+    # cheaper similarity math. Re-tunable without re-embedding — see embed.py.
+    # Skipped (with a warning) on models not known to be MRL-trained, since
+    # truncating those would silently corrupt similarity.
+    embedding_dimensions = config.get("models", {}).get("embedding_dimensions")
+    embedding_model = config.get("models", {}).get("embedding")
+    if embedding_dimensions:
+        if supports_mrl(embedding_model):
+            embeddings = truncate_embeddings(embeddings, embedding_dimensions)
+            hyde_embeddings = {k: truncate_embeddings(v, embedding_dimensions)
+                               for k, v in hyde_embeddings.items()}
+            print(f"   MRL-truncated to {embedding_dimensions} dims: {embeddings.shape}")
+        else:
+            print(f"⚠️  embedding_dimensions={embedding_dimensions} is set, but model "
+                  f"'{embedding_model}' is not known to support Matryoshka (MRL) "
+                  f"truncation — keeping full {embeddings.shape[-1]} dims. Add it to "
+                  f"MRL_CAPABLE_MODELS in src/embed.py if it does, or unset "
+                  f"embedding_dimensions to silence this warning.")
+
+    if hyde_embeddings:
+        for k, v in hyde_embeddings.items():
+            print(f"   HyDE embeddings [{k}]: {v.shape}")
 
     print("\n📊 Step 3.5: Creating t-SNE visualizations...")
     tsne_results = None
@@ -241,11 +326,12 @@ def _execute_matching_pipeline(
 
     print("\n🎯 Step 4: Generating similarity matrix...")
     try:
-        similarity_matrix, user_ids_sorted, matrices_dict = generate_similarity_matrix(
+        dir_similarity_matrix, similarity_matrix, user_ids_sorted, matrices_dict = generate_similarity_matrix(
             embeddings=embeddings,
             user_ids=user_ids,
             section_names=section_names,
             recipe_config=config.get("recipe", {}),
+            hyde_embeddings=hyde_embeddings if hyde_embeddings else None,
         )
         print(f"✅ Generated similarity matrix for {len(user_ids_sorted)} users")
     except Exception as exc:  # pylint: disable=broad-except
@@ -343,9 +429,12 @@ def _execute_matching_pipeline(
                 edge.starter_topics = intro_obj.starter_topics
             else:
                 edge.intro = (
-                    f"Hi {edge.user2}! I'm {edge.user1}. Looking forward to connecting with you."
+                    f"For {edge.user1}: You've been matched with {edge.user2} — "
+                    f"explore how their skills could support your project.\n\n"
+                    f"For {edge.user2}: You've been matched with {edge.user1} — "
+                    f"explore how their skills could support your project."
                 )
-                edge.starter_topics = "• Share your background • Discuss common interests • Talk about your goals"
+                edge.starter_topics = "• Share what you're each building • Identify where your skills meet the other's needs • Plan a concrete next step"
 
         print(f"✅ Generated introductions for {len(introductions)} matches")
     except Exception as exc:  # pylint: disable=broad-except
@@ -431,7 +520,7 @@ class MatchingPipeline(BasePipeline):
     def run(self, context: PipelineContext) -> Dict[str, Any]:
         config_copy = deepcopy(context.config)
         config_copy.setdefault("io", {})
-        apply_group_overrides(config_copy, context.group_name)
+        apply_io_overrides(config_copy, context.group_name, context.input_dir)
 
         prompt_paths = resolve_prompt_paths(config_copy)
 
@@ -440,6 +529,7 @@ class MatchingPipeline(BasePipeline):
             sections_config_path=prompt_paths["sections"],
             scoring_prompt_path=prompt_paths["scoring"],
             introduction_prompt_path=prompt_paths["introduction"],
+            hyde_prompt_path=prompt_paths["hyde"],
             force=context.force,
             group_name=context.group_name,
         )
@@ -455,6 +545,7 @@ def run_matching_pipeline(
     sections_config_path: str = DEFAULT_SECTIONS_CONFIG_PATH,
     scoring_prompt_path: str = DEFAULT_SCORING_PROMPT_PATH,
     introduction_prompt_path: str = DEFAULT_INTRODUCTION_PROMPT_PATH,
+    hyde_prompt_path: str = DEFAULT_HYDE_PROMPT_PATH,
     force: bool = False,
     group_name: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -465,13 +556,14 @@ def run_matching_pipeline(
     if user_profiles_dir:
         io_config["raw_dir"] = user_profiles_dir
 
-    apply_group_overrides(config_copy, group_name)
+    apply_io_overrides(config_copy, group_name)
 
     return _execute_matching_pipeline(
         config=config_copy,
         sections_config_path=sections_config_path,
         scoring_prompt_path=scoring_prompt_path,
         introduction_prompt_path=introduction_prompt_path,
+        hyde_prompt_path=hyde_prompt_path,
         force=force,
         group_name=group_name,
     )
@@ -482,21 +574,39 @@ def main(
     force: bool = False,
     pipeline_name: str = MatchingPipeline.name,
     config_path: str = DEFAULT_CONFIG_PATH,
+    input_dir: Optional[str] = None,
 ) -> int:
     """CLI entrypoint for running pipelines via main.py."""
 
     load_dotenv()
 
+    # Folder mode: profiles live directly in input_dir. Derive the group label
+    # from the folder name and write all artifacts inside the folder.
+    if input_dir:
+        input_dir = str(Path(input_dir).expanduser())
+        if not Path(input_dir).is_dir():
+            print(f"❌ Input folder not found: {input_dir}")
+            return 1
+        if not group_name:
+            group_name = Path(input_dir).resolve().name
+
     config = load_yaml(config_path)
     config_copy = deepcopy(config)
     config_copy.setdefault("io", {})
-    apply_group_overrides(config_copy, group_name)
+    apply_io_overrides(config_copy, group_name, input_dir)
+
+    io_paths = config_copy["io"]
+    if input_dir:
+        print(f"📁 Input folder: {io_paths['raw_dir']}  →  outputs: {io_paths['outputs_dir']}")
+    elif group_name:
+        print(f"📁 Group: {group_name}  →  data/{group_name}/")
 
     context = PipelineContext(
         config=config_copy,
         force=force,
         group_name=group_name,
         config_path=config_path,
+        input_dir=input_dir,
     )
 
     try:
@@ -536,7 +646,15 @@ if __name__ == "__main__":
         "--group",
         type=str,
         default=None,
-        help="Group name for data organization (e.g., 'group_name_01')",
+        help="Group name; reads from data/<group>/raw and writes to data/<group>/.",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Path to a folder of profile .txt files (one per user). The group "
+             "name is derived from the folder name and all artifacts/outputs are "
+             "written inside it (e.g. <folder>/outputs). Takes precedence over --group.",
     )
     parser.add_argument(
         "--force",
@@ -566,5 +684,6 @@ if __name__ == "__main__":
         force=args.force,
         pipeline_name=args.pipeline,
         config_path=args.config,
+        input_dir=args.input,
     )
     sys.exit(exit_code)

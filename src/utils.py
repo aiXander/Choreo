@@ -32,6 +32,24 @@ def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
 
 
+def parse_cross_key(cross_key: str) -> Tuple[str, str]:
+    """Split a cross-section key into (source, target).
+
+    Preferred form uses ``->`` so multi-word section names parse correctly
+    (e.g. ``"needs->final_project"``). The legacy ``source_target`` form is
+    still accepted, but only when it splits cleanly into exactly two parts —
+    multi-word names under the legacy form are ambiguous and rejected.
+    """
+    parts = cross_key.split("->") if "->" in cross_key else cross_key.split("_")
+    parts = [p.strip() for p in parts]
+    if len(parts) != 2 or not all(parts):
+        raise ValueError(
+            f"Invalid cross_section_weights key '{cross_key}': expected "
+            "'source->target' (or legacy 'source_target')"
+        )
+    return parts[0], parts[1]
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate (words * 1.3)."""
     words = len(text.split())
@@ -96,6 +114,12 @@ def truncate_words(text: str, max_words: int) -> str:
 def get_cache_path(cache_dir: Path, key: str, suffix: str = '.json') -> Path:
     """Generate cache file path from key."""
     return cache_dir / f"{key}{suffix}"
+
+
+def filter_active_sections(sections_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of sections_config with only active sections."""
+    filtered = {k: v for k, v in sections_config['sections'].items() if v.get('active', True)}
+    return {**sections_config, 'sections': filtered}
 
 
 def generate_schema_hint_from_sections(sections_config: Dict[str, Any]) -> str:
@@ -283,7 +307,7 @@ def prepare_normalized_scores(
                 selected_reference_scores=selected_embed_scores,
                 normalized_target_scores=normalized_llm_scores
             )
-            print(f"📊 Score normalization stats:")
+            print("📊 Score normalization stats:")
             print(f"   Matrix range: [{stats['reference_range'][0]:.3f}, {stats['reference_range'][1]:.3f}]")
             print(f"   Selected matrix range (normalized): [{stats['selected_normalized_range'][0]:.3f}, {stats['selected_normalized_range'][1]:.3f}]")
             print(f"   LLM original range: [{stats['target_original_range'][0]:.3f}, {stats['target_original_range'][1]:.3f}]")

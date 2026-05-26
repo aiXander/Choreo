@@ -1,27 +1,32 @@
 sections:
-  capabilities:
-    guideline: "Extract the concrete skills, tools, and resources this person can contribute to others and the group. Use action-oriented, specific terms (e.g., Python, fundraising, facilitation, woodworking, video editing)."
-    max_words: 80
-  interests:
-    guideline: "Extract the main topics, themes, and domains this person is curious about, follows, or enjoys discussing—regardless of expertise."
-    max_words: 80
-  goals:
-    guideline: "Summarize this person's current projects and near- to mid-term goals. Capture what they are building, seeking, or aiming toward. What drives them?"
-    max_words: 80
-  persona:
-    guideline: "Capture broader psychological, contextual, and human factors about this person not captured in the previous sections: personality traits, collaboration tendencies, values, cultural background, location/timezone, logistical constraints, quirks, or personal trivia that are relevant for the goal."
+  skills:
+    active: true
+    guideline: "Extract the concrete skills, tools, techniques, domains of expertise, and resources this person can offer others. Use specific, action-oriented terms (e.g., Python, projection mapping, sound design, fabrication, fundraising, facilitation). Include both technical and soft skills. Frame everything as teachable or contributable — what could this person do for someone else?"
+    max_words: 120
+  vision:
+    active: true
+    guideline: "Capture this person's broader direction: core values, long-term interests, themes they care about, the kind of impact they want to have, and how they like to work with others. This is the 'why' behind what they do — their worldview, curiosities, and the future they're drawn toward. Include personality traits and collaboration style where relevant."
+    max_words: 120
+  project:
+    active: true
+    guideline: "Describe what this person is actively building or working on right now: the specific project, its current state, medium, technology, and creative direction. Keep it concrete and present-tense — what exists today and what's the immediate next step."
+    max_words: 100
+  needs:
+    active: true
+    guideline: "Extract what this person's project still needs — gaps, challenges, missing expertise, tools, or help they're looking for. Frame needs in terms of concrete skills and techniques someone else could bring (e.g., 'someone who can help make my installation respond to audience movement' rather than just 'computer vision'). This section will be matched against other people's skills, so use similar vocabulary — describe the help needed as if writing a wanted-ad for a collaborator with specific abilities."
     max_words: 120
 
 sections_prompt: |
   Context: {goal}
-  
-  Your goal is to extract structured information from the following user profile:
+
+  Your goal is to extract structured information from the following user profile which will be vector embedded and used for matchmaking.
   <profile>
   {profile_text}
   </profile>
 
-  Task: 
+  Task:
   Extract the following sections:
   {sections_list}
 
-  Try to be comprehensive but stay within the given word limits. Do not invent / hallucinate any information that wasn't actually in the profile. If information is missing, extract what you can or use "Not specified" for missing sections.
+  Try to make the extracted sections complementary although some content overlap is totally fine since every section needs to stand on its own since it will get vector embedded and must cover the full section intent.
+  Try to be comprehensive but stay within the given word limits. Do not invent / hallucinate information that wasn't in the profile. If information is missing, infer what you can based on the available profile context. If you absolutely cannot infer anything useful (rare): use "Not specified" for missing sections.

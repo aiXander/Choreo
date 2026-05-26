@@ -149,48 +149,74 @@ def greedy_b_matching(
     
     print(f"Phase 1: Selected {len(selected_edges)} edges")
     
-    # Phase 2: Backfill users below b_min
+    # Phase 2: Backfill users below b_min (respecting b_max for partners)
     users_below_min = [
-        user for user in all_users 
+        user for user in all_users
         if user_degrees[user] < b_min
     ]
-    
+
     if users_below_min:
         print(f"Phase 2: Backfilling {len(users_below_min)} users below minimum degree")
-        
-        # Create a mapping of available edges for each user
-        available_edges = defaultdict(list)
-        for edge in sorted_edges:
-            if edge not in selected_edges:
-                available_edges[edge.user1].append(edge)
-                available_edges[edge.user2].append(edge)
-        
+
+        selected_set = set(id(e) for e in selected_edges)
+
         for user in users_below_min:
-            current_degree = user_degrees[user]
-            needed = b_min - current_degree
-            
+            needed = b_min - user_degrees[user]
+
             # Find best available edges for this user
             candidates = [
-                edge for edge in available_edges[user]
-                if edge not in selected_edges
+                edge for edge in sorted_edges
+                if id(edge) not in selected_set
+                and (edge.user1 == user or edge.user2 == user)
             ]
-            
-            # Sort by weight and try to add
             candidates.sort(key=lambda e: e.final_weight, reverse=True)
-            
-            added = 0
+
             for edge in candidates:
-                if added >= needed:
+                if needed <= 0:
                     break
-                    
                 other_user = edge.user2 if edge.user1 == user else edge.user1
-                
-                # Check if other user still has capacity
                 if user_degrees[other_user] < b_max:
                     selected_edges.append(edge)
+                    selected_set.add(id(edge))
                     user_degrees[edge.user1] += 1
                     user_degrees[edge.user2] += 1
-                    added += 1
+                    needed -= 1
+
+    # Phase 3: Force-fill users still below b_min (relaxing b_max for partners)
+    users_still_below = [
+        user for user in all_users
+        if user_degrees[user] < b_min
+    ]
+
+    if users_still_below:
+        print(f"Phase 3: Force-filling {len(users_still_below)} users still below b_min (relaxing b_max)")
+
+        for user in users_still_below:
+            needed = b_min - user_degrees[user]
+
+            # Find best available edges, ignoring b_max for the partner
+            candidates = [
+                edge for edge in sorted_edges
+                if id(edge) not in selected_set
+                and (edge.user1 == user or edge.user2 == user)
+            ]
+            # Prefer partners with lowest current degree (least overloaded)
+            candidates.sort(key=lambda e, u=user: (
+                user_degrees[e.user2 if e.user1 == u else e.user1],
+                -e.final_weight
+            ))
+
+            for edge in candidates:
+                if needed <= 0:
+                    break
+                other_user = edge.user2 if edge.user1 == user else edge.user1
+                selected_edges.append(edge)
+                selected_set.add(id(edge))
+                user_degrees[edge.user1] += 1
+                user_degrees[edge.user2] += 1
+                needed -= 1
+                print(f"  {user}: force-added edge with {other_user} "
+                      f"(partner degree now {user_degrees[other_user]})")
     
     # Final statistics
     final_degrees = {user: user_degrees[user] for user in all_users}
@@ -199,7 +225,7 @@ def greedy_b_matching(
     users_at_min = sum(1 for d in final_degrees.values() if d >= b_min)
     users_at_max = sum(1 for d in final_degrees.values() if d == b_max)
     
-    print(f"Final matching:")
+    print("Final matching:")
     print(f"  Selected {len(selected_edges)} edges")
     print(f"  Average degree: {avg_degree:.2f}")
     print(f"  Users at/above b_min ({b_min}): {users_at_min}/{len(all_users)}")

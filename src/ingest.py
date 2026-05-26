@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 from dataclasses import dataclass
 
-from utils import hash_text, ensure_dir
+from utils import hash_text
 
 
 @dataclass
