@@ -18,7 +18,7 @@ models:
   enable_reasoning: false
 
 instruction_prompt:
-  goal: "We are matching community residents who are working on their finals projects. Each person has specific skills and project needs. We want to find pairs where one person's skills can directly help the other's project needs."
+  goal: "We are matching community members who might potentially want to collaborate. Each person has specific skills and project needs. We want to find pairs where one person's skills can directly help the other's project needs."
 
 budgets:
   extraction_llm_calls: 100
@@ -37,7 +37,7 @@ recipe:
     project:  0.10
     needs:    0.00
   cross_section_weights:
-    needs_skills: 0.80
+    needs_skills: 0.60
 
 blending:
   embed_weight: 0.35

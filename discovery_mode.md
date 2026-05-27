@@ -1,440 +1,416 @@
-# Discovery Mode — Plan
+# Discovery Mode — Implementation Plan (V1 lean MVP + V2 roadmap)
 
 A new pipeline mode (`--pipeline discovery`) that, instead of producing N warm
-1:1 introductions, reads a whole cohort's onboarding inputs and surfaces:
+1:1 introductions, reads a whole cohort's onboarding inputs and engineers
+**serendipity**: it surfaces a curated set of project seeds and collaboration
+provocations — concrete "the four of you should build X this weekend" sparks.
 
-- the **emergent themes / clusters of ideas** in the group,
-- concrete **project seeds & collaboration proposals** that combine *different
-  people with complementary skills around a shared interest/value*, and
-- a facilitator-facing **"state of the community" overview** (themes, the people
-  who connect them, and the skill gaps to fill).
+Target use: the first night of a weekend hackathon / a residency / a Wintercircus
+cohort, right after everyone has done an agent onboarding call. Cohort sizes are
+small (~8–50 people).
 
-Target use: the start of a hackathon / residency / Wintercircus cohort, right
-after everyone has done an agent onboarding call. Cohort sizes are small
-(~8–50 people).
-
-> This document is a design plan only. No code is written here.
-
----
-
-## 1. Design thesis
-
-The hard part, as stated: a *great* project usually needs **cohesion on the
-"why"** (shared interests, values, curiosities) and **diversity on the "how"**
-(different, complementary skills). Naive clustering of a single "goals"
-embedding fails because it optimizes only cohesion and is blind to
-complementarity — it surfaces echo chambers, not teams.
-
-Two design commitments fall out of this:
-
-1. **Separate the two axes.** Use one embedding-derived signal for *cohesion*
-   (interests/vision/ideas) and a different one for *complementarity* (skills).
-   Cluster primarily on cohesion; use complementarity to *score and rank* the
-   resulting groups. Do **not** collapse both into one signed similarity number
-   and cluster on that — clustering a signed blend is semantically muddy and
-   hard to interpret. (This is the one place we deliberately *don't* reuse the
-   matching recipe's single fused matrix as-is.)
-
-2. **Over-generate cheaply, judge expensively — but bounded.** Mirror the
-   matching pipeline's budget discipline exactly. There the flow is: compute an
-   N×N similarity matrix (cheap) → select the top candidate *pairs* per profile
-   under a budget → spend LLM calls only on those. Here it becomes: embed
-   everything (cheap) → generate many candidate *groups* and score them with
-   pure-numpy cohesion/diversity metrics (cheap) → spend a **bounded** number of
-   LLM calls only on the top-ranked, de-duplicated groups. We never do O(N²) or
-   O(2^N) LLM work.
-
-This keeps the cost profile identical in spirit to matching: **LLM cost grows
-linearly with N (extraction) plus a fixed cap (group analysis); the
-combinatorial work stays in cheap embedding/linear-algebra space.**
+**This document is split into two phases.** §5 (**V1**) is the leanest thing that
+tests the core hypothesis end-to-end, reuses the existing codebase, and can be
+benchmarked against a dead-simple baseline. §6 (**V2**) scopes every refinement —
+including the fixes for the three known failure modes — as *not-yet-implemented*
+upgrades, each paired with the V1 result it would improve. Build V1, benchmark it,
+then add V2 features one at a time and measure each.
 
 ---
 
-## 2. What we reuse vs. what is new
+## 1. The core thesis: a geometry engine + a meaning engine
 
-### Reuse as-is (no changes)
+- **Embeddings + similarity = a geometry engine.** It answers *where to look*:
+  which threads are adjacent, which are far, which corner of the room is crowded.
+  It can enumerate and score thousands of candidate groupings — cheaply, in numpy.
+- **The LLM = a meaning engine.** It answers *what it means*: given an odd
+  assortment of threads and the event context, what could these specific people
+  actually *make* together? It names the latent theme and turns adjacency into a
+  buildable provocation.
 
-| Primitive | Module | Role in discovery |
-|-----------|--------|-------------------|
-| `load_profiles` → `Profile` | `src/ingest.py` | Identical ingest of `<raw_dir>/*.txt`. |
-| `extract_sections_from_profiles` | `src/extract.py` | Bounded, cached, async section extraction. **Linear in N.** Driven by a section config — so we just point it at discovery-flavored sections. |
-| `LLMWrapper.batch_json_complete` | `src/llm.py` | The async/cached/cost-tracked/retrying batch workhorse for the group-analysis and synthesis passes (same way `score.py` and `introduction.py` use it). |
-| `get_embeddings` | `src/embed.py` | Low-level batch embedder. Reusable directly for idea-atom embedding (see §4.3). |
-| `cost_tracker`, `utils` (`cosine_matrix`, `hash_text`, JSON/JSONL/YAML IO, `ensure_dir`, `filter_active_sections`, `truncate_words`) | `src/cost_tracker.py`, `src/utils.py` | Unchanged. |
-| `compute_combined_distances` + t-SNE plotting | `src/tsne.py` | Visual sanity check, now colored by discovered cluster. |
-| Pipeline plumbing: `BasePipeline`, `PipelineRegistry`, `PipelineContext`, `apply_io_overrides`, `resolve_prompt_paths`, `--group`/`--input`/`--force` | `main.py` | The mode hooks in here as a registered pipeline — see §6. |
+Three observations shape the design:
 
-### Reuse with a small adaptation
-
-| Primitive | Module | Adaptation |
-|-----------|--------|-----------|
-| `compute_fused_similarity_matrix` | `src/candidate.py` | Call it with a **discovery recipe** to get the cohesion (affinity) matrix from interest/vision/idea sections. It already returns per-section matrices in `matrices_dict` — we read the `skills` section matrix straight out of there for the complementarity axis. No code change needed; just a different recipe + we consume more of its existing output. |
-| `create_section_embeddings` | `src/embed.py` | Reusable verbatim for **person-level** discovery (fixed `users × sections × dims` tensor). For **idea-atom-level** discovery the fixed reshape doesn't fit a variable number of atoms per person, so atoms use `get_embeddings` + a thin new flatten/index routine instead (§4.3). |
-| HyDE (`generate_hyde_descriptors`) + directional cross-matrix | `src/hyde.py`, `src/candidate.py` | Optional advanced path (§5): bridge "idea/need" → "skills that would realize it" to recruit complementary collaborators around an idea. Pure reuse, gated like it already is on `cross_section_weights`. |
-
-### New components
-
-| New file | Responsibility | Modeled on |
-|----------|----------------|------------|
-| `src/discover.py` | Pure numpy/sklearn: build the cohesion & complementarity matrices, generate candidate groups, score them (cohesion × diversity), rank + de-dupe. **No LLM calls.** | the cheap pre-filter half of `candidate.py` / `score.py` |
-| `src/analyze.py` | The bounded LLM passes: (a) per-group analysis → spark score + named theme + project seeds + gaps; (b) one cohort-level synthesis pass. Batched via `batch_json_complete`. | `score.py` + `introduction.py` |
-| `src/discovery_report.py` | Emit `discovery.json` (machine) + `discovery_report.md` (human) + cluster-colored plots. | `report.py` |
-| `config/discovery_prompt.yaml` | Prompt templates: `group_analysis`, `cohort_synthesis` (and `idea_atoms` if used). | `scoring_prompt.yaml`, `introduction_prompt.yaml`, `hyde_prompt.yaml` |
-| `config/config_discovery.yaml` *(or a `discovery:` block in `config.yaml`)* | Discovery recipe, group-size bounds, objective weights, budgets, prompt-file overrides. | `config.yaml` |
-| `DiscoveryPipeline` class in `main.py` | Registers the mode; runs ingest/extract/embed verbatim then branches into discovery steps. | `MatchingPipeline` |
+- **(a) Pure similarity collapses to the mean.** Maximizing goal-similarity yields
+  bland blobs. So similarity shapes the process **softly** (a probability
+  landscape) and is **never** the thing we maximize.
+- **(b) People arrive with threads, not ideas.** The *idea* is an **output** the
+  LLM synthesizes from a *collision* of threads — never an input we cluster.
+- **(c) The loudest signal is the least useful.** Instrumental goals ("I want to
+  network") are high-volume and high-similarity. We do **not** classify them out
+  (the line is a gradient an LLM can't reliably draw). In V2, geometry demotes them
+  via density; in V1 we accept some obvious groups and let the LLM label them.
 
 ---
 
-## 3. Pipeline at a glance
+## 2. The atom model (the V1 substrate)
+
+Everything is built on one unit: the **atom**.
+
+> An **atom** is a single, self-contained, interesting statement about a person,
+> phrased to stand alone and embed cleanly. *"Ran a 60m audio-reactive LED
+> installation on a Raspberry Pi." "Plays modular synth on the side." "Wants paying
+> customers for his payments API." "Curious about citizen science."*
+
+We do **not** tag atoms (instrumental/latent, skill/value) — they are just
+statements, and geometry sorts them. A person contributes a **variable-length list**
+of atoms (soft target ~3–8). The landscape is the union of everyone's atoms.
+
+Why atoms beat one vector per person: a buried "plays modular synth" gets **equal
+geometric standing** with a loud "I want customers," and a person can enter
+different groups through different facets of themselves.
+
+**Lean handling of variable length.** The "non-trivial" part is only hard if you
+force atoms into the fixed `(users × sections × dims)` tensor that
+`create_section_embeddings` produces. We **don't**. We embed a *flat list* of all
+atom texts with `embed.get_embeddings` and keep an integer owner index. No reshape,
+no per-section bookkeeping — simpler than the section tensor, not harder.
 
 ```
-1.  INGEST    → reuse load_profiles  (unchanged)
-2.  EXTRACT   → reuse extract_sections_from_profiles with discovery sections
-                (skills + interests + vision + ideas/needs)            [LLM, linear in N]
-2a. IDEA ATOMS → (recommended) split each profile's ideas/interests into a
-                 bounded list of atomic "idea units"                    [LLM, linear in N]
-3.  EMBED     → reuse get_embeddings (atoms) / create_section_embeddings (persons)
-                                                                        [cheap]
-4.  SIGNALS   → cohesion matrix (interests/vision/ideas) via discovery recipe;
-                complementarity from the skills section matrix          [cheap, numpy]
-5.  CLUSTER   → cluster idea-atoms into THEMES and/or grow candidate
-                people-GROUPS by seed-expansion                         [cheap, sklearn/numpy]
-6.  SCORE+RANK→ score each candidate group by cohesion × skill-diversity;
-                de-dupe overlapping groups; keep top G under budget     [cheap, numpy]
-7.  ANALYZE   → LLM judges each of the top-G groups → spark score, theme
-                name, 1–3 concrete project seeds, missing-skill gaps    [LLM, BOUNDED ≤ G]
-8.  SYNTHESIZE→ one LLM pass over the surviving themes/seeds → cohort
-                "state of the community" overview                       [LLM, ~1 call]
-9.  REPORT    → discovery.json + discovery_report.md + cluster plots    [cheap]
+AtomTable:
+  texts:      List[str]          # length A (total atoms in cohort)
+  owner:      np.ndarray[int]    # length A; owner[i] = person index of atom i
+  person_ids: List[str]          # person index -> user id
+  E:          np.ndarray[A, d]   # L2-normalized atom embeddings
+  S:          np.ndarray[A, A]   # atom×atom cosine = E @ E.T (utils.cosine_matrix)
 ```
 
-Steps 1–3 are shared with matching and **cache-compatible**: extraction and
-embeddings are mode-agnostic, so if the section set matches, both modes can run
-on the same cohort and reuse caches. (Embedding cache keys on the user set +
-section names, so a different active-section set lands in its own cache — run
-with `--force` when switching section configs in place, or use a separate
-group/folder.)
+A **group** is a set of atom indices. A **team** is the set of distinct owners.
+**Invariant:** one atom per person per group (mask an owner once picked), so a
+k-atom group is always k distinct people; facet-level participation lives *across*
+groups, not within one.
 
 ---
 
-## 4. The core algorithm (steps 4–6 in detail)
+## 3. Why this beats dumping all profiles into one LLM call
 
-### 4.1 The two signals
+The geometry engine does the relational/combinatorial reasoning a single LLM call
+is bad at: it gives **equal standing to quiet threads** (attention ignores them),
+it can **enumerate thousands of groupings** without mode-collapsing to a handful of
+clichés, and **adding/removing a member is a cheap matrix update**. The LLM does the
+one thing geometry can't — the semantic leap from adjacency to a named, buildable
+idea. V1 is designed to be measured against exactly the "LLM dump" baseline (§5.8).
 
-From the embeddings we derive two N×N matrices over people (and, in the
-idea-atom variant, distances over atoms):
+---
 
-- **Cohesion / affinity `A`** — "how aligned are these two on what they care
-  about?" Built by calling `compute_fused_similarity_matrix` with a discovery
-  recipe that puts **positive** weight on `interests`, `vision`, `ideas` (the
-  "why" sections) and **zero** weight on `skills`. This reuses the existing
-  fusion + normalization code unchanged.
-
-- **Complementarity `C`** — "how *different* are their skill sets?" Read the
-  `skills` per-section similarity matrix out of `matrices_dict['section_matrices']`
-  (already computed by the same call) and use `C = 1 − S_skills`. High `C` =
-  complementary capabilities. (Note the elegant parallel: matching already
-  expresses "skills should differ" as a *negative* `section_weights.skills`;
-  discovery just makes that the explicit second axis instead of folding it in.)
-
-### 4.2 Candidate-group generation — **seed expansion** (recommended)
-
-Hard partitioning (k-means / a single cut of agglomerative clustering) is the
-wrong model: a person can belong to several project seeds, and we want
-**overlapping, size-bounded, interpretable** groups. Proposed primary method,
-which needs no new dependencies (pure numpy):
-
-For each seed (each person, or each strong affinity edge):
-1. Start a group `G = {seed}`.
-2. Repeatedly add the not-yet-included person `c` that **maximizes affinity to
-   the current group** (mean of `A[c, g]` for `g ∈ G`) *subject to* the group's
-   cohesion staying above a floor.
-3. Stop when `|G|` hits `group_size.max` or no candidate keeps cohesion above
-   the floor; discard if `|G| < group_size.min`.
-4. Collect the set; de-dupe identical sets at the end.
-
-This yields many overlapping candidate groups that are all internally cohesive
-by construction. Diversity is *not* forced during growth — it's used to **rank**
-afterward (§4.4), so we don't trade away cohesion to chase diversity.
-
-**Baseline / sanity alternative:** `sklearn.cluster.AgglomerativeClustering`
-(or `SpectralClustering`) on the affinity distance `1 − A` (both accept a
-precomputed affinity/distance and are already available via the sklearn dep).
-This gives a clean hard partition useful for the cohort map and t-SNE coloring,
-but it can't express overlap, so it's the secondary view, not the group source.
-HDBSCAN / Louvain community detection are optional upgrades but add a dependency
-(`hdbscan` / `networkx`) and are less robust at very small N — noted as future
-options, not the v1 default.
-
-### 4.3 Idea-atom theme clustering — **the recommended core for "clusters of ideas"**
-
-The user's framing is literally "find interesting clusters of *ideas*." Treating
-each **person** as one point under-resolves this — one person often carries
-several distinct ideas. So the recommended core operates on **idea atoms**:
-
-1. **Extract atoms (step 2a, LLM, still linear in N):** one extra extraction
-   call per profile asks the LLM to decompose the person's
-   interests/ideas/project into a *bounded* list (e.g. ≤5) of atomic idea units,
-   each a short self-contained phrase, tagged with the source person. Bounded
-   list → still O(N) calls, batched and cached like every other extraction.
-2. **Embed atoms (cheap):** flatten all atoms across all people into one list,
-   call `get_embeddings` directly, and keep an `atom → person` index. *(This is
-   where `create_section_embeddings`'s fixed `users × sections` reshape doesn't
-   fit — `get_embeddings` is the reusable piece; the flatten/index is a few new
-   lines.)*
-3. **Cluster atoms into themes (cheap):** cluster the atom embeddings (cosine).
-   Each cluster is a **theme** = a cluster of ideas contributed by potentially
-   several different people.
-4. **Back out people & skills per theme:** map a theme's atoms to their source
-   people → the theme's *participant set*. Now check the participants' `skills`
-   embeddings for diversity/coverage. A theme with many distinct contributors
-   and complementary skills is a strong project seed; a theme that's one
-   person's pet idea, or a crowd with identical skills, ranks lower.
-
-This directly solves the stated problem: **a theme is defined by clustered idea
-fragments (shared interest) while its participant set's skill spread measures
-complementarity** — the two axes stay separate and legible.
-
-v1 can ship person-level seed-expansion (§4.2) first for simplicity, with
-idea-atom theming (§4.3) as the headline capability; they share all downstream
-scoring, analysis, and reporting code.
-
-### 4.4 Scoring & ranking candidate groups/themes (cheap, pre-LLM)
-
-For each candidate group `G` (whether from seed-expansion or an atom theme's
-participant set), compute with pure numpy:
-
-- `cohesion(G)` = mean pairwise affinity within `G` (on `A`); for atom themes,
-  also the tightness of the atom cluster.
-- `diversity(G)` = mean pairwise skill distance within `G` (mean of `C`), i.e.
-  how complementary the skills are.
-- `size sanity` = penalty outside `[group_size.min, group_size.max]`.
-
-Combine into a single rankable score, config-driven (mirrors `recipe` weights):
+## 4. End-to-end shape (V1)
 
 ```
-group_score = cohesion_weight * cohesion(G) + diversity_weight * diversity(G)
+INGEST    → load .txt profiles                    (reuse ingest.load_profiles)
+ATOMIZE   → 1 batched LLM call/profile → atom list (NEW fn, reuses batch_json_complete)
+EMBED     → embed all atoms flat → AtomTable        (reuse embed.get_embeddings)
+SAMPLE    → N tempered random walks → groups          (NEW, pure numpy)
+SELECT    → coherence gate + diversity + coverage → M  (NEW, pure numpy)
+PROPOSE   → ≤M batched LLM calls → provocation JSON     (reuse batch_json_complete)
+RANK      → top K by spark_score
+REPORT    → discovery.json + discovery_report.md + atom t-SNE
 ```
 
-with a hard **cohesion floor** (a group with no shared thread is noise, not a
-seed) gating before diversity is even considered.
-
-Then **de-dupe for variety** before spending LLM budget: greedily keep
-top-scoring groups while rejecting any new group whose member overlap (Jaccard)
-with an already-kept group exceeds `overlap_jaccard_max`. This is the discovery
-analogue of the matching pipeline's "spread coverage across users" concern, and
-it ensures the LLM sees ~G *distinct* seeds rather than 20 variations of the
-same clique. Keep the top `max_group_llm_calls` survivors.
+LLM cost = `P (atomize) + M (propose)`. No HyDE, no pair-scoring, no synthesis —
+cheaper than the existing matching pipeline.
 
 ---
 
-## 5. The LLM passes (steps 7–8, bounded)
+## 5. V1 — the lean MVP
 
-### 5.1 Per-group analysis (≤ G calls, batched)
+### 5.1 Scope
 
-For each surviving group, build one prompt containing the members' extracted
-sections (reusing `score.py`'s XML profile formatting) and the theme's idea
-atoms, and ask the LLM for structured JSON:
+**In:** flat atoms, single-temperature stochastic sampling with a mean↔max pooling
+knob, a coherence gate, diversity + coverage selection, one LLM provocation pass,
+a report, and an atom-landscape plot. Two dials only: temperature `T` and pooling
+`λ`. **Out (→ V2):** everything in §6.
 
-- `spark_score` (0–1): is this a genuinely interesting, non-obvious
-  combination? — the LLM judgment the cheap metrics can't make.
-- `theme`: a short name + one-line description of the shared thread.
-- `project_seeds`: 1–3 concrete proposals that *specifically* leverage who is in
-  the group — "X's projection-mapping + Y's sensor fabrication + Z's
-  community-organizing → a movement-reactive installation for the Kaaibar
-  opening" — naming which person brings what (same specificity bar the
-  introduction prompt already enforces: "be specific about WHICH skill meets
-  WHICH need," no vague "you share interests").
-- `missing`: the one or two skills/roles the seed needs but the group lacks —
-  feeds gap analysis and "who else to pull in."
+### 5.2 The algorithm, step by step
 
-Batched and budgeted exactly like `score_pairs_with_llm`: a single
-`batch_json_complete` over all surviving groups, cached per group signature,
-capped by `budgets.max_group_llm_calls`. `spark_score` lets us drop groups the
-cheap geometry liked but the LLM finds boring before they reach the report.
+All of 5.2 is **pure numpy, no LLM, no new dependencies.** Build it and eyeball the
+t-SNE landscape *before* spending on the LLM pass.
 
-### 5.2 Cohort synthesis (~1 call)
+**Landscape (once):**
+```
+1. atoms = extract_atoms(profiles)                     # §5.3 — [(owner_idx, text)]
+2. E     = get_embeddings([t for _,t in atoms], model) # embed.get_embeddings
+   E     = E / ||E||                                    # L2 normalize rows
+3. S     = E @ E.T                                       # utils.cosine_matrix
+4. owner = int array of length A
+```
 
-A final pass receives the surviving themes + their seeds + the cohort skill
-inventory and writes the narrative overview: the top themes, **connectors**
-(people who bridge several themes — derivable from group overlap), notable
-unmatched/loner profiles, and **collective gaps** (skills repeatedly listed in
-`missing`). This is the facilitator's "state of the community" briefing. Bounded
-to one (or a few, if the cohort is large) calls.
+**Grow one group (single-temperature tempered walk):**
+```
+def grow_group(rng, T, lam):
+    k    = rng.integers(size_min, size_max + 1)
+    seed = rng.integers(A)                       # uniform seed (V1)
+    G, used = [seed], {owner[seed]}
+    while len(G) < k:
+        cand = [c for c in range(A) if owner[c] not in used]   # 1 atom/person
+        if not cand: break
+        sims = S[np.ix_(cand, G)]                              # |cand| × |G|
+        pool = (1-lam) * sims.mean(1) + lam * sims.max(1)      # λ: 0=mean … 1=max
+        z    = (pool - pool.mean()) / (pool.std() + 1e-9)      # per-step z-score
+        p    = softmax(z / T)                                   # Boltzmann
+        c    = rng.choice(cand, p=p)
+        G.append(c); used.add(owner[c])
+    return G
+```
+- `T` is the one temperature dial. `T→0` echo chamber; `T→∞` noise; moderate `T`
+  coherent-with-surprises.
+- `λ` is the one character dial. Default `λ=0` (mean → tight, safe groups). Cranking
+  `λ` toward 1 (max-pooling drift) is where cross-domain serendipity comes from —
+  it's a single line, so V1 exposes it, but defaults safe. (Drift's failure mode and
+  its guards are V2; see §6.)
 
----
+**Gate (kill noise):**
+```
+def coherent(G):
+    sub = S[np.ix_(G, G)].copy(); np.fill_diagonal(sub, -inf)
+    return np.all(sub.max(1) >= coherence_floor)   # single-linkage: every member
+                                                    # is close to ≥1 other member
+```
 
-## 6. Integration & invocation
+**Sample N, then select M (anti-collapse by diversity, not by a quality score):**
+```
+groups    = dedup( [grow_group(rng, T, lam) for _ in range(N)] )   # by frozenset(owner)
+survivors = [g for g in groups if coherent(g)]
+rng.shuffle(survivors)                              # NOT sorted by similarity (obs. a)
+selected  = []
+for g in survivors:
+    members = {owner[i] for i in g}
+    if all(jaccard(members, members_of(s)) <= overlap_jaccard_max for s in selected):
+        selected.append(g)
+    if len(selected) >= llm_judge_pool: break       # M
+# coverage — nobody leaves without a provocation
+for p in (all_persons - covered(selected)):
+    add any survivor group containing p              # (relax M slightly)
+```
 
-Use the existing registry — it's purpose-built for exactly this (`main.py`
-already has `PipelineRegistry`, `--pipeline`, and `--list-pipelines`):
+Deliberately, V1 has **no contrast/novelty/density score** — the only geometric
+quality signal is the coherence gate; diversity selection prevents near-duplicate
+groups, and the **LLM's `spark_score` does all quality ranking.** This keeps V1 a
+clean test ("does stochastic diverse sampling + LLM judging beat a dump?") and
+turns every V2 geometric score into a separately measurable improvement.
 
-- Add `DiscoveryPipeline(BasePipeline)` with `name = "discovery"`, registered
-  next to `MatchingPipeline`. Its `run()` reuses `apply_io_overrides` +
-  `resolve_prompt_paths` (extended to resolve the discovery prompt files), runs
-  ingest/extract/embed via the existing functions, then calls the new
-  `discover` → `analyze` → `discovery_report` steps.
-- Invoke:
-  ```bash
-  python main.py --pipeline discovery --input ~/cohorts/hackathon_2026 --force
-  python main.py --pipeline discovery --group wintercircus
-  python main.py --list-pipelines        # now shows matching + discovery
-  ```
-- Optional ergonomic wrapper: a tiny `analyze_community.py` that just calls
-  `main(pipeline_name="discovery", ...)`, so the mode has a memorable entry
-  point — but the registry is the real mechanism, no plumbing is duplicated.
-- Modal: add a `run_discovery_pipeline` entry alongside the existing matching one
-  in `deploy_modal.py`, delegating to the same pipeline (same profiles-as-JSON
-  contract).
+### 5.3 Atomization (the one new LLM step)
 
----
+A new `extract_atoms_from_profiles` — modeled on
+`extract.extract_sections_from_profiles` but with a **list-valued output**. Simplest
+implementation: call `llm_wrapper.batch_json_complete` directly (one prompt per
+profile, like `score.py`), prompt returns `{"atoms": ["…", "…"]}`.
 
-## 7. Configuration sketch
+- Prompt (`config/discovery_atoms_prompt.yaml`): *"Extract the distinct, interesting,
+  self-contained elements of this person — projects, skills, obsessions, side
+  hobbies, what they're building, and **what they want or need help with**. Each as
+  a standalone sentence that reads on its own. Surface the orthogonal and the quiet,
+  not just the headline. ~3–8 elements. Do not invent."* (Including "what they want"
+  seeds complementarity cheaply — a need-atom can sit near a skill-atom.)
+- Cache per profile via `utils.hash_text(profile_text)` (reuse the cache-key pattern
+  from extract.py), so re-runs are free and `--force` re-atomizes.
+- Embeddings cached as one `.npz` in `embeds_dir`; recompute if the atom set changes.
 
-A `discovery:` block (or standalone `config_discovery.yaml` chosen via
-`--config`), in the existing config style:
+### 5.4 LLM proposal pass (the only analysis call)
+
+One batched call over the M selected groups (driven via `asyncio.run`, exactly like
+`score.py:386`). Prompt = members' atoms + their full profiles + the **event
+context** (theme, venue/vibe, time budget, ethos — the constraint is *generative*).
+Stance is a **provocation, not a prediction**. Structured JSON per group:
+
+- `spark_score` (0–1) — the taste judgment geometry can't make;
+- `theme` — the latent thread, named;
+- `proposal` — names *which person's atom brings what* (no vague "you share
+  interests");
+- `first_step` — the smallest thing they could do in the first hour;
+- `missing` — a skill/role the group lacks (recorded; V2 turns this into a loop).
+
+Cached per group signature (sorted owner ids + atom texts), capped by
+`budgets.max_group_llm_calls`. Rank by `spark_score`; return top `K`.
+
+### 5.5 Reuse map
+
+| Need | Reuse / extend |
+|------|----------------|
+| Load profiles | `ingest.load_profiles` — as-is |
+| Atomize | **NEW** `extract_atoms_from_profiles` (in `extract.py` or new `atomize.py`), reuses `LLMWrapper.batch_json_complete`, `utils.hash_text`, `get_cache_path` |
+| Embed atoms | `embed.get_embeddings` — as-is (**not** `create_section_embeddings`); optional `truncate_embeddings` |
+| Similarity | `utils.cosine_matrix` — as-is |
+| Sample/gate/select | **NEW** `src/sampler.py` — pure numpy |
+| Proposal pass | **NEW** `src/analyze.py` — reuses `batch_json_complete` + `asyncio.run` |
+| Report | **NEW** `src/discovery_report.py` — mirrors `report.py`; reuse `utils` IO |
+| Landscape plot | `tsne.py` — thin adapter for a flat `(A, d)` array |
+| Cost | `cost_tracker` — as-is |
+| Pipeline plumbing | `main.py`: `BasePipeline`, `PipelineRegistry`, `apply_io_overrides`, `resolve_prompt_paths`, `--group/--input/--force/--pipeline/--list-pipelines` — register a `DiscoveryPipeline` |
+
+New surface is small: ~3 modules + 1 extract function + 2 prompt files + 1 pipeline
+class.
+
+### 5.6 Configuration sketch (minimal)
 
 ```yaml
-models:                      # reuse existing model slugs
-  embedding: "google/gemini-embedding-2-preview"
+models:
+  embedding:      "google/gemini-embedding-2-preview"
   embedding_dimensions: 768
-  extraction_llm: "google/gemini-3.1-flash-lite"
-  analysis_llm:   "google/gemini-3.1-flash-lite"   # group analysis + synthesis
+  extraction_llm: "google/gemini-3.1-flash-lite"   # atomization
+  analysis_llm:   "google/gemini-3.1-flash-lite"   # proposals
 
 discovery:
-  cohesion_recipe:           # the "why" axis → affinity matrix A (reuses candidate.py)
-    section_weights:
-      interests: 0.40
-      vision:    0.35
-      ideas:     0.25
-      skills:    0.00
-  complementarity_section: skills     # → C = 1 - S_skills
-  granularity: idea_atoms             # "idea_atoms" | "person"
-  idea_atoms:
-    max_atoms_per_profile: 5
-  group_size: { min: 2, max: 5 }
-  objective:
-    cohesion_weight: 0.6
-    diversity_weight: 0.4
-    cohesion_floor: 0.25              # hard gate before ranking
-  candidate_groups:
-    overlap_jaccard_max: 0.6          # de-dupe for variety
-  budgets:
-    extraction_llm_calls: 100
-    max_group_llm_calls: 40           # the bounded LLM cap (≈ #seeds judged)
-  synthesis: true
+  atoms: { max_atoms_per_profile: 8 }
+
+  sampler:
+    n_groups: 3000                 # N — compute knob; pure numpy, scale freely
+    group_size: { min: 3, max: 5 }
+    temperature: 0.8               # the one T dial
+    pooling: 0.0                   # λ: 0=mean (safe). Crank toward 1 for drift.
+
+  selection:
+    coherence_floor: 0.20
+    llm_judge_pool: 30             # M — distinct candidates sent to the LLM
+    overlap_jaccard_max: 0.6
+    coverage_min_per_person: 1
+
+  output: { return_top: 12 }       # K
+
+  event_context: |
+    A weekend hackathon at Wintercircus, Ghent. Playful, hands-on, community-driven
+    vibe-coding around music, visuals, physical/social spaces. Bias toward things
+    buildable in 2 days that could live on afterward.
+
+  budgets: { atomize_llm_calls: 100, max_group_llm_calls: 30 }
 
 prompt_files:
-  section_prompt:   config/discovery_section_prompt.yaml   # adds interests/ideas sections
+  atoms_prompt:     config/discovery_atoms_prompt.yaml
   discovery_prompt: config/discovery_prompt.yaml
 ```
 
-Everything that defines *what makes a good seed* (axis weights, size bounds,
-cohesion floor, objective blend, budgets) is config, not code — same philosophy
-as the matching `recipe`/`blending`/`matching` blocks, so Xander can tune it per
-cohort without edits.
+### 5.7 Outputs
 
-### Sections for discovery
+- **`discovery.json`**: each returned group with `members` (people), `atoms`
+  (entering facets), `spark_score`, `theme`, `proposal`, `first_step`, `missing`.
+- **`discovery_report.md`**: ranked provocations, each naming who brings what +
+  first step + missing skill.
+- **`plots/`**: atom t-SNE colored by person and by selected-group membership.
+- **`cost_report.json`**: `cost_tracker`, unchanged.
 
-Reuse the section-config mechanism (`active` flags + `guideline` + `max_words`).
-The matching sections are `skills / vision / project / needs`. For discovery, a
-discovery section config keeps `skills` and `vision`, and adds/activates:
+### 5.8 Baseline & evaluation (the point of staying lean)
 
-- `interests` — themes, curiosities, domains this person is drawn to (the
-  cohesion axis, distinct from long-term `vision`).
-- `ideas` — things they want to build / wish existed / would jump on (the raw
-  material for idea atoms and project seeds), distinct from present-tense
-  `project`.
+To know whether any of this works, V1 ships with a **baseline** to beat:
 
-Because extraction is fully config-driven, this is a new YAML, not new code.
+- **Baseline = the LLM dump.** Feed all atoms (or all profiles) + event context to
+  the LLM in one/few calls; ask for `K` group provocations in the *same JSON
+  format*. (A `--baseline dump` flag on the same pipeline.)
+- **Compare V1 vs. baseline on, for the same K:**
+  - *coverage* — fraction of people appearing in ≥1 provocation;
+  - *non-obviousness* — mean intra-group atom similarity (lower = more cross-domain);
+    plus a count of cross-domain vs. same-domain groups;
+  - *facilitator/LLM-judge rating* of spark and buildability (qualitative).
+- Every V2 feature is then an A/B against this V1 number, on real cohort data — so we
+  add complexity only where it measurably moves coverage / non-obviousness / rating.
 
----
+### 5.9 V1 build order
 
-## 8. Outputs
-
-Written to the existing `<outputs_dir>` (so `--group`/`--input` layout is
-unchanged):
-
-- **`discovery.json`** (machine-readable): list of themes/groups, each with
-  members, their idea atoms, `spark_score`, `cohesion`/`diversity`,
-  `project_seeds`, `missing` skills; plus cohort-level connectors and gaps.
-- **`discovery_report.md`** (the deliverable): the facilitator narrative —
-  "6 emergent themes, 10 concrete project seeds with named people and the why,
-  the connectors, the gaps." This is the artifact a hackathon/residency host
-  reads aloud or pins to a wall.
-- **`plots/`**: idea-atom / person t-SNE colored by discovered theme (reuse
-  `tsne.py`), and an affinity heatmap (reuse `visualize_similarity.py`), so
-  cluster quality is eyeballable — the discovery analogue of matching's
-  score-correlation plots.
-- **`cost_report.json`**: reuse `cost_tracker` unchanged.
-
----
-
-## 9. Scaling & cost (the explicit requirement)
-
-| Stage | Work | LLM calls | Scaling |
-|-------|------|-----------|---------|
-| Extract sections | 1 call/profile (batched, cached) | N | **linear** |
-| Extract idea atoms | 1 call/profile (batched, cached) | N | **linear** |
-| Embed | atoms+sections, batched | 0 (embeddings) | linear, cheap |
-| Signals (A, C) | N×N cosine | 0 | quadratic *but pure numpy*, trivial at our N |
-| Cluster + generate groups | atom clustering / seed expansion | 0 | cheap |
-| Score + rank + de-dupe | numpy over candidate groups | 0 | cheap |
-| Group analysis | 1 call/surviving group | **≤ `max_group_llm_calls`** | **capped constant** |
-| Synthesis | cohort overview | ~1 | constant |
-
-Total LLM cost ≈ `2N + min(#groups, cap) + 1` — **linear extraction plus a fixed
-analysis cap**, never combinatorial. This is the same cost shape as matching and
-holds from an 8-person residency to a few-hundred-person cohort.
+1. **Scaffold:** `DiscoveryPipeline` (register + CLI), reuse ingest/embed, stub
+   `atomize`/`sampler`/`analyze`/`discovery_report`, add the two prompt files. Run a
+   placeholder end-to-end. Author a ~20-person multi-domain fixture cohort to test
+   against (see Risks).
+2. **Atomize + landscape:** `extract_atoms_from_profiles`, `AtomTable`, atom t-SNE.
+   **Eyeball the landscape before any LLM scoring.**
+3. **Sampler + selection (§5.2):** single-T tempered walk, coherence gate, diversity
+   + coverage. Eyeball groups on the landscape.
+4. **Proposal pass (§5.4) + report (§5.7).**
+5. **Baseline + eval harness (§5.8).** Measure V1 vs. dump on the fixture + a real
+   cohort. *Stop here and learn before building V2.*
 
 ---
 
-## 10. Risks, tradeoffs & decisions to confirm
+## 6. V2 — scoped, not implemented
 
-- **Person-level vs. idea-atom granularity.** Idea-atoms answer the brief most
-  directly and resolve multi-idea people, but add one extraction pass and a
-  custom embedding/index path. *Recommendation:* ship person-level seed-expansion
-  as v1 scaffolding, then idea-atom theming as the headline — they share all
-  downstream code. (Confirm which to build first.)
-- **Clustering method at small N.** HDBSCAN/Louvain are tempting but fragile at
-  N≈8–15 and add deps. *Recommendation:* seed-expansion (numpy, overlap-friendly,
-  size-bounded) as the group source + agglomerative (existing sklearn) for the
-  partition map. Revisit community detection only if cohorts grow large.
-- **No ground truth.** Quality is subjective, so lean on the plots + exposed
-  scores + fully config-driven knobs for human-in-the-loop tuning (exactly how
-  matching exposes recipe weights and correlation plots today).
-- **Cohesion-floor / objective-weight sensitivity.** These decide whether seeds
-  skew "safe echo chamber" vs. "ambitious mashup." Surface both `cohesion` and
-  `diversity` per group in `discovery.json` so the balance is auditable and
-  tunable.
-- **Don't cluster the signed fused matrix.** Reusing matching's single
-  `final = embed·w + llm·w` blend for *clustering* would re-introduce the exact
-  cohesion/complementarity confound we set out to avoid. We reuse the fusion code
-  but keep the two axes separate. (Stated so a future contributor doesn't
-  "simplify" it back.)
-- **Optional HyDE idea→skill bridge (§2, §5).** An idea-anchored variant —
-  take each strong idea as a nucleus and recruit complementary skills via the
-  existing directional HyDE cross-matrix — is arguably an even more direct
-  "project proposal" generator. It's pure reuse of `hyde.py` + `candidate.py`'s
-  directional path and can layer on later as an alternative `granularity` mode.
+Each item names the **V1 weakness it addresses**, a one-line **sketch**, its **cost**,
+and (where relevant) which Gemini critique it answers. Add them one at a time and
+A/B against the §5.8 numbers — do not batch them.
+
+### 6.1 Cohort synthesis — "state of the room" (cheap, likely first add)
+*Weakness:* V1 returns provocations but no cohort-level narrative. *Sketch:* 1 extra
+LLM call over the returned groups + atom inventory → dominant threads, connectors,
+collective gaps. *Cost:* +1 LLM call.
+
+### 6.2 Temperature portfolio + annealing
+*Weakness:* a single `T` bets on one energy. *Sketch:* sample across cool/warm/hot
+bands, tag each group with its band (cool=teams, hot=wildcards); optionally anneal
+`T_start→T_end` within a walk (nucleation). *Cost:* 0 LLM, pure numpy.
+
+### 6.3 Outlier (density) seeding
+*Weakness:* uniform seeding under-samples the misfits that produce the best
+collisions. *Sketch:* precompute `dens[i] = Σ_j max(S[i,j],0)`; seed `p ∝
+exp(−dens/T_seed)`. *Cost:* 0 LLM.
+
+### 6.4 Max-pooling drift **+ its guards** (answers Gemini #2)
+*Weakness:* high-`λ` drift produces the most exciting cross-domain groups but can
+create "chain-link" groups whose extremes share no vocabulary — the LLM then
+hallucinates a contrived connection. *Sketch:* turn up `λ`, **and ship the guards
+with it** — replace the single-linkage gate with a **weakest-link gate** (max
+spanning tree over `S_G`, require its minimum edge ≥ floor) and a **diameter cap**
+(reject `max_{i,j}(1−S[i,j]) > diameter_max`), turning contrast into a bounded
+inverted-U ("diverse but not shattered"). *Cost:* 0 LLM.
+
+### 6.5 Theme anchor projection (answers Gemini #2 **and** #3)
+*Weakness:* (a) raw density penalties would punish the *core event theme* (at a
+climate residency, "carbon tracking" is dense *because it's the point*); (b) groups
+lack a guaranteed shared center of gravity. *Sketch:* embed `event_context` → `θ`;
+measure **contrast in the theme-orthogonal residual** `a⊥ = a − (a·θ̂)θ̂` (diversity
+in the dimensions that *aren't* "we're all here for climate"), while the theme
+provides cohesion. One mechanism fixes both density-eats-theme and chain-link
+(everyone connects through the theme). *Cost:* 0 LLM.
+
+### 6.6 Contrast & novelty scores
+*Weakness:* V1 does no geometric quality ranking (LLM judges everything). *Sketch:*
+add `contrast` (mean pairwise distance, bounded per 6.4) and `novelty` (off-centroid
++ low theme-residual density per 6.5) as a *loose* pre-ranking before the LLM, plus a
+**wildcard quota** (force-keep high-novelty groups the metrics under-rate). *Cost:* 0
+LLM. Measure whether geometric pre-ranking beats pure LLM judging.
+
+### 6.7 Complement-attraction via HyDE (answers Gemini #1)
+*Weakness:* like-attracts-like sampling clusters similar skills, not complementary
+ones (React dev ≠ near designer). *Sketch:* give each atom a HyDE-derived "complement
+vector" (what would *complete* it; reuse `hyde.py`) and blend into growth:
+`p(c) ∝ exp((α·sim + β·complement)/T)`. *Cost:* +1 HyDE LLM pass over atoms.
+
+### 6.8 Missing→fill loop (answers Gemini #1)
+*Weakness:* V1 just records the LLM's `missing` field. *Sketch:* embed the missing-
+role text, nearest-neighbor among *unattached* people → concrete "pull in Sarah."
+Turns a flagged gap into a geometric suggestion. *Cost:* 0–1 LLM.
+
+### 6.9 Path-as-explanation
+*Sketch:* emit the max-similarity spanning tree edges as the human-readable "why it
+cohered" ("art-student ↔ robotics 0.68, bridged to producer via sound 0.61").
+*Cost:* 0 LLM. Builds facilitator trust.
+
+### 6.10 Connector / free-agent detection
+*Sketch:* centrality on `S` → connectors; people who recur across many groups'
+`missing` lists → free agents to deploy. *Cost:* 0 LLM.
+
+### 6.11 Iterative refinement (light MCMC / genetic)
+*Sketch:* take top groups, swap the weakest-marginal member for a hot-sampled
+alternative, re-score. Cheap matrix ops; polishes raw samples. *Cost:* 0 LLM.
+
+### 6.12 Modal entry point
+*Sketch:* a `run_discovery_pipeline` Modal entry mirroring the matching one.
 
 ---
 
-## 11. Suggested build order
+## 7. Risks & open questions
 
-1. **Scaffold the mode.** `DiscoveryPipeline` in `main.py` (register + CLI),
-   reuse ingest/extract/embed, stub `discover`/`analyze`/`discovery_report`.
-   Add the discovery section + prompt + config files. Run end-to-end on
-   `data/real` producing a placeholder report.
-2. **Cheap half (`src/discover.py`).** Build A and C from the discovery recipe;
-   person-level seed-expansion; cohesion×diversity scoring; Jaccard de-dupe.
-   Validate via t-SNE/heatmap before any LLM spend.
-3. **LLM half (`src/analyze.py`).** Per-group analysis (spark score + theme +
-   seeds + gaps) via `batch_json_complete`; then the synthesis pass.
-4. **Report (`src/discovery_report.py`).** `discovery.json` + `discovery_report.md`
-   + cluster-colored plots.
-5. **Idea-atom granularity.** Add the atom extraction pass (step 2a) + the
-   `get_embeddings` flatten/index path + atom clustering; route the same scoring/
-   analysis/report code through it. Make `granularity` config-switchable.
-6. **(Optional) HyDE idea→skill anchored variant** and Modal entry point.
-```
+- **Variable-length atoms are the real engineering cost** — but the flat-array
+  approach (§2) keeps it small. The `AtomTable` is the single source of truth; build
+  it first and route every step through it. *Open:* atom-set caching when profiles
+  change partially.
+- **Atom quality = onboarding quality** (garbage in, garbage out). The orthogonal-
+  thread digging happens **upstream**, out of scope here; this pipeline assumes
+  profiles already contain such material.
+- **V1 tests the *weakest* form of the hypothesis** (mean-pooling → tightish
+  groups). The most exciting cross-domain serendipity is expected to need V2's drift
+  (§6.4) — so don't over-conclude from V1 alone; the point of V1 is the harness and
+  the baseline.
+- **No fixture cohort exists yet.** The vivid multi-domain cohort needed to validate
+  serendipity must be authored (~20 `.txt` profiles); current `data/*` groups are
+  small and homogeneous. First task in §5.9.
+- **Don't sample on a signed fused matrix.** Keep similarity a *soft probability
+  landscape*; collapsing it into a single maximized score recreates mean-collapse.
+- **Randomness is a feature** — output varies run-to-run by design (fresh best-of-N
+  draw). To pin a batch, persist its `discovery.json`.
+- **No external frontend.** Output is the markdown report + JSON; the schema is owned
+  by this doc.

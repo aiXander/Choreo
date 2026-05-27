@@ -6,9 +6,8 @@ A flexible user profile matching system that uses LLM embeddings, HyDE (Hypothet
 
 Loose ends from the HyDE / directional-matching work, to pick up later (roughly highest-impact first):
 
-1. **Use or drop the directional matrix.** `main.py:329` captures `dir_similarity_matrix` (the asymmetric "who can help whom" signal — the whole point of not symmetrizing in `candidate.py`), but only the symmetrized matrix flows into scoring/matching/intros/reports. Either consume it (order directional intros by it, or surface a directional help score in the report) or drop the extra return value so it isn't dead computation.
-2. **Existing groups need `--force`.** Embedding cache keys on (user set, section names); the section rename invalidates old caches anyway, but don't trust a stale `data/{group}/embeds`.
-3. **Commit hygiene.** This work-in-progress mixes the feature with model repricing, a Modal signature change, and regenerated `README.md`/`analysis_report.md` (the latter looks like a run artifact — decide if it belongs in git or `.gitignore`). Consider splitting doc regen from code before pushing.
+1. **Existing groups need `--force`.** Embedding cache keys on (user set, section names); the section rename invalidates old caches anyway, but don't trust a stale `data/{group}/embeds`.
+2. **Commit hygiene.** This work-in-progress mixes the feature with model repricing, a Modal signature change, and regenerated `README.md`/`analysis_report.md` (the latter looks like a run artifact — decide if it belongs in git or `.gitignore`). Consider splitting doc regen from code before pushing.
 
 _Resolved: starter-topics bullet char unified on `•`; cross-key parsing consolidated into `utils.parse_cross_key` (now `->`-aware for multi-word sections); error-path intros use the dual-direction format; `deploy_modal.py` dead `group_name` param removed._
 

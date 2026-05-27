@@ -1,14 +1,51 @@
 # Choreo Upgrade Plan: Directional Cross-Matching with HyDE
 
+---
+
+## 📋 Implementation Status (last reviewed: 2026-05-26)
+
+**The core plan (Steps 1–8, "batch-directional" mode) is fully implemented and shipped.** Everything still outstanding is an explicitly-deferred FUTURE TODO — none of it is required for the batch-directional matching mode to work.
+
+### ✅ Done (Steps 1–8)
+
+| Step | What | Where |
+|------|------|-------|
+| 1 | Section config + `active` flags | `config/section_prompt.yaml` (sections evolved to `skills`/`vision`/`project`/`needs`) |
+| 2 | Active-section filtering | `utils.filter_active_sections()`, called in `extract.py` (incl. response loop) |
+| 3 | HyDE descriptor generation | `src/hyde.py`, `config/hyde_prompt.yaml` (cached to `processed/hyde/`) |
+| 4 | Embed HyDE descriptors | `embed.py:create_section_embeddings()` → `hyde_vectors.npz` |
+| 5 | Directional (asymmetric) cross-section similarity | `candidate.py` — returns both `dir_matrix` + `sym_matrix`, not symmetrized |
+| 6 | Main config (hyde, recipe, cross weights) | `config/config.yaml` (`cross_section_weights: {needs_skills: 0.80}`) |
+| 7 | Single-score scoring prompt | `config/scoring_prompt.yaml` |
+| 8 | Directional intros (`intro_for_a`/`intro_for_b`) | `config/introduction_prompt.yaml` + `introduction.py` parsing |
+| — | Pipeline wiring (HyDE step 2.5, data passthrough) | `main.py` |
+
+**Implemented beyond the original plan:** robust `parse_cross_key()` supporting `source->target` for multi-word section names; MRL/Matryoshka truncation (`supports_mrl()` + `truncate_embeddings()` in `embed.py`); full OpenRouter migration for all LLM + embedding calls.
+
+### ⏳ Still TODO (all deferred FUTURE work — see bottom of doc)
+
+1. **User-centric mode** — `--user alice [--query "..."]`: single directional row, no b-matching, top-K ranked list, single-user report. *Not started.* Directional infra to support it already exists.
+2. **Collective-optimal mode** — ILP/graph optimization for total value with diversity/bridging/coverage constraints. *Not started.*
+3. **Enhanced HyDE:**
+   - `n_descriptors > 1` — data path already supports it (list-based + max-pooling), but only ever run with `1`; multi-descriptor path untested in practice.
+   - **Community-aware HyDE** — inject available-skill summary into the HyDE prompt. *Not started.*
+   - **Bidirectional HyDE** — HyDE-transform the target side too. *Not started.*
+
+### Note on the directional matrix
+
+`generate_similarity_matrix` returns both a directional (asymmetric) and a symmetric matrix. The symmetric matrix drives scoring/matching, and intro directionality is reasoned from the intro prompt. The directional matrix is intentionally retained (captured in `main.py`, not yet consumed) as the foundation for future directional features (user-centric mode, directional reporting).
+
+---
+
 ## Architectural Vision
 
 Choreo's matching should be **directional by default**: every score answers "how valuable is person B *for person A*?" rather than "how good is this pair?" This is the fundamental primitive. All matching modes are built on top of directional scores:
 
 | Mode | How it uses directional scores | Status |
 |------|-------------------------------|--------|
-| **Batch-directional** (demo tomorrow) | Compute asymmetric embedding scores for all pairs. Aggregate into symmetric edge weights. Run b-matching so everyone gets ~equal matches. | **IMPLEMENT NOW** |
-| **User-centric** (near-future) | Given user A + optional need query, rank all others by `score_A→B`. No graph optimization, just a ranked list. | FUTURE TODO |
-| **Collective-optimal** (longer-term) | Optimize total graph value: `maximize Σ value(edge)` with diversity/bridging/coverage constraints. Operates from the group's POV, not any individual's. | FUTURE TODO |
+| **Batch-directional** (demo tomorrow) | Compute asymmetric embedding scores for all pairs. Aggregate into symmetric edge weights. Run b-matching so everyone gets ~equal matches. | ✅ **IMPLEMENTED** |
+| **User-centric** (near-future) | Given user A + optional need query, rank all others by `score_A→B`. No graph optimization, just a ranked list. | ⏳ FUTURE TODO |
+| **Collective-optimal** (longer-term) | Optimize total graph value: `maximize Σ value(edge)` with diversity/bridging/coverage constraints. Operates from the group's POV, not any individual's. | ⏳ FUTURE TODO |
 
 ### What "directional" means concretely
 

@@ -60,7 +60,7 @@ The matching pipeline (steps as printed in `main.py`):
 - **Same-section similarity** is symmetric (e.g. `project`↔`project`).
 - **Cross-section similarity is asymmetric**: `cross[i][j]` = "how well can j's skills address i's needs". This is *not* symmetrized during computation — see `candidate.py:121`.
 - **HyDE bridges the vocabulary gap**: a need ("make my installation respond to movement") is rewritten by an LLM into skill-vocabulary text, so it embeds close to the matching skills.
-- `generate_similarity_matrix` returns both the directional matrix and a symmetric `(dir + dir.T)/2` matrix. **Only the symmetric matrix flows into scoring/matching today**; the directional one is currently captured but unused in `main.py`.
+- `generate_similarity_matrix` returns both the directional matrix and a symmetric `(dir + dir.T)/2` matrix. The symmetric matrix drives scoring/matching; the directional matrix is intentionally retained (captured in `main.py` but not yet consumed) for future directional features such as user-centric mode.
 
 ### Key Data Flow
 

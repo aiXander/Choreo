@@ -1,7 +1,7 @@
 introduction_generation: |
   Context: {goal}
 
-  Your task is to generate collaboration guidance for a matched pair of residents.
+  Your task is to generate intro / collaboration guidance for a matched pair of community members.
   "{instruction}"
 
   This pair ({user_a_name} and {user_b_name}) have been matched because they are complementary in the project context.

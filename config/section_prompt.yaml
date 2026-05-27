@@ -29,4 +29,5 @@ sections_prompt: |
   {sections_list}
 
   Try to make the extracted sections complementary although some content overlap is totally fine since every section needs to stand on its own since it will get vector embedded and must cover the full section intent.
-  Try to be comprehensive but stay within the given word limits. Do not invent / hallucinate information that wasn't in the profile. If information is missing, infer what you can based on the available profile context. If you absolutely cannot infer anything useful (rare): use "Not specified" for missing sections.
+  Try to be comprehensive but stay within the given word limits. 
+  IMPORTANT: Do not invent / hallucinate information that wasn't in the profile! If information is missing, infer what you can based on the available profile context, but don't guess things you don't know. If you absolutely cannot infer anything useful (rare): use "Not specified" for missing sections.
