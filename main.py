@@ -200,7 +200,7 @@ def _execute_matching_pipeline(
 
     llm_wrapper = LLMWrapper(
         cache_dir=io_config.get("cache_dir"),
-        enable_reasoning=config.get("models", {}).get("enable_reasoning", False),
+        reasoning_effort=config.get("models", {}).get("reasoning_effort", "low"),
     )
 
     if force:

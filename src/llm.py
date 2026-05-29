@@ -127,16 +127,18 @@ def extract_usage(response: Any) -> Dict[str, Any]:
     }
 
 
-def _build_extra_body(reasoning_effort: Optional[str], enable_reasoning: bool) -> Dict[str, Any]:
+def _build_extra_body(reasoning_effort: Optional[str]) -> Dict[str, Any]:
     """Assemble OpenRouter-specific request extensions.
 
     Note: OpenRouter usage accounting (cost + token details) is always on, so no
     ``usage: {include: true}`` flag is needed — it returns automatically.
     """
     extra_body: Dict[str, Any] = {}
-    # Only forward a reasoning effort to reasoning-capable models when enabled;
-    # the default (gemini-flash-lite) is not a reasoning model.
-    if enable_reasoning and reasoning_effort:
+    # Forward the reasoning effort whenever one is set (including "none" to turn
+    # reasoning off). OpenRouter silently ignores this for non-reasoning models,
+    # so it's safe to always send; reasoning models that can't be disabled would
+    # otherwise default to "medium". A null/empty effort lets the model decide.
+    if reasoning_effort:
         extra_body["reasoning"] = {"effort": reasoning_effort}
     return extra_body
 
@@ -145,7 +147,6 @@ def _build_chat_params(
     messages: List[Dict[str, str]],
     model: str,
     reasoning_effort: Optional[str] = None,
-    enable_reasoning: bool = False,
     **kwargs,
 ) -> Dict[str, Any]:
     """Build the chat.completions request params shared by sync and async paths."""
@@ -154,7 +155,7 @@ def _build_chat_params(
         "messages": messages,
     }
 
-    extra_body = _build_extra_body(reasoning_effort, enable_reasoning)
+    extra_body = _build_extra_body(reasoning_effort)
     if extra_body:
         params["extra_body"] = extra_body
 
@@ -182,12 +183,11 @@ async def async_chat_completion(
     messages: List[Dict[str, str]],
     model: str,
     reasoning_effort: Optional[str] = None,
-    enable_reasoning: bool = False,
     **kwargs,
 ) -> Any:
     """Native async OpenRouter chat completion using a caller-provided client."""
     return await client.chat.completions.create(
-        **_build_chat_params(messages, model, reasoning_effort, enable_reasoning, **kwargs)
+        **_build_chat_params(messages, model, reasoning_effort, **kwargs)
     )
 
 
@@ -202,16 +202,18 @@ class JSONExtractionError(ValueError):
 class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
     
-    def __init__(self, cache_dir: str, max_retries: int = 3, enable_reasoning: bool = False):
+    def __init__(self, cache_dir: str, max_retries: int = 3, reasoning_effort: Optional[str] = "low"):
         self.cache_dir = ensure_dir(cache_dir) / "llm"
         ensure_dir(self.cache_dir)
         self.max_retries = max_retries
         self.call_count = 0
         self.cost_tracker = get_cost_tracker()
         self.current_component = None  # Will be set by calling code
-        # Whether to forward reasoning effort to the model (only useful for
-        # reasoning-capable models; default model is non-reasoning).
-        self.enable_reasoning = enable_reasoning
+        # Default reasoning effort forwarded to OpenRouter (xhigh|high|medium|
+        # low|minimal|none, or None to let the model decide). Used by any phase
+        # that doesn't pass an explicit reasoning_effort; "low" is the
+        # cost-effective baseline and is ignored on non-reasoning models.
+        self.reasoning_effort = reasoning_effort
         # Request provider-native JSON mode (response_format={"type":"json_object"})
         # on JSON completions so the model is forced to emit syntactically valid
         # JSON at the source. Auto-disabled for the rest of the run if a provider
@@ -355,7 +357,7 @@ class LLMWrapper:
         schema_hints: Optional[List[Optional[str]]] = None,
         batch_size: int = 8,
         max_retries: int = 3,
-        reasoning_effort: str = "low",
+        reasoning_effort: Optional[str] = None,
         retry_delay_base: float = 1.0,
         verbosity: int = 0,
         print_reasoning_summary: bool = False
@@ -377,7 +379,12 @@ class LLMWrapper:
         """
         if not prompts:
             return []
-        
+
+        # Fall back to the wrapper's configured default when no per-phase
+        # effort is given (None means "inherit the config default").
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
+
         n_prompts = len(prompts)
         cache_keys = cache_keys or [None] * n_prompts
         schema_hints = schema_hints or [None] * n_prompts
@@ -463,7 +470,7 @@ class LLMWrapper:
         schema_hint: Optional[str] = None,
         max_retries: int = 3,
         retry_delay_base: float = 1.0,
-        reasoning_effort: str = "low",
+        reasoning_effort: Optional[str] = None,
         verbosity: int = 0,
         print_reasoning_summary: bool = False
     ) -> Dict[str, Any]:
@@ -494,8 +501,7 @@ class LLMWrapper:
                     self._async_client,
                     messages=[{"role": "user", "content": json_prompt}],
                     model=model,
-                    reasoning_effort=reasoning_effort,
-                    enable_reasoning=self.enable_reasoning,
+                    reasoning_effort=reasoning_effort if reasoning_effort is not None else self.reasoning_effort,
                     **call_kwargs,
                 )
 

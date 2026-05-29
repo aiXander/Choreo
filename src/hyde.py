@@ -115,7 +115,6 @@ def generate_hyde_descriptors(
                         model=model,
                         cache_keys=cache_keys_for_llm,
                         schema_hints=schema_hints,
-                        reasoning_effort="low",
                         batch_size=16,
                     )
                     return responses

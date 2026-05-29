@@ -103,7 +103,7 @@ models:
   embedding_dimensions: 768   # MRL truncation; null = full native size (3072)
   extraction_llm: "google/gemini-3.1-flash-lite"
   pair_llm: "google/gemini-3.1-flash-lite"
-  enable_reasoning: false      # true only for reasoning-capable models
+  reasoning_effort: "low"      # global default; xhigh|high|medium|low|minimal|none (null = model default). Ignored on non-reasoning models; pair scoring overrides to "medium".
 
 hyde:
   n_descriptors: 1             # HyDE phrasings per source section
