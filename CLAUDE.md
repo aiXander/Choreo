@@ -32,9 +32,15 @@ uv run python main.py --group test4                   # group mode with caching
 uv run python main.py --list-pipelines                # show registered pipelines
 
 # Modal deployment (serverless)
-uv run modal deploy deploy_modal.py
-uv run modal run deploy_modal.py::run_matching_pipeline --user-profiles-json=profiles.json
+uv run modal deploy deploy_modal.py                              # deploy callable function
+uv run modal run deploy_modal.py --input-dir data/test4 --force # run a job; downloads outputs_modal.zip locally
+uv run modal run deploy_modal.py --profiles-json profiles.json  # or pass {user_id: text} JSON
 ```
+
+Modal needs a `choreo-secrets` secret holding `OPENROUTER_API_KEY` (add `AWS_*`
+keys to it to also push the outputs zip to S3). Outputs persist to the
+`choreo-data` Volume; the local entrypoint pulls the zip back automatically. See
+the header of `deploy_modal.py` for details.
 
 `--force` re-runs every step, ignoring caches. Without it, unchanged profiles/sections/embeddings are reused.
 
