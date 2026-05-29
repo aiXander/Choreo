@@ -18,11 +18,11 @@ models:
   enable_reasoning: false
 
 instruction_prompt:
-  goal: "We are matching community members who might potentially want to collaborate. Each person has specific skills and project needs. We want to find pairs where one person's skills can directly help the other's project needs."
+  goal: "We are matching participants at an AI hackathon at Wintercircus Gent. Most attendees are here for professional reasons: to form teams and build product demos during the event (eg AI agents), while also making valuable professional connections. We want to surface pairs who should connect — where one person's skills fill another's build gap, and/or they share a project direction worth building together. Stay focused on the hackathon, but keep an eye slightly wider than the event itself: also surface connections with real potential beyond the weekend (career moves, co-founders, startups, business and network opportunities)."
 
 budgets:
-  extraction_llm_calls: 100
-  max_pair_llm_calls: 300
+  extraction_llm_calls: 300
+  max_pair_llm_calls: 600
   max_n_llm_evaluations_per_profile: 16
   n_profiles_to_score_together: 4
 
@@ -30,21 +30,21 @@ hyde:
   n_descriptors: 1
 
 recipe:
-  instruction: "Score this match based on how directly each person's skills can address the other's project needs. The best matches are where both people bring something the other needs but unidirectional matches are also totally fine. Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
+  instruction: "Score this match on collaboration potential. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional signal is also valuable. Also reward a shared buildable direction or overlapping ambition (two people excited about the same problem who should team up), and connections with real potential beyond the hackathon (co-founder, startup, business, or network fit). Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
   section_weights:
     skills:   -0.10
     vision:   0.30
-    project:  0.10
-    needs:    0.00
+    project:  0.20
+    needs:    -0.10
   cross_section_weights:
-    needs_skills: 0.60
+    needs_skills: 0.80
 
 blending:
   embed_weight: 0.35
   llm_weight:   0.65
 
 matching:
-  b_min: 2
+  b_min: 3
   b_max: 4
   min_profiles_required: 2
 

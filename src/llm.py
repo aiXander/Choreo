@@ -159,7 +159,7 @@ def _build_chat_params(
         params["extra_body"] = extra_body
 
     # Forward standard sampling params if explicitly provided.
-    for key in ("temperature", "max_tokens", "top_p"):
+    for key in ("temperature", "max_tokens", "top_p", "response_format"):
         if kwargs.get(key) is not None:
             params[key] = kwargs[key]
 
@@ -191,6 +191,14 @@ async def async_chat_completion(
     )
 
 
+class JSONExtractionError(ValueError):
+    """Raised when a model response cannot be parsed into JSON.
+
+    Treated as retryable (see ``_is_retryable_error``): LLM output is stochastic,
+    so re-sampling the same prompt usually yields valid JSON on the next attempt.
+    """
+
+
 class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
     
@@ -204,6 +212,11 @@ class LLMWrapper:
         # Whether to forward reasoning effort to the model (only useful for
         # reasoning-capable models; default model is non-reasoning).
         self.enable_reasoning = enable_reasoning
+        # Request provider-native JSON mode (response_format={"type":"json_object"})
+        # on JSON completions so the model is forced to emit syntactically valid
+        # JSON at the source. Auto-disabled for the rest of the run if a provider
+        # rejects the param (see _async_json_complete_with_retry).
+        self.json_mode = True
         # Async client, created/closed per batch_json_complete run (see note in
         # make_async_openrouter_client about per-event-loop lifecycle).
         self._async_client: Optional[AsyncOpenAI] = None
@@ -253,42 +266,82 @@ class LLMWrapper:
         
         return f"{prompt}\n\n{json_instruction}"
     
+    @staticmethod
+    def _first_balanced_json(text: str) -> Optional[Any]:
+        """Parse the first balanced ``{...}`` / ``[...]`` span in ``text``.
+
+        Scans for the first opening brace/bracket and walks to its matching close,
+        correctly skipping braces that appear inside string literals (and their
+        escapes). This recovers a JSON object even when the model wraps it in
+        prose ("Here is the JSON: {...} Hope that helps!") or pretty-prints it
+        across many lines — cases the old line-by-line scan could not handle.
+        Returns the parsed value, or None if no balanced span parses.
+        """
+        for start, opener in enumerate(text):
+            if opener not in "{[":
+                continue
+            closer = "}" if opener == "{" else "]"
+            depth = 0
+            in_str = False
+            escaped = False
+            for end in range(start, len(text)):
+                ch = text[end]
+                if in_str:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:end + 1])
+                        except json.JSONDecodeError:
+                            break  # try the next opener
+        return None
+
     def _extract_json(self, response: str) -> Dict[str, Any]:
-        """Extract JSON from response, handling various formats."""
+        """Extract JSON from a model response, tolerant of common wrappers.
+
+        Order: direct parse → fenced code block (```json / ```) → first balanced
+        JSON span anywhere in the text. Raises JSONExtractionError (retryable) if
+        nothing parses, so the caller re-samples rather than silently dropping
+        the profile to empty sections.
+        """
         response = response.strip()
-        
+
         # Try direct JSON parse first
         try:
             return json.loads(response)
         except json.JSONDecodeError:
             pass
-        
-        # Look for JSON within markdown code blocks
-        if "```json" in response:
-            start = response.find("```json") + 7
-            end = response.find("```", start)
-            if end > start:
-                json_str = response[start:end].strip()
-                return json.loads(json_str)
-        
-        # Look for JSON within regular code blocks
-        if "```" in response:
-            start = response.find("```") + 3
-            end = response.find("```", start)
-            if end > start:
-                json_str = response[start:end].strip()
-                return json.loads(json_str)
-        
-        # Look for anything that looks like JSON (starts with { or [)
-        for line in response.split('\n'):
-            line = line.strip()
-            if line.startswith(('{', '[')):
-                try:
-                    return json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-        
-        raise ValueError(f"Could not extract valid JSON from response: {response[:200]}...")
+
+        # Look for JSON within markdown code blocks (```json or plain ```)
+        for fence in ("```json", "```"):
+            if fence in response:
+                start = response.find(fence) + len(fence)
+                end = response.find("```", start)
+                if end > start:
+                    try:
+                        return json.loads(response[start:end].strip())
+                    except json.JSONDecodeError:
+                        pass
+
+        # Fall back to the first balanced JSON span anywhere in the text.
+        obj = self._first_balanced_json(response)
+        if obj is not None:
+            return obj
+
+        raise JSONExtractionError(
+            f"Could not extract valid JSON from response: {response[:200]}..."
+        )
     
     def get_stats(self) -> Dict[str, int]:
         """Get usage statistics."""
@@ -433,12 +486,17 @@ class LLMWrapper:
                     print(f"Calling LLM {model} with prompt:\n{json_prompt}")
                     print("-----------------------------------------------------------")
 
+                call_kwargs: Dict[str, Any] = {}
+                if self.json_mode:
+                    call_kwargs["response_format"] = {"type": "json_object"}
+
                 response = await async_chat_completion(
                     self._async_client,
                     messages=[{"role": "user", "content": json_prompt}],
                     model=model,
                     reasoning_effort=reasoning_effort,
                     enable_reasoning=self.enable_reasoning,
+                    **call_kwargs,
                 )
 
                 # Track token usage and cost.
@@ -473,9 +531,18 @@ class LLMWrapper:
                 return result
                 
             except Exception as e:
-                if attempt < max_retries and self._is_rate_limit_error(e):
+                # If the provider rejects JSON mode, disable it for the rest of
+                # the run and retry without it (the hardened parser still copes).
+                if self.json_mode and "response_format" in str(e).lower():
+                    print(f"⚠️  Provider rejected JSON mode (response_format); disabling for this run: {e}")
+                    self.json_mode = False
+                    retryable = True
+                else:
+                    retryable = self._is_retryable_error(e)
+
+                if attempt < max_retries and retryable:
                     delay = retry_delay_base * (2 ** attempt)
-                    print(f"Rate limit error, retrying in {delay}s: {e}")
+                    print(f"Transient LLM error, retrying in {delay}s: {e}")
                     await asyncio.sleep(delay)
                 else:
                     print(f"Failed after {attempt + 1} attempts: {e}")
@@ -492,6 +559,39 @@ class LLMWrapper:
             "quota exceeded", "rate exceeded", "throttle", "throttled"
         ]
         return any(indicator in error_str for indicator in rate_limit_indicators)
+
+    def _is_retryable_error(self, error: Exception) -> bool:
+        """Whether an error is transient and worth retrying.
+
+        Covers rate limits plus transient server (5xx) and connection/timeout
+        errors — common on live venue wifi — so a single blip doesn't drop a
+        profile to empty sections or a pair to embed-only scoring. A 4xx client
+        error other than 429 (e.g. a malformed request) is NOT retried; it fails
+        fast so it stays visible.
+        """
+        # Malformed-JSON responses are stochastic — re-sampling usually fixes it.
+        if isinstance(error, JSONExtractionError):
+            return True
+
+        if self._is_rate_limit_error(error):
+            return True
+
+        # Honor an explicit HTTP status code if the SDK exposes one.
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int):
+            if status == 429 or 500 <= status < 600:
+                return True
+            if 400 <= status < 500:
+                return False
+
+        error_str = str(error).lower()
+        transient_indicators = [
+            "500", "502", "503", "504", "520", "521", "522", "524", "529",
+            "internal server error", "bad gateway", "service unavailable",
+            "gateway timeout", "overloaded", "timeout", "timed out",
+            "connection", "connection error", "connection reset", "temporarily",
+        ]
+        return any(indicator in error_str for indicator in transient_indicators)
 
 
 async def cleanup_background_tasks():

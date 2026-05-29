@@ -1,6 +1,6 @@
 """LLM-based pair scoring for candidate pairs."""
 
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Set, Tuple, Optional
 from dataclasses import dataclass
 import asyncio
 import numpy as np
@@ -24,88 +24,108 @@ class PairScore:
 
 def create_profile_groups_from_pairs(
     candidate_pairs: List[CandidatePair],
-    n_profiles_to_score_together: int
+    n_profiles_to_score_together: int,
+    max_groups: Optional[int] = None,
 ) -> List[Set[str]]:
-    """Create groups of user profiles to score together, ensuring all candidate pairs are covered."""
-    
-    # Extract all unique users from candidate pairs
-    all_users = set()
+    """Pack profiles into groups so every candidate pair lands in at least one group.
+
+    Each group of up to ``n_profiles_to_score_together`` users becomes one batched
+    LLM call that scores all C(n, 2) pairs among its members. To get a pair scored
+    its two users must co-occur in some group, so this is a set-cover problem:
+    cover all candidate pairs with as few groups (LLM calls) as possible.
+
+    Greedy strategy: seed each new group from the highest-priority still-uncovered
+    pair (``candidate_pairs`` is pre-sorted by similarity), then grow the group by
+    repeatedly adding the user that covers the most *additional* uncovered pairs
+    with the current members. Every iteration covers at least its seed pair, so the
+    loop is guaranteed to terminate (≤ one group per pair in the worst case).
+
+    Unlike the previous implementation this never evicts users from consideration,
+    so it cannot orphan pairs and leave half the candidates unscored.
+
+    ``max_groups`` (the LLM-call budget) optionally caps the number of groups; if
+    pairs remain uncovered when the cap is hit, that is logged loudly rather than
+    silently dropped.
+    """
+    if not candidate_pairs:
+        return []
+
+    n = max(2, n_profiles_to_score_together)
+
+    # All users, and the set of candidate pairs to cover (keyed by an unordered
+    # frozenset so user1/user2 ordering never matters). Preserve input priority.
+    all_users: Set[str] = set()
+    pair_keys: List[frozenset] = []
+    pair_key_set: Set[frozenset] = set()
     for pair in candidate_pairs:
         all_users.add(pair.user1)
         all_users.add(pair.user2)
-    
-    users_list = sorted(list(all_users))  # Sort for consistent ordering
-    
-    groups = []
-    covered_pairs = set()
-    
-    # Create groups greedily - each group should cover as many uncovered pairs as possible
-    while len(covered_pairs) < len(candidate_pairs):
-        if len(users_list) <= n_profiles_to_score_together:
-            # Add remaining users as final group
-            groups.append(set(users_list))
+        key = frozenset((pair.user1, pair.user2))
+        if key not in pair_key_set:
+            pair_key_set.add(key)
+            pair_keys.append(key)
+
+    covered: Set[frozenset] = set()
+    groups: List[Set[str]] = []
+
+    def uncovered_gain(user: str, group: Set[str]) -> int:
+        """Number of still-uncovered candidate pairs adding `user` to `group` covers."""
+        gain = 0
+        for member in group:
+            key = frozenset((user, member))
+            if key in pair_key_set and key not in covered:
+                gain += 1
+        return gain
+
+    total_pairs = len(pair_key_set)
+    while len(covered) < total_pairs:
+        if max_groups is not None and len(groups) >= max_groups:
             break
-        
-        # For each possible group of n_profiles_to_score_together users,
-        # calculate how many uncovered candidate pairs it would score
-        best_group = None
-        best_new_pairs_count = 0
-        
-        # Try different starting points to avoid always picking the same users
-        start_idx = len(groups) % len(users_list)
-        
-        for i in range(len(users_list) - n_profiles_to_score_together + 1):
-            group_start = (start_idx + i) % (len(users_list) - n_profiles_to_score_together + 1)
-            test_group = set(users_list[group_start:group_start + n_profiles_to_score_together])
-            
-            # Count how many uncovered pairs this group would score
-            new_pairs_count = 0
-            for pair in candidate_pairs:
-                if pair.pair_id not in covered_pairs:
-                    if pair.user1 in test_group and pair.user2 in test_group:
-                        new_pairs_count += 1
-            
-            if new_pairs_count > best_new_pairs_count:
-                best_new_pairs_count = new_pairs_count
-                best_group = test_group
-        
-        # If no group covers any new pairs, take users involved in most uncovered pairs
-        if best_group is None or best_new_pairs_count == 0:
-            user_pair_counts = {}
-            for pair in candidate_pairs:
-                if pair.pair_id not in covered_pairs:
-                    user_pair_counts[pair.user1] = user_pair_counts.get(pair.user1, 0) + 1
-                    user_pair_counts[pair.user2] = user_pair_counts.get(pair.user2, 0) + 1
-            
-            # Take top n_profiles_to_score_together users by uncovered pair count
-            sorted_users = sorted(user_pair_counts.items(), key=lambda x: x[1], reverse=True)
-            best_group = set([user for user, _ in sorted_users[:n_profiles_to_score_together]])
-        
-        groups.append(best_group)
-        
-        # Mark pairs in this group as covered
-        for pair in candidate_pairs:
-            if pair.user1 in best_group and pair.user2 in best_group:
-                covered_pairs.add(pair.pair_id)
-        
-        # Remove users from the list if they've been heavily used
-        # This helps ensure good coverage across all users
-        users_in_multiple_groups = set()
-        for user in best_group:
-            user_group_count = sum(1 for group in groups if user in group)
-            if user_group_count >= 2:  # User has been in multiple groups
-                users_in_multiple_groups.add(user)
-        
-        for user in users_in_multiple_groups:
-            if user in users_list and len(users_list) > n_profiles_to_score_together:
-                users_list.remove(user)
-    
-    print(f"Created {len(groups)} profile groups covering {len(covered_pairs)}/{len(candidate_pairs)} candidate pairs")
+
+        # Seed from the highest-priority pair that is still uncovered.
+        seed = next((key for key in pair_keys if key not in covered), None)
+        if seed is None:
+            break
+        group: Set[str] = set(seed)
+
+        # Grow greedily to size n by maximum uncovered-pair gain.
+        while len(group) < n:
+            best_user, best_gain = None, 0
+            for user in all_users:
+                if user in group:
+                    continue
+                gain = uncovered_gain(user, group)
+                if gain > best_gain:
+                    best_user, best_gain = user, gain
+            if best_user is None:  # no remaining user covers a new pair
+                break
+            group.add(best_user)
+
+        # Mark every candidate pair inside this group as covered.
+        members = sorted(group)
+        for a in range(len(members)):
+            for b in range(a + 1, len(members)):
+                key = frozenset((members[a], members[b]))
+                if key in pair_key_set:
+                    covered.add(key)
+        groups.append(group)
+
+    n_covered = len(covered)
+    print(f"Created {len(groups)} profile groups covering {n_covered}/{total_pairs} candidate pairs")
+    if n_covered < total_pairs:
+        print(
+            f"⚠️  WARNING: {total_pairs - n_covered} candidate pair(s) left UNSCORED "
+            f"after hitting the max_groups={max_groups} budget. Raise "
+            f"budgets.max_pair_llm_calls to score them all."
+        )
     for i, group in enumerate(groups):
-        pairs_in_group = sum(1 for pair in candidate_pairs 
-                           if pair.user1 in group and pair.user2 in group)
+        members = sorted(group)
+        pairs_in_group = sum(
+            1 for a in range(len(members)) for b in range(a + 1, len(members))
+            if frozenset((members[a], members[b])) in pair_key_set
+        )
         print(f"  Group {i+1}: {len(group)} profiles, {pairs_in_group} pairs")
-    
+
     return groups
 
 
@@ -309,10 +329,13 @@ def score_pairs_with_llm(
         print("No pairs selected for LLM scoring")
         return {}
     
-    # Create profile groups that cover all selected pairs
+    # Create profile groups that cover all selected pairs. Each group is one LLM
+    # call, so the call budget (global_cap = budgets.max_pair_llm_calls) caps the
+    # number of groups.
     profile_groups = create_profile_groups_from_pairs(
         candidate_pairs=selected_pairs,
-        n_profiles_to_score_together=n_profiles_to_score_together
+        n_profiles_to_score_together=n_profiles_to_score_together,
+        max_groups=global_cap,
     )
     
     pair_scores = {}

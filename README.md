@@ -28,7 +28,7 @@ _Resolved: starter-topics bullet char unified on `•`; cross-key parsing consol
    ```bash
    cp .env.example .env
    # Add your OpenRouter API key to .env (https://openrouter.ai/settings/keys)
-   pip install -e .
+   uv sync   # creates .venv from pyproject.toml + uv.lock; prefix commands with `uv run`
    ```
 
 2. **Add User Profiles** (one `.txt` file per user; filename becomes the user ID, e.g. `alice.txt` -> "alice")
@@ -44,10 +44,10 @@ _Resolved: starter-topics bullet char unified on `•`; cross-key parsing consol
 4. **Run Matching**
    ```bash
    # Folder mode: group name derived from the folder; outputs go inside it.
-   python main.py --input /path/to/folder --force
+   uv run python main.py --input /path/to/folder --force
 
    # Group mode: reads data/<group>/raw, writes to data/<group>/.
-   python main.py --group <group_name> --force
+   uv run python main.py --group <group_name> --force
    ```
 
 5. **View Results** (under `<folder>/outputs/` in folder mode, or `data/{group_name}/outputs/` in group mode)
@@ -229,9 +229,9 @@ config/
 
 ```bash
 # Local
-python main.py --group <group_name> --force
+uv run python main.py --group <group_name> --force
 
 # Modal (serverless)
-modal deploy deploy_modal.py
-modal run deploy_modal.py::run_matching_pipeline --user-profiles-json=profiles.json
+uv run modal deploy deploy_modal.py
+uv run modal run deploy_modal.py::run_matching_pipeline --user-profiles-json=profiles.json
 ```

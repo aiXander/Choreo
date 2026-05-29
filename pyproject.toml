@@ -3,7 +3,7 @@ name = "Choreo"
 version = "0.1.0"
 description = "User profile matching system using LLM embeddings and processing"
 authors = [{name = "Xander", email = "xander@eden.art"}]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.3.3",
     "scikit-learn>=1.7.2",
@@ -32,14 +32,14 @@ include = ["src*"]
 
 [tool.black]
 line-length = 88
-target-version = ['py39']
+target-version = ['py311']
 
 [tool.isort]
 profile = "black"
 multi_line_output = 3
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

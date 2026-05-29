@@ -1,5 +1,6 @@
 """Generate embeddings for profile sections via OpenRouter."""
 
+import time
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple
@@ -9,6 +10,31 @@ from extract import ExtractedSections
 from hyde import HydeDescriptors
 from cost_tracker import get_cost_tracker
 from llm import get_openrouter_client, extract_usage, DEFAULT_EMBEDDING_MODEL
+
+
+# Transient error markers worth retrying: rate limits, 5xx server errors, and
+# connection/timeout blips (common on live venue wifi). A 400 (bad request,
+# e.g. batch too large) is NOT transient and should fail fast so it's visible.
+_TRANSIENT_ERROR_MARKERS = (
+    "rate limit", "rate_limit", "429", "too many requests", "throttle",
+    "500", "502", "503", "504", "520", "521", "522", "524", "529",
+    "internal server error", "bad gateway", "service unavailable",
+    "gateway timeout", "overloaded", "timeout", "timed out",
+    "connection", "connection error", "connection reset", "temporarily",
+)
+
+
+def _is_transient_embedding_error(error: Exception) -> bool:
+    """Whether an embedding API error looks transient (worth retrying)."""
+    # Honor an explicit HTTP status code if the SDK exposes one.
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        if status == 429 or 500 <= status < 600:
+            return True
+        if 400 <= status < 500:
+            return False  # client error (e.g. 400 batch-too-large) — fail fast
+    error_str = str(error).lower()
+    return any(marker in error_str for marker in _TRANSIENT_ERROR_MARKERS)
 
 
 # Embedding models known to be Matryoshka (MRL) trained — i.e. their leading
@@ -26,7 +52,12 @@ def supports_mrl(model: str) -> bool:
     return model in MRL_CAPABLE_MODELS
 
 
-def get_embeddings(texts: List[str], model: str) -> np.ndarray:
+def get_embeddings(
+    texts: List[str],
+    model: str,
+    max_retries: int = 4,
+    retry_delay_base: float = 1.0,
+) -> np.ndarray:
     """
     Get embeddings for a list of texts via OpenRouter's embeddings endpoint.
 
@@ -35,50 +66,70 @@ def get_embeddings(texts: List[str], model: str) -> np.ndarray:
     truncate_embeddings() — so the on-disk vectors stay full and the truncation
     size can be re-tuned without re-embedding.
 
+    Transient failures (rate limits, 5xx, connection/timeout blips) are retried
+    with exponential backoff so a single network hiccup on live wifi doesn't
+    abort the whole pipeline. Non-transient errors (e.g. a 400 from too-large a
+    batch) fail fast so they stay visible.
+
     Args:
         texts: List of text strings to embed
         model: Embedding model name (e.g. "google/gemini-embedding-2-preview")
+        max_retries: Max retries on transient errors (default: 4)
+        retry_delay_base: Base delay (s) for exponential backoff (default: 1.0)
 
     Returns:
         numpy array of shape (len(texts), embedding_dim)
     """
     model = model or DEFAULT_EMBEDDING_MODEL
-    try:
-        client = get_openrouter_client()
-        # The OpenAI SDK defaults to encoding_format="base64", which OpenRouter's
-        # Google AI Studio embedding provider rejects (400 → empty data → the SDK
-        # raises "No embedding data received"). Force "float" to stay compatible.
-        response = client.embeddings.create(
-            model=model, input=texts, encoding_format="float"
-        )
+    client = get_openrouter_client()
 
-        # Track cost using OpenRouter's native usage accounting (real cost in USD
-        # credits, returned automatically). Falls back to 0 if not reported.
-        cost_tracker = get_cost_tracker()
+    last_error: Exception = None
+    for attempt in range(max_retries + 1):
         try:
-            usage = extract_usage(response)
-            input_tokens = usage["prompt_tokens"] or len(texts)
-
-            cost_tracker.record_call(
-                component="embeddings",
-                call_type="embedding",
-                model=model,
-                input_tokens=input_tokens,
-                output_tokens=0,  # Embeddings don't have output tokens
-                cost=usage["cost"] or 0.0,
+            # The OpenAI SDK defaults to encoding_format="base64", which OpenRouter's
+            # Google AI Studio embedding provider rejects (400 → empty data → the SDK
+            # raises "No embedding data received"). Force "float" to stay compatible.
+            response = client.embeddings.create(
+                model=model, input=texts, encoding_format="float"
             )
-        except (AttributeError, KeyError, TypeError):
-            # If cost tracking fails, continue without it
-            print(f"Warning: Could not track cost for embedding call with model {model}")
 
-        embeddings = np.array([item.embedding for item in response.data])
-        print(f"Created embeddings with {model} of shape {embeddings.shape}")
+            # Track cost using OpenRouter's native usage accounting (real cost in USD
+            # credits, returned automatically). Falls back to 0 if not reported.
+            cost_tracker = get_cost_tracker()
+            try:
+                usage = extract_usage(response)
+                input_tokens = usage["prompt_tokens"] or len(texts)
 
-        return embeddings
+                cost_tracker.record_call(
+                    component="embeddings",
+                    call_type="embedding",
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=0,  # Embeddings don't have output tokens
+                    cost=usage["cost"] or 0.0,
+                )
+            except (AttributeError, KeyError, TypeError):
+                # If cost tracking fails, continue without it
+                print(f"Warning: Could not track cost for embedding call with model {model}")
 
-    except Exception as e:
-        print(f"Error getting embeddings: {e}")
-        raise
+            embeddings = np.array([item.embedding for item in response.data])
+            print(f"Created embeddings with {model} of shape {embeddings.shape}")
+
+            return embeddings
+
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries and _is_transient_embedding_error(e):
+                delay = retry_delay_base * (2 ** attempt)
+                print(f"Transient embedding error (attempt {attempt + 1}/{max_retries + 1}), "
+                      f"retrying in {delay:.1f}s: {e}")
+                time.sleep(delay)
+            else:
+                print(f"Error getting embeddings: {e}")
+                raise
+
+    # Should not reach here; re-raise the last error defensively.
+    raise last_error
 
 
 def truncate_embeddings(arr: np.ndarray, dimensions: int) -> np.ndarray:
@@ -192,8 +243,9 @@ def create_section_embeddings(
 
     print(f"Getting embeddings for {len(all_texts)} text segments...")
 
-    # Get embeddings in batches to avoid API limits
-    batch_size = 64
+    # Get embeddings in batches to avoid API limits. Capped at 128 inputs per
+    # request — some providers reject larger embedding arrays with a 400.
+    batch_size = 128
     all_embeddings = []
 
     for i in range(0, len(all_texts), batch_size):

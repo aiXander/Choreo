@@ -154,8 +154,9 @@ def extract_sections_from_profiles(
 
         try:
             responses = asyncio.run(_async_batch_with_cleanup())
-            
+
             # Process batch responses
+            failed_ids = []
             for profile, response in zip(uncached_profiles, responses):
                 try:
                     if isinstance(response, Exception):
@@ -186,9 +187,10 @@ def extract_sections_from_profiles(
                     
                 except Exception as e:
                     print(f"Error processing response for {profile.id}: {e}")
+                    failed_ids.append(profile.id)
                     # Add empty sections to avoid breaking pipeline
                     empty_sections = {
-                        section_name: "Not specified" 
+                        section_name: "Not specified"
                         for section_name in sections_config['sections'].keys()
                     }
                     sections = ExtractedSections(
@@ -199,6 +201,13 @@ def extract_sections_from_profiles(
                     extracted_sections.append(sections)
 
             print(f"Done processing {len(extracted_sections)} LLM extractions")
+            if failed_ids:
+                print(
+                    f"⚠️  WARNING: extraction FAILED for {len(failed_ids)} profile(s): "
+                    f"{', '.join(failed_ids)}. These were filled with empty "
+                    f"('Not specified') sections and will produce meaningless "
+                    f"matches — re-run with --force to retry them."
+                )
                     
         except Exception as e:
             print(f"Error in batch extraction: {e}")

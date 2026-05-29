@@ -8,29 +8,32 @@ Choreo is an AI-powered profile matching system. It extracts structured sections
 
 ## Commands
 
+This project is managed with [uv](https://docs.astral.sh/uv/). `uv sync` creates the
+`.venv` from `pyproject.toml` + `uv.lock`; prefix commands with `uv run` to use it.
+
 ```bash
-# Install
-pip install -e .
+# Install / sync the environment (reads pyproject.toml + uv.lock)
+uv sync
 
 # Run the matching pipeline. Two input modes:
 
 # (a) Folder mode — point at any folder of profile .txt files; the group name is
 #     derived from the folder name and all artifacts go inside it
 #     (<folder>/processed, <folder>/embeds, <folder>/outputs, <folder>/cache).
-python main.py --input /path/to/folder --force
+uv run python main.py --input /path/to/folder --force
 
 # (b) Group mode — reads data/<group>/raw, writes to data/<group>/.
-python main.py --group <group_name> --force
+uv run python main.py --group <group_name> --force
 
 # Examples
-python main.py --input ~/cohorts/spring_2026   # folder mode
-python main.py --group real --force            # group mode, "real"
-python main.py --group test4                   # group mode with caching
-python main.py --list-pipelines                # show registered pipelines
+uv run python main.py --input ~/cohorts/spring_2026   # folder mode
+uv run python main.py --group real --force            # group mode, "real"
+uv run python main.py --group test4                   # group mode with caching
+uv run python main.py --list-pipelines                # show registered pipelines
 
 # Modal deployment (serverless)
-modal deploy deploy_modal.py
-modal run deploy_modal.py::run_matching_pipeline --user-profiles-json=profiles.json
+uv run modal deploy deploy_modal.py
+uv run modal run deploy_modal.py::run_matching_pipeline --user-profiles-json=profiles.json
 ```
 
 `--force` re-runs every step, ignoring caches. Without it, unchanged profiles/sections/embeddings are reused.
