@@ -304,7 +304,10 @@ class LLMWrapper:
                     depth -= 1
                     if depth == 0:
                         try:
-                            return json.loads(text[start:end + 1])
+                            # strict=False tolerates literal control chars
+                            # (newlines/tabs) inside string values — common in
+                            # multi-paragraph prose responses.
+                            return json.loads(text[start:end + 1], strict=False)
                         except json.JSONDecodeError:
                             break  # try the next opener
         return None
@@ -319,9 +322,12 @@ class LLMWrapper:
         """
         response = response.strip()
 
-        # Try direct JSON parse first
+        # Try direct JSON parse first. strict=False allows literal control
+        # characters (unescaped newlines/tabs) inside string values — models
+        # routinely emit these in multi-paragraph prose, and strict parsing
+        # would otherwise reject structurally-valid JSON and force a re-sample.
         try:
-            return json.loads(response)
+            return json.loads(response, strict=False)
         except json.JSONDecodeError:
             pass
 
@@ -332,7 +338,7 @@ class LLMWrapper:
                 end = response.find("```", start)
                 if end > start:
                     try:
-                        return json.loads(response[start:end].strip())
+                        return json.loads(response[start:end].strip(), strict=False)
                     except json.JSONDecodeError:
                         pass
 

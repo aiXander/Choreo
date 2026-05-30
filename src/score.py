@@ -393,7 +393,7 @@ def score_pairs_with_llm(
                 model=model,
                 cache_keys=group_cache_keys,
                 reasoning_effort="medium",
-                print_reasoning_summary = True,
+                print_reasoning_summary=False,
                 verbosity=0
             )
             return responses

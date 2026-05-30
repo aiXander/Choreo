@@ -27,7 +27,7 @@ instruction_prompt:
 
 budgets:
   extraction_llm_calls: 300
-  max_pair_llm_calls: 800
+  max_pair_llm_calls: 1200
   max_n_llm_evaluations_per_profile: 16
   n_profiles_to_score_together: 4
 
