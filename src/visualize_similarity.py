@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from utils import ensure_dir
+from raw_data import save_similarity_raw_data
 
 
 def create_similarity_plots(
@@ -27,7 +28,10 @@ def create_similarity_plots(
     # Create output directory
     plots_dir = Path(output_dir) / "plots"
     ensure_dir(plots_dir)
-    
+
+    # Persist the raw matrices behind these heatmaps (crash-safe).
+    save_similarity_raw_data(output_dir, matrices_dict, user_ids)
+
     # Extract matrices and weights from the dict
     section_matrices = matrices_dict['section_matrices']
     section_weights = matrices_dict['section_weights']

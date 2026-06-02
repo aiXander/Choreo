@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List
 
 from utils import ensure_dir
+from raw_data import save_tsne_raw_data
 
 
 def create_tsne_plots(
@@ -43,6 +44,9 @@ def create_tsne_plots(
     plt.style.use('default')
     sns.set_palette("husl")
     
+    # Collect the (stochastic) 2D layouts so they can be persisted for re-plotting.
+    section_coords_by_name = {}
+
     results = {
         'plots_dir': str(plots_dir),
         'section_plots': {},
@@ -72,7 +76,8 @@ def create_tsne_plots(
         )
         
         tsne_coords = tsne.fit_transform(section_embeddings)
-        
+        section_coords_by_name[section_name] = tsne_coords
+
         # Create plot
         plt.figure(figsize=(10, 8))
         scatter = plt.scatter(
@@ -161,7 +166,17 @@ def create_tsne_plots(
     
     results['combined_plot'] = str(combined_plot_path)
     print(f"Saved combined t-SNE plot: {combined_plot_path}")
-    
+
+    # Persist the raw 2D coordinates (crash-safe: never propagates errors).
+    save_tsne_raw_data(
+        output_dir=output_dir,
+        section_coords=section_coords_by_name,
+        combined_coords=tsne_coords_combined,
+        user_ids=user_ids,
+        metric=metric,
+        perplexity=perplexity,
+    )
+
     return results
 
 
@@ -257,6 +272,16 @@ def visualize_section_relationships(
     plot_path = plots_dir / "tsne_section_relationships.jpg"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     print(f"Saved section relationships plot: {plot_path}")
+
+    # Persist the raw centroid coordinates (crash-safe).
+    save_tsne_raw_data(
+        output_dir=output_dir,
+        section_relationship_coords=section_tsne,
+        section_names=section_names,
+        metric="cosine",
+        filename="tsne_section_relationships",
+    )
+
     return str(plot_path)

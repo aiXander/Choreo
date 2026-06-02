@@ -79,9 +79,24 @@ def get_embeddings(
 
     Returns:
         numpy array of shape (len(texts), embedding_dim)
+
+    Empty/whitespace-only texts (e.g. a section a profile didn't fill) are never
+    sent to the API — Google AI Studio rejects any batch containing an empty Part
+    with a 400, which OpenRouter surfaces as a 200 carrying ``data: null`` rather
+    than an exception. Such inputs are mapped to zero vectors, which read as "no
+    signal" (cosine 0 with everyone) downstream.
     """
     model = model or DEFAULT_EMBEDDING_MODEL
     client = get_openrouter_client()
+
+    # Split out empty inputs so the API only ever sees non-empty Parts.
+    nonempty_idx = [i for i, t in enumerate(texts) if t and t.strip()]
+    if not nonempty_idx:
+        raise ValueError(
+            "get_embeddings called with no non-empty texts; cannot infer "
+            "embedding dimensionality for an all-empty batch."
+        )
+    api_texts = [texts[i] for i in nonempty_idx]
 
     last_error: Exception = None
     for attempt in range(max_retries + 1):
@@ -90,8 +105,19 @@ def get_embeddings(
             # Google AI Studio embedding provider rejects (400 → empty data → the SDK
             # raises "No embedding data received"). Force "float" to stay compatible.
             response = client.embeddings.create(
-                model=model, input=texts, encoding_format="float"
+                model=model, input=api_texts, encoding_format="float"
             )
+
+            # OpenRouter passes provider-side errors (e.g. a 400) back as a 200
+            # body with ``data: null`` and an ``error`` field, so the SDK never
+            # raises. Surface it as a clear exception instead of letting the
+            # downstream comprehension fail with "'NoneType' object is not iterable".
+            if response.data is None:
+                err = getattr(response, "model_extra", {}) or {}
+                raise RuntimeError(
+                    f"Embedding API returned no data (model={model}): "
+                    f"{err.get('error', response)}"
+                )
 
             # Track cost using OpenRouter's native usage accounting (real cost in USD
             # credits, returned automatically). Falls back to 0 if not reported.
@@ -112,8 +138,16 @@ def get_embeddings(
                 # If cost tracking fails, continue without it
                 print(f"Warning: Could not track cost for embedding call with model {model}")
 
-            embeddings = np.array([item.embedding for item in response.data])
-            print(f"Created embeddings with {model} of shape {embeddings.shape}")
+            api_embeddings = np.array([item.embedding for item in response.data])
+
+            # Scatter results back to original positions; empty inputs stay zero.
+            embeddings = np.zeros((len(texts), api_embeddings.shape[1]))
+            for slot, src in enumerate(nonempty_idx):
+                embeddings[src] = api_embeddings[slot]
+
+            n_empty = len(texts) - len(nonempty_idx)
+            suffix = f" ({n_empty} empty → zero vectors)" if n_empty else ""
+            print(f"Created embeddings with {model} of shape {embeddings.shape}{suffix}")
 
             return embeddings
 
@@ -243,9 +277,10 @@ def create_section_embeddings(
 
     print(f"Getting embeddings for {len(all_texts)} text segments...")
 
-    # Get embeddings in batches to avoid API limits. Capped at 128 inputs per
-    # request — some providers reject larger embedding arrays with a 400.
-    batch_size = 128
+    # Get embeddings in batches to avoid API limits. Capped at 100 inputs per
+    # request — Google AI Studio rejects larger batches with a 400
+    # ("at most 100 requests can be in one batch").
+    batch_size = 100
     all_embeddings = []
 
     for i in range(0, len(all_texts), batch_size):

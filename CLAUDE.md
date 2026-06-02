@@ -77,7 +77,8 @@ The matching pipeline (steps as printed in `main.py`):
 - Processing: `<processed_dir>/` (extracted sections + `hyde/*.jsonl`, cached)
 - Embeddings: `<embeds_dir>/` (embeddings.npy, ids.json, section_names.json)
 - Cache: `<cache_dir>/llm/` (LLM call cache)
-- Output: `<outputs_dir>/` (per-user reports, cohort.json, cost_report.json, plots/)
+- Output: `<outputs_dir>/` (per-user reports, cohort.json, cost_report.json, plots/, plots/raw_data/)
+- Raw plot data: `<outputs_dir>/plots/raw_data/` — `.npz` dumps of the arrays behind each plot (t-SNE 2D coords, similarity matrices, per-pair scores), each labelled by `user_ids`/`pair_id` so points trace back to users. Written by `src/raw_data.py`, whose save functions are crash-safe (never propagate errors to the pipeline). Lets you edit data (drop outliers, rename labels) and re-export images without re-embedding/re-running t-SNE.
 
 Paths resolve to `data/<group>/{raw,processed,embeds,outputs,cache}` in group mode, or `<input_dir>/{...}` in folder mode (see `apply_io_overrides` in `main.py`).
 

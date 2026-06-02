@@ -43,13 +43,10 @@ def generate_user_report(
     sorted_matches = sorted(user_matches, key=lambda e: e.final_weight, reverse=True)
     top_matches = sorted_matches[:top_n]
 
-    # Build profile section
-    profile_lines = [
-        f"Profile of {user_id}:",
-        "",
-        format_sections_for_report(user_sections)
-    ]
-    profile_content = "\n".join(profile_lines)
+    # Build profile section. No "Profile of <id>:" label — the field is already
+    # named "profile", and consumers (motherbrain) add their own heading; the
+    # label was redundant and baked the raw user id into the prose.
+    profile_content = format_sections_for_report(user_sections)
 
     # Build matches section
     if not top_matches:
@@ -77,7 +74,12 @@ def generate_user_report(
                 "",
                 f"**Match Score:** {match.final_weight:.3f} (embedding: {embed_display:.3f}, LLM: {llm_display:.3f})",
                 "",
-                f"**Introduction:** {match.intro}",
+                # Label on its own line so it reads as a section header and the
+                # first "For …:" direction aligns with the second (intro is
+                # "For {user1}: …\n\nFor {user2}: …" — see introduction.py).
+                "**Introduction:**",
+                "",
+                match.intro,
                 "",
                 "**Conversation Starters:**"
             ])

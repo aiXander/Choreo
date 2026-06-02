@@ -25,6 +25,7 @@ from score_correlation import (
     create_normalized_score_correlation_plot,
     create_normalized_detailed_score_analysis,
 )
+from raw_data import save_score_correlation_raw_data
 from match import create_matches
 from introduction import generate_introductions_for_matches
 from report import generate_all_reports
@@ -395,6 +396,13 @@ def _execute_matching_pipeline(
                     normalized_embed_scores=normalized_embed_scores,
                     normalized_llm_scores=normalized_llm_scores,
                     output_dir=io_config.get("outputs_dir"),
+                    group_name=group_name,
+                )
+                # Persist the per-pair scores behind these plots (crash-safe).
+                save_score_correlation_raw_data(
+                    output_dir=io_config.get("outputs_dir"),
+                    normalized_embed_scores=normalized_embed_scores,
+                    normalized_llm_scores=normalized_llm_scores,
                     group_name=group_name,
                 )
                 print("✅ Generated score correlation plots")

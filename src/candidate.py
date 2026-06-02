@@ -52,14 +52,18 @@ def compute_fused_similarity_matrix(
     """
     n_users, n_sections, embedding_dim = embeddings.shape
 
-    # Compute same-section similarity matrices (symmetric)
+    # Presence of each section per user. A section a profile didn't fill is
+    # stored as a zero vector (see embed.get_embeddings); treat that as "absent"
+    # so it can be masked out of the fusion rather than counted as similarity 0.
+    section_present = {}  # name -> bool array (n_users,)
     section_matrices = {}
     for section_idx, section_name in enumerate(section_names):
         section_embeddings = embeddings[:, section_idx, :]
-        similarity_matrix = cosine_matrix(section_embeddings)
-        section_matrices[section_name] = similarity_matrix
+        section_present[section_name] = (
+            np.linalg.norm(section_embeddings, axis=1) > 1e-8
+        )
+        section_matrices[section_name] = cosine_matrix(section_embeddings)
 
-    # Normalize all weights (section + cross-section) so abs values sum to 1
     cross_weights = cross_section_weights or {}
     hyde = hyde_embeddings or {}
 
@@ -67,17 +71,20 @@ def compute_fused_similarity_matrix(
     for missing in set(section_weights) - set(valid_section_weights):
         print(f"Warning: Section '{missing}' not found in embeddings")
 
-    total_abs = sum(abs(w) for w in valid_section_weights.values()) + sum(abs(w) for w in cross_weights.values())
-    if total_abs > 0:
-        norm = total_abs
-    else:
-        norm = 1.0
-
-    # Fuse same-section matrices
-    fused_matrix = np.zeros((n_users, n_users))
+    # Per-pair fusion with masking: a section contributes to a pair only when the
+    # relevant side(s) are present, and the denominator is the weight mass that
+    # was *actually present* for that pair. This makes a missing section neutral
+    # (ignored) instead of an extreme low that drags a sparse profile's scores.
+    # When every section is present for a pair, this reduces exactly to the old
+    # global-normalization behavior (denominator == sum of all abs weights).
+    weighted_sum = np.zeros((n_users, n_users))
+    weight_mass = np.zeros((n_users, n_users))
 
     for section_name, weight in valid_section_weights.items():
-        fused_matrix += (weight / norm) * section_matrices[section_name]
+        present = section_present[section_name]
+        mask = np.outer(present, present).astype(float)  # both sides must have it
+        weighted_sum += weight * mask * section_matrices[section_name]
+        weight_mass += abs(weight) * mask
 
     # Cross-section similarity — DIRECTIONAL (not symmetrized)
     cross_section_matrices = {}
@@ -123,7 +130,17 @@ def compute_fused_similarity_matrix(
         # cross_matrix[j][i] = "i can help j" (i's skills match j's HyDE-bridged needs)
 
         cross_section_matrices[cross_key] = cross_matrix
-        fused_matrix += (weight / norm) * cross_matrix
+
+        # Directional presence: source i (HyDE of i's needs) and target j (j's section).
+        src_present = np.linalg.norm(src_emb, axis=2).max(axis=1) > 1e-8
+        tgt_present = section_present[tgt_section]
+        mask = np.outer(src_present, tgt_present).astype(float)
+        weighted_sum += weight * mask * cross_matrix
+        weight_mass += abs(weight) * mask
+
+    # Per-pair normalization. Pairs with no overlapping present signal get 0.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fused_matrix = np.where(weight_mass > 0, weighted_sum / weight_mass, 0.0)
 
     matrices_dict = {
         'section_matrices': section_matrices,
