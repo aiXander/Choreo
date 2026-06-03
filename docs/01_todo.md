@@ -1,10 +1,48 @@
-# TODO — Make Choreo matchmaking granular & incremental
+# TODO — Make Choreo matchmaking granular, incremental & pluggable
 
-**Status:** design / not yet implemented (drafted 2026-06-02).
+**Status:** design / not yet implemented (drafted 2026-06-02, revised 2026-06-03).
 **Goal:** evolve Choreo from a single monolithic, all-to-all, raw-text→reports batch
-job into a set of composable services that operate against a *persistent community
-profile/embedding store*, so the platform can trigger small, targeted matchmaking
-operations on demand.
+job into a set of **composable, IO-agnostic functions** that can be (a) driven
+end-to-end from a folder of `.txt` profiles exactly as today, **and** (b) plugged
+into an external app that owns its own data store (a Neon/Postgres DB) and feeds
+profiles / sections / embeddings / past-match history in as plain arguments.
+
+### Guiding principle: this repo stays unopinionated about persistence
+
+Choreo is a **library of matchmaking compute**, not a database. The external app
+(the community platform) owns all user data in Neon and wraps this repo with a thin
+adapter that:
+
+- pulls `user sections`, `section embeddings`, and `past matches per user` out of
+  Neon,
+- calls Choreo's core functions with that data **passed as arguments**,
+- takes the returned values (new embeddings, match edges, intros) and writes them
+  back to Neon.
+
+So the refactor is fundamentally about **IO shape, not new storage**. The code will
+always run in some process with a disk available (localhost, Modal container, …),
+so **writing a stage's output to disk and having the next stage read it back is a
+perfectly valid way to chain stages** — it's just not the *only* way. Each stage
+must support both:
+
+- **in-memory chaining** — pass the previous stage's return value straight in as a
+  Python object, and
+- **disk chaining** — a stage can persist its output in a declared format, and a
+  later stage can load that same format.
+
+The key enabler is that **every stage has a fixed, declared input schema and a
+predictable output schema** (see §3.2, the *data-flow schema*). An external caller
+(the Neon wrapper) fetches those schemas, formats whatever data it has into the
+right shape, and triggers any stage it wants — either by handing Python objects in
+or by writing files to a folder the stage reads. We pick whatever is most flexible
+and extensible, not the most dogmatically pure.
+
+A direct consequence: the caller must be able to **enter the pipeline at any
+stage** — with raw text (do everything), with pre-extracted sections (skip
+extraction), or with pre-computed embeddings (skip extraction + embedding, go
+straight to similarity/scoring). The filesystem/`.txt` flow that exists today is
+*one adapter* (the reference implementation) and must keep working unchanged; the
+Neon wrapper is a *second adapter* living **outside this repo**. See §3.
 
 > An unrelated prior design note ("LLM pair-scoring batch anchoring & global
 > calibration") lives at the bottom of this file under **Appendix A** — it is
@@ -135,32 +173,192 @@ generate_all_reports (report.py:184)    -> cohort_summary + per-user JSON
 
 ---
 
-## 3. Refactor plan (workstreams)
+## 3. Target architecture: schema-driven stages + adapters
+
+Three layers. The dividing line that matters: **each stage is a transform with a
+declared input/output schema; *how* its data is moved (in-memory object or file on
+disk) is the adapter's choice, not baked into the stage.**
+
+```
+┌─ Adapters (own IO; one per data source) ───────────────────────────────┐
+│  • Filesystem/CLI adapter  (main.py): .txt in  → stages → json/npz out  │  ← in this repo
+│  • Modal adapter           (deploy_modal.py): same, on a Volume         │  ← in this repo
+│  • Neon/Postgres adapter   (the app's wrapper)                          │  ← OUTSIDE this repo
+│      fetches the stage schema → formats rows into it → calls the stage  │
+│      (passing python objects OR writing files the stage reads)          │
+└────────────────────────────────────────────────────────────────────────┘
+                  │  (each stage: declared input schema → output schema)
+┌─ Orchestration (mode runners; chain stages in-memory or via disk) ──────┐
+│  run_full_match() · run_query_match() · run_batch_match()               │
+└────────────────────────────────────────────────────────────────────────┘
+                                  │
+┌─ Core stages (schema in → schema out; can be invoked individually) ─────┐
+│  extract · hyde · embed · similarity(rectangular) · score ·             │
+│  match · introduce · build_report_data                                   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.1 The data-flow schema (the central organizing idea)
+
+Every stage already has a *de facto* fixed input shape and predictable output
+shape (see the §2 data-shapes block). The plan is to make that **explicit and
+discoverable**: each stage declares a typed `input_schema` and `output_schema`, and
+the set of stages is exposed through a small **stage registry** the caller can
+introspect at runtime.
+
+The workflow for an external caller (e.g. the Neon wrapper) becomes:
+
+1. **Fetch the schema** for the stage it wants to trigger (e.g. "similarity") —
+   `describe_stage("similarity")` returns its input/output schema.
+2. **Format its data** (whatever it has in Postgres) into that input schema.
+3. **Invoke the stage**, passing Python objects directly *or* pointing the stage at
+   a folder where it wrote the input files (both supported — see §3.3).
+4. **Consume the output** in the declared output format and persist it however it
+   likes (back to Neon, to disk, return to the agent).
+
+Concretely, implement each stage as a small spec object:
+
+```
+Stage{
+  name: str,
+  input_schema:  <typed schema>,   # dataclass / TypedDict / pydantic / JSON-schema
+  output_schema: <typed schema>,
+  run(input) -> output,            # pure transform, in-memory
+  # optional disk helpers the adapter may use:
+  load(path) -> input,  dump(output, path) -> None
+}
+```
+
+Use a single schema mechanism end-to-end (recommendation: dataclasses +
+`to_dict`/`from_dict`, optionally exported as JSON Schema so a non-Python caller can
+read it too). The win: the contract is **self-describing** — the external caller
+never has to read Choreo's source to learn what a stage needs; it asks.
+
+The concrete schemas (these already mostly exist as return values — formalize them):
+
+| Stage | Input schema | Output schema |
+|-------|-------------|---------------|
+| `extract` | `{user_id: raw_text}` + sections-config | `list[ExtractedSections{id, sections, hash}]` |
+| `hyde` | `ExtractedSections[]` + cross-weights + `n_descriptors` | `{cross_key: [HydeDescriptors{..., descriptors: list[str]}]}` |
+| `embed` | `ExtractedSections[]` (+ optional HyDE, + optional `existing_embeddings` to reuse) | **embeddings bundle**: `{user_ids, section_names, embeddings[N,S,D], hyde{key:[N,d,D]}, embedding_model, dim}` |
+| `similarity` | source bundle + target bundle + recipe | `{dir_matrix, (sym_matrix), matrices_dict, source_ids, target_ids}` |
+| `score` | similarity + sections + budgets + `excluded_pairs?` | `{pair_id: PairScore}` |
+| `match` | candidates + llm_scores + matching/blending cfg + `excluded_pairs?` | `list[Edge]` |
+| `introduce` | `Edge[]` (or query→candidate pairs) + sections | `{pair_id: Introduction}` |
+| `report` | `Edge[]` + sections (scope: which users) | report-data dict (the caller writes it) |
+
+Design rules for every stage:
+- **Pure transform at heart:** `run(input) -> output` does no IO. Disk read/write is
+  an *optional* helper (`load`/`dump`) the adapter calls — never hidden inside
+  `run`. This is what lets the same stage chain in-memory or via files.
+- **Optional reuse, passed in:** instead of "load cache from disk if present,"
+  accept an optional `existing_*` argument (e.g. `existing_embeddings`) and recompute
+  only what's missing or hash-changed. The caller decides where "existing" came
+  from (Neon, files, nothing).
+- **Embeddings carry provenance:** `embedding_model` + native `dim` ride inside the
+  embeddings bundle so MRL truncation (`embed.py:169`) stays consistent across
+  stored-vs-fresh vectors. (Model-migration handling is explicitly out of scope for
+  now — see §5 note.)
+- **Stable ordering:** stages that build dense `[N,S,D]` arrays use an explicit
+  `section_names` and `user_ids` order from the input, so a subset pulled from Neon
+  lines up with the array axes deterministically.
+
+### 3.2 Query as a *partial profile* (the clean way to support query-driven matching)
+
+A natural-language query ("find me a CTO in the network who's great at agentic
+engineering") should be **the full input context** for a match run, *without*
+forcing it through the whole profile recipe. The clean model: **a query is just a
+partial `ExtractedSections`** — a pseudo-user (`id="__query__"`) with only some
+sections populated. This drops straight into the existing machinery because the
+per-pair fusion already **treats an absent section as neutral, not as similarity 0**
+(`candidate.py:80–143`). So a query with only `needs` filled simply matches via the
+`needs_skills` cross-weight (+ any same-section `needs` weight) and ignores the rest.
+
+Two ways the caller supplies a query, both supported:
+
+- **(a) Explicit section mapping (default, cheapest):** the tool/caller stipulates
+  which section(s) the query text maps to, e.g.
+  `{"needs": "a CTO great at agentic engineering"}`. No extraction LLM call. The
+  query is HyDE'd + embedded like any partial profile.
+- **(b) Auto-expand via extraction:** hand raw query text to the `extract` stage to
+  populate one or more sections (reusing the existing extractor) when the caller
+  wants richer structure than a single section.
+
+Either way, allow a **per-call recipe override**: a query usually wants a different
+recipe than full-profile matching (e.g. `cross_section_weights: {needs_skills: 1.0}`
+with same-section weights zeroed, since the query has no vision/project to compare).
+The recipe is already a plain config dict, so accept an override argument on the
+query runner rather than hardcoding. This makes "match on which section(s)" a
+caller-controlled knob, not a code change.
+
+### 3.3 Multiple HyDE descriptors per query/need (already supported — keep it)
+
+The directional machinery is **already built for `n` descriptors per source
+section**, not one: `hyde.n_descriptors` config drives generation
+(`hyde.py:48`), embeddings are stored as `[N, n_desc, D]` (`embed.py:322–327`), and
+the cross-similarity **max-pools over all descriptor pairs** (`candidate.py:122–127`).
+Today config just sets `n_descriptors: 1`. The task is therefore mainly to **avoid
+regressing this** in the query path: the query atom must carry `descriptors:
+list[str]` (the `HydeDescriptors` dataclass already does, `hyde.py:18`) and the
+1×M similarity must keep the max-pool loop. Add a test at `n_descriptors > 1`
+(see WS7) to lock it in.
+
+### 3.4 The filesystem store stays — as an adapter, not the core
+
+The current disk behavior (`vectors.npz`, `sections.jsonl`, `hyde/*.jsonl`,
+hash-based skip) is **kept and refactored behind a small storage interface** so the
+standalone `.txt` workflow runs exactly as now. It becomes the *reference adapter*
+that implements the same "give me existing data / here's new data to persist"
+contract the Neon adapter implements — just backed by files. It is also the
+canonical implementation of each stage's `load`/`dump` disk format (§3.1), so
+disk-chaining between stages has one source of truth. No external user is forced to
+adopt it.
+
+---
+
+## 4. Refactor plan (workstreams)
 
 Ordered so each unblocks the next. WS1 + WS2 are the foundation; B and C ride on top.
 
-### WS1 — Persistent, per-user profile + embedding store  *(foundation)*
+### WS1 — Schema-driven stages: separate transform from IO  *(foundation)*
 
-Replace the monolithic `vectors.npz` with a content-addressable per-user store so
-profiles can be upserted one at a time and any subset loaded on demand.
+Make each stage a pure transform with a declared input/output schema (§3.1) and an
+optional disk `load`/`dump`. The existing file persistence is preserved as the
+`FileStore` adapter. The point is **not** a new store — it's clean, self-describing
+stage boundaries that chain in-memory or via disk.
 
-- [ ] Define an on-disk schema (per user), e.g. `store/users/<user_id>.json` +
-      `store/vectors/<user_id>.npz`, holding: `sections`, per-section
-      `content_hash`, per-section embedding, HyDE descriptors + embeddings per
-      `cross_key`, **`embedding_model`**, **native `dim`**, `section_names`,
-      `updated_at`. (Record the model+dim so queries embed compatibly and MRL
-      truncation stays consistent — see gap #6 / WS5.)
-- [ ] New module `src/store.py` (working name) with:
-      `upsert_user(...)`, `get_users(ids) -> (ids, section_names, emb[N,S,D], hyde)`,
-      `all_user_ids()`, `delete_user(id)`. `get_users` is the replacement for
-      `load_embeddings` and must assemble the dense array for an **arbitrary subset**
-      in a fixed section order.
-- [ ] Make embedding generation incremental: re-embed a section **only** when its
-      `content_hash` changed (today it's all-or-nothing on roster equality,
-      `embed.py:238`). Keep storing full-dim vectors.
-- [ ] Migration/back-compat: a one-shot importer from the existing
-      `data/<group>/embeds` blob into the new store (or keep `load_embeddings` for
-      the legacy monolithic pipeline and have the store layer wrap it).
+- [ ] **Formalize the stage schemas + a `describe_stage` / stage registry.** Pick
+      one schema mechanism (recommend dataclasses with `to_dict`/`from_dict`, JSON
+      Schema export optional) and define the §3.1 table as real types. Expose a
+      registry so a caller can fetch a stage's input/output schema at runtime.
+- [ ] **Split each disk-coupled stage into transform + disk helpers.** Today
+      `create_section_embeddings` (`embed.py:197`) and
+      `extract_sections_from_profiles` (`extract.py:43`) interleave compute with
+      load/save and hash-skip logic. Pull out a pure transform
+      (e.g. `embed_sections(extracted, model, existing=None) -> embeddings-bundle`)
+      and move `.npz`/`.jsonl` read/write into `load`/`dump` helpers the adapter
+      calls — never inside the transform.
+- [ ] **Define a tiny `Store`/adapter protocol** with methods like
+      `get_sections(ids)`, `get_embeddings(ids)`, `get_match_history(ids)`,
+      `put_embeddings(...)`, `put_matches(...)`. Provide **one implementation in
+      this repo**: `FileStore` (wraps current disk layout, owns the stage disk
+      formats). The Neon implementation is the app's, outside this repo.
+- [ ] **Make embedding reuse content-hash based, not roster-based.** Today cache is
+      reused only when `set(user_ids)` matches exactly (`embed.py:238`) — adding one
+      user re-embeds everyone. The transform should diff per-section `content_hash`
+      against the passed-in `existing` and recompute just the deltas, regardless of
+      who else is in the set. (Lets the Neon adapter store one embedding per section
+      and pass back only what it has.)
+- [ ] **`get_embeddings(ids)` for arbitrary subsets.** Replace whole-blob
+      `load_embeddings` (`embed.py:338`) with subset assembly: given any `user_ids`,
+      return the dense `[N,S,D]` bundle in a fixed `section_names` order. Critical for
+      query (1×M) and subset (M×N) modes pulling a slice of the community.
+- [ ] **Entry-at-any-stage:** ingest pre-sectioned input
+      (`{user_id: {section: text}}` → `ExtractedSections`) bypassing
+      `load_profiles`/extraction, and accept the embeddings-bundle directly bypassing
+      embedding. (See WS6 for the public signatures.) Embedding always happens
+      **inside this repo** via the `embed` stage — Neon only stores the bundle and
+      hands it back; it never embeds itself.
 
 ### WS2 — Rectangular (source × target) similarity  *(foundation)*
 
@@ -179,26 +377,52 @@ Generalize similarity so source and target user sets can differ.
 
 ### WS3 — Mode B: Query match (1 × M)  *(the hot path)*
 
-- [ ] New `src/query.py`: build a transient "query atom" from a free-text need
-      (one `needs` section, `id="__query__"`), HyDE it into target vocabulary
-      (reuse `generate_hyde_descriptors` for a single item, no disk cache needed),
-      embed need + HyDE with the **store's** model/dims.
-- [ ] Rank: load candidate pool via `store.get_users(...)`, compute 1×M directional
-      similarity (WS2), take top-K.
-- [ ] Optional LLM re-rank of the top-K only (reuse `build_batch_scoring_prompt`
-      framing from `score.py:132` but query-vs-candidate, **no** set-cover/b-match).
-- [ ] Output: a single ranked shortlist (id, score, why) + optional per-candidate
-      intro (reuse `generate_introductions_for_matches`, treating the query as user1).
-- [ ] Register a `QueryMatchPipeline` in `PIPELINE_REGISTRY` and expose it as a
-      function with a tight, JSON-in/JSON-out signature for the agent tool-call.
-- [ ] Target: no community re-embedding; cold load from store only.
+Built on the **query-as-partial-profile** model (§3.2) — reuses the directional
+machinery rather than a separate code path.
+
+- [ ] New `src/query.py`: build a transient query atom as a partial
+      `ExtractedSections` (`id="__query__"`). Accept **either** an explicit section
+      mapping (`{"needs": "<query text>"}`, default — no extraction call) **or** raw
+      text routed through the `extract` stage to auto-populate sections (§3.2 a/b).
+- [ ] HyDE the query's source section(s) into target vocabulary (reuse
+      `generate_hyde_descriptors` for the single atom; no disk cache needed),
+      supporting **`n_descriptors > 1`** (§3.3). Embed need + HyDE via the `embed`
+      stage (embedding stays in-repo).
+- [ ] **Candidate pool comes in as an argument**: `run_query_match` accepts the
+      embeddings-bundle for the pool directly (Neon adapter passes pulled rows;
+      `FileStore` passes loaded vectors). Never re-embeds the pool.
+- [ ] **Per-call recipe override** (§3.2): the caller can pass a query-specific
+      recipe (e.g. `{cross_section_weights: {needs_skills: 1.0}}`) so matching keys
+      on just the section(s) the query populated. Falls back to config recipe.
+- [ ] Rank: compute 1×M directional similarity (WS2) against the pool, take top-K
+      (`top_k` configurable).
+- [ ] **LLM re-rank of the top-K is ON by default** (decision confirmed). Reuse the
+      `build_batch_scoring_prompt` framing (`score.py:132`) as query-vs-candidate,
+      **no** set-cover / b-match. Allow disabling via config for a pure-embedding,
+      cheaper path.
+- [ ] Output (returned, not written): a ranked shortlist (id, score, why) + per-
+      candidate intro (reuse `generate_introductions_for_matches`, query as user1).
+      The caller persists/returns it however it likes.
+- [ ] Register a `QueryMatchPipeline` in `PIPELINE_REGISTRY` and expose a thin
+      JSON-in/JSON-out wrapper for the agent tool-call (goes through the Neon adapter
+      in production).
 
 ### WS4 — Mode C: Subset batch match (M × N) with novelty
 
-- [ ] Match-history store: persist surfaced pairs (by `stable_pair_id`) with a
-      timestamp / run id, e.g. `store/match_history.jsonl`. Add a helper to fetch
-      the exclusion set for a given member set and lookback window.
-- [ ] Thread an `excluded_pairs` set through pair selection (`score.py:180`),
+- [ ] **Members & pool are caller-supplied** (decision confirmed): `run_batch_match`
+      takes an explicit M list (ids/sections/embeddings) for the "who needs matches"
+      side and an explicit pool (ids/sections/embeddings) for the candidate side —
+      for both input and output. Choreo never reads a `tier` flag or decides who's a
+      member; that's app data.
+- [ ] **Match history is an INPUT, not a store this repo owns.** `run_batch_match`
+      accepts `excluded_pairs: set[pair_id]` (or `dict[user_id, set[partner_id]]`)
+      as an argument — the caller builds it from Neon's `past_matches` table.
+      **Novelty window default = last 6 months, configurable** via a config key
+      (e.g. `matching.novelty_window_months: 6`). For the standalone `FileStore`
+      path, the adapter applies this window against `match_history.jsonl`; for the
+      Neon path the app applies it when building `excluded_pairs` (the config value
+      is still the documented default it should honor).
+- [ ] Thread that `excluded_pairs` set through pair selection (`score.py:180`),
       group building, and `greedy_b_matching` (`match.py:111`) so already-surfaced
       pairs are skipped → "N novel matches."
 - [ ] Make b-matching asymmetric: degree targets bind on the **M (member) side**;
@@ -206,49 +430,124 @@ Generalize similarity so source and target user sets can differ.
       person saturating everyone. Generalize `greedy_b_matching` accordingly.
 - [ ] Subset-aware selection/set-cover: restrict scored pairs to (member × pool),
       not the full upper triangle.
-- [ ] Reports only for the M members; append the run's matches to match-history.
+- [ ] **Return** report-data only for the M members, plus the new pairs surfaced
+      this run (so the caller can append them to its own history). The `FileStore`
+      adapter writes them to disk; the Neon adapter writes them to Postgres.
 - [ ] Register a `BatchMatchPipeline`.
 
 ### WS5 — Cross-run score stability & config
 
 - [ ] Decide normalization strategy that doesn't depend on cohort size
-      (gap #6): either persist global reference stats in the store and normalize
-      against those, or switch to an absolute/rubric-anchored score (ties into
-      Appendix A's "shared calibration anchors"). Needed so query/subset scores are
+      (gap #6): either compute the reference distribution over the passed-in pool /
+      let the caller supply stable reference stats, or switch to an
+      absolute/rubric-anchored score (ties into Appendix A's "shared calibration
+      anchors"). Either way the reference must be an explicit input, not derived
+      from the current run's square matrix — needed so query/subset scores are
       comparable over time.
 - [ ] Config surface for modes: `query` (top_k, llm_rerank on/off, pool filter),
       `batch` (member set source, novelty lookback, asymmetric b-params). The
       recipe/HyDE config already drives directionality — keep mode switching
       config-only where possible (per CLAUDE.md "switching matching modes").
 
-### WS6 — Entry points / serving surface
+### WS6 — Public function signatures & adapters
 
-- [ ] Add an "ingest pre-sectioned profiles" path (skip `load_profiles` +
-      `extract_sections_from_profiles`): accept `{user_id: {section: text}}` and
-      build `ExtractedSections` directly. This is the daily-upsert input.
-- [ ] Modal: replace the throwaway `run_<uuid>` layout (`deploy_modal.py:234`) with
-      a **persistent** store on the `choreo-data` Volume, and expose 3 functions:
-      `upsert_profiles`, `query_match`, `batch_match` (+ keep the legacy full-run for
-      back-compat). `query_match` must load-not-rebuild.
+The orchestration layer (§3) is the public API external apps import. Keep it small
+and typed; runners take Python objects in and return Python objects out (callers may
+still chain via disk using each stage's `load`/`dump`).
+
+- [ ] **Define the three mode runners** as importable functions taking schema
+      objects and returning schema objects (sketch):
+      - `run_full_match(sections|embeddings, config, excluded_pairs=None) -> {edges, report_data, embeddings}`
+      - `run_query_match(query, pool_embeddings, config, recipe_override=None, top_k=...) -> {shortlist}`
+      - `run_batch_match(members, pool, config, excluded_pairs) -> {edges, report_data, new_pairs}`
+      Each accepts an optional `Store` for the convenience/standalone case but never
+      requires one.
+- [ ] **`report.py` → return data, then write.** Split `generate_all_reports`
+      (`report.py:184`, currently writes per-user JSON + `cohort.json` to disk) into
+      a pure `build_report_data(...) -> dict` plus an adapter that persists it. The
+      Neon caller wants the dict; the CLI wants the files.
+- [ ] **Stage helpers** for entry-at-any-stage:
+      `sections_from_dict({user_id: {section: text}}) -> list[ExtractedSections]`
+      (skip `load_profiles`/extraction) and direct acceptance of the
+      embeddings-bundle (skip embedding).
+- [ ] **CLI adapter (`main.py`) keeps working unchanged** for `.txt` folder/group
+      runs — it just becomes a `FileStore` + `run_full_match` composition.
+- [ ] **Modal adapter:** expose `upsert_profiles`, `query_match`, `batch_match` (+
+      keep the legacy full-run for back-compat). For standalone Modal use these can
+      back onto a `FileStore` on the `choreo-data` Volume; in the real product the
+      app calls the library directly with Neon data, so the Volume persistence is
+      optional, not the design center. (Replaces the throwaway `run_<uuid>` layout,
+      `deploy_modal.py:234`.)
 - [ ] Keep `choreo_IO.md` and `CLAUDE.md` updated as these contracts land
       (per docs workflow: durable bits → `docs/reference/`).
 
+### WS7 — Test scripts (per-stage, per-mode, and end-to-end)
+
+Primary fixture: **`data/test4`** (4 profiles). `matching.min_profiles_required`
+is 2 in config, so 4 profiles is enough to exercise full and batch modes. Put tests
+under `tests/` and make them runnable with `uv run pytest` (and a couple of
+runnable `__main__` scripts for manual inspection). Keep network/LLM calls
+**cached** (the existing hash caches make reruns cheap) and gate live-LLM tests so
+the suite can run offline against fixtures.
+
+- [ ] **Schema round-trip tests:** for every stage, assert `from_dict(to_dict(x))`
+      is identity and that `dump`→`load` reproduces the object (locks the §3.1
+      contract and the disk format).
+- [ ] **Per-stage isolation tests** on `test4`, each fed the *previous* stage's
+      saved output (proving stages compose via disk *and* in-memory):
+      `extract` · `hyde` (assert `n_descriptors=1` **and** `>1`, §3.3) · `embed`
+      (assert bundle shape + provenance) · `similarity` (assert **rectangular**
+      source×target reduces to the square result when source==target, the WS2
+      regression check) · `score` (with and without `excluded_pairs`) · `match`
+      (asymmetric b, exclusion honored) · `introduce` · `report`.
+- [ ] **Mode B (query) test:** explicit-section-mapping query + auto-expand query,
+      both against the `test4` pool; assert top-K ordering, that LLM re-rank runs by
+      default, and that a `recipe_override` changes results. Include an
+      `n_descriptors>1` query case.
+- [ ] **Mode C (batch) test:** a 2-member M against the 4-profile pool with a seeded
+      `excluded_pairs`; assert excluded pairs never appear and members get novel
+      matches.
+- [ ] **Incremental-embedding test:** embed `test4`, change one profile's section,
+      re-run; assert only the changed section re-embeds and unchanged vectors are
+      byte-identical (locks the content-hash reuse from WS1).
+- [ ] **End-to-end regression:** the existing full `.txt` run on `data/test4` still
+      produces equivalent `cohort.json` / per-user reports after the refactor
+      (golden-file compare, tolerant to score float jitter).
+- [ ] **Adapter parity test:** `FileStore`-driven run == in-memory-objects-driven
+      run for the same inputs (proves the two chaining styles agree).
+
 ---
 
-## 4. Open questions / decisions to confirm with Xander
+## 5. Decisions (confirmed) & remaining open questions
 
-- **Store backend:** flat files on disk/Volume (simplest, matches current style) vs
-  SQLite vs a vector DB. Given community scale (hundreds, not millions) and the
-  "static snapshot at query time" framing, flat per-user files + in-memory matmul
-  is probably enough for V1 — confirm.
-- **Query LLM re-rank default:** on (better quality, slower/cost) or off (pure
-  embedding rank) for the agent tool-call?
-- **Novelty window:** exclude *ever-surfaced* pairs, or a rolling window
-  (e.g. last 8 weeks)? Re-surfacing after a cooldown may be desirable.
-- **Member (M) source for batch mode:** explicit list passed in, or a flag on the
-  stored profile (e.g. `tier: paying`)?
-- **Embedding model migration:** when the embedding model changes, the whole store
-  must be re-embedded. Worth a `model_version` guard + bulk re-embed path.
+**Confirmed (2026-06-03):**
+- **Persistence backend is the caller's.** Neon owns the data; this repo only ships
+  a `FileStore` adapter for standalone `.txt` runs. In-memory matmul over a passed-in
+  pool is the V1 compute (fine for hundreds/low-thousands). Disk-as-intermediate
+  between stages is allowed wherever it's the most flexible option (§3).
+- **Embedding ownership: entirely inside this repo.** The `embed` stage (existing
+  functions) does all embedding; **Neon only stores** the resulting bundle and hands
+  it back. The app never embeds itself. → `embed` is a first-class public stage.
+- **Query LLM re-rank: ON by default** (config-disableable for a cheaper pure-
+  embedding path).
+- **Novelty window: last 6 months, configurable** (`matching.novelty_window_months`).
+- **Member (M) source for batch mode: caller passes explicit ids/profiles/embeddings**
+  for both input and output. Choreo never reads a `tier` flag.
+
+**Still open:**
+- **Schema mechanism:** dataclasses (+JSON-Schema export) vs pydantic for the §3.1
+  stage schemas. Recommendation: dataclasses to stay dependency-light; revisit if
+  the Neon caller wants runtime validation.
+- **`Store`/adapter protocol surface:** confirm the §3.1 stage table is the complete
+  set of contracts the Neon adapter must satisfy.
+- **Cross-run score normalization (gap #6 / WS5):** pool-relative vs caller-supplied
+  reference stats vs absolute rubric — needs a call once query/batch land.
+
+**Noted for later (explicitly out of scope now):**
+- **Embedding model migration:** when the embedding model changes, every stored
+  vector is stale and must be re-embedded. Not handled now. The embeddings bundle
+  carries `embedding_model` + `dim` (§3.1) so a future `model_version` guard +
+  bulk re-embed path can be added without reworking the contract.
 
 ---
 
