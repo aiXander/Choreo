@@ -1,10 +1,18 @@
-"""Generate candidate pairs using fused similarity from embeddings."""
+"""Generate candidate pairs using fused similarity from embeddings.
+
+Similarity is RECTANGULAR at its core: a source user set scored against a
+target user set (``fused[i][j]`` = "how well can target j help source i").
+The legacy square cohort path is just the special case source == target —
+``compute_fused_similarity_matrix`` reduces bit-exactly to the historical
+behavior when no target is passed.
+"""
 
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
-from utils import cosine_matrix, stable_pair_id, parse_cross_key
+from .utils import cosine_matrix, cosine_rect, stable_pair_id, parse_cross_key
+from .schemas import EmbeddingsBundle, SimilarityResult
 
 
 @dataclass
@@ -27,42 +35,74 @@ class CandidatePair:
 
 
 def compute_fused_similarity_matrix(
-    embeddings: np.ndarray,  # shape: (n_users, n_sections, embedding_dim)
+    embeddings: np.ndarray,  # SOURCE embeddings: (n_source, n_sections, embedding_dim)
     section_names: List[str],
     section_weights: Dict[str, float],
     cross_section_weights: Optional[Dict[str, float]] = None,
     hyde_embeddings: Optional[Dict[str, np.ndarray]] = None,
+    target_embeddings: Optional[np.ndarray] = None,  # (n_target, n_sections, dim); None = square
+    target_section_names: Optional[List[str]] = None,
 ) -> Tuple[np.ndarray, Dict]:
     """
-    Compute fused similarity matrix across all sections.
+    Compute fused similarity between a source user set and a target user set.
 
-    Supports both same-section (symmetric) and cross-section (asymmetric) similarity.
-    When cross_section_weights are present, the fused matrix is ASYMMETRIC:
-    fused[i][j] != fused[j][i].
+    Square mode (the historical cohort path) is the default: omit
+    ``target_embeddings`` and the target side IS the source side — this reduces
+    bit-exactly to the pre-rectangular behavior.
+
+    Rectangular mode: pass ``target_embeddings`` (and, if its section order
+    differs, ``target_section_names``). Same-section terms become
+    ``source_sec @ target_sec.T``; the directional cross term becomes
+    ``source_hyde @ target_sec.T``. Nothing is symmetrized.
+
+    The fused matrix is ASYMMETRIC whenever cross weights are present:
+    fused[i][j] = "how well can target j help source i" != fused[j][i].
 
     Args:
-        embeddings: User embeddings array (n_users, n_sections, embedding_dim)
-        section_names: Names of sections
+        embeddings: Source embeddings array (n_source, n_sections, embedding_dim)
+        section_names: Section names of the source embeddings (axis order)
         section_weights: Weights for same-section similarity
         cross_section_weights: Weights for cross-section similarity (e.g., {"needs_skills": 0.85})
-        hyde_embeddings: HyDE embeddings dict {cross_key: (n_users, n_descriptors, dim)}
+        hyde_embeddings: SOURCE-side HyDE embeddings {cross_key: (n_source, n_descriptors, dim)}
+        target_embeddings: Optional target embeddings (n_target, n_sections, dim)
+        target_section_names: Section names of the target embeddings (defaults
+            to ``section_names``)
 
     Returns:
-        Tuple of (fused_matrix, matrices_dict)
+        Tuple of (fused_matrix [n_source, n_target], matrices_dict)
     """
-    n_users, n_sections, embedding_dim = embeddings.shape
+    n_source = embeddings.shape[0]
 
-    # Presence of each section per user. A section a profile didn't fill is
-    # stored as a zero vector (see embed.get_embeddings); treat that as "absent"
-    # so it can be masked out of the fusion rather than counted as similarity 0.
-    section_present = {}  # name -> bool array (n_users,)
+    # Square (legacy cohort) mode = no target passed. Kept as a real flag, not
+    # just target=source, because the same-section term must call the exact
+    # legacy cosine_matrix: BLAS uses a symmetric kernel for A @ A.T that
+    # differs from the rectangular A @ B.T path by ~1 ULP, and the legacy
+    # behavior is preserved bit-exactly.
+    square_mode = target_embeddings is None
+    if target_embeddings is None:
+        target_embeddings = embeddings
+        target_section_names = section_names
+    elif target_section_names is None:
+        target_section_names = section_names
+    n_target = target_embeddings.shape[0]
+
+    # Presence of each section per user, per side. A section a profile didn't
+    # fill is stored as a zero vector (see embed.get_embeddings); treat that as
+    # "absent" so it can be masked out of the fusion rather than counted as
+    # similarity 0.
+    shared_sections = [s for s in section_names if s in target_section_names]
+    src_present = {}   # name -> bool array (n_source,)
+    tgt_present = {}   # name -> bool array (n_target,)
     section_matrices = {}
-    for section_idx, section_name in enumerate(section_names):
-        section_embeddings = embeddings[:, section_idx, :]
-        section_present[section_name] = (
-            np.linalg.norm(section_embeddings, axis=1) > 1e-8
-        )
-        section_matrices[section_name] = cosine_matrix(section_embeddings)
+    for section_name in shared_sections:
+        src_sec = embeddings[:, section_names.index(section_name), :]
+        tgt_sec = target_embeddings[:, target_section_names.index(section_name), :]
+        src_present[section_name] = np.linalg.norm(src_sec, axis=1) > 1e-8
+        tgt_present[section_name] = np.linalg.norm(tgt_sec, axis=1) > 1e-8
+        if square_mode:
+            section_matrices[section_name] = cosine_matrix(src_sec)
+        else:
+            section_matrices[section_name] = cosine_rect(src_sec, tgt_sec)
 
     cross_weights = cross_section_weights or {}
     hyde = hyde_embeddings or {}
@@ -77,12 +117,11 @@ def compute_fused_similarity_matrix(
     # (ignored) instead of an extreme low that drags a sparse profile's scores.
     # When every section is present for a pair, this reduces exactly to the old
     # global-normalization behavior (denominator == sum of all abs weights).
-    weighted_sum = np.zeros((n_users, n_users))
-    weight_mass = np.zeros((n_users, n_users))
+    weighted_sum = np.zeros((n_source, n_target))
+    weight_mass = np.zeros((n_source, n_target))
 
     for section_name, weight in valid_section_weights.items():
-        present = section_present[section_name]
-        mask = np.outer(present, present).astype(float)  # both sides must have it
+        mask = np.outer(src_present[section_name], tgt_present[section_name]).astype(float)
         weighted_sum += weight * mask * section_matrices[section_name]
         weight_mass += abs(weight) * mask
 
@@ -96,18 +135,18 @@ def compute_fused_similarity_matrix(
             print(f"Warning: No HyDE embeddings for '{cross_key}', skipping")
             continue
 
-        if tgt_section not in section_names:
+        if tgt_section not in target_section_names:
             print(f"Warning: Target section '{tgt_section}' not found in embeddings, skipping")
             continue
 
         # Source side: HyDE embeddings (vocabulary-bridged toward target)
-        # Shape: (n_users, n_descriptors, dim)
+        # Shape: (n_source, n_descriptors, dim)
         src_emb = hyde[cross_key]
 
         # Target side: regular section embeddings
-        # Shape: (n_users, 1, dim)
-        tgt_idx = section_names.index(tgt_section)
-        tgt_emb = embeddings[:, tgt_idx:tgt_idx+1, :]
+        # Shape: (n_target, 1, dim)
+        tgt_idx = target_section_names.index(tgt_section)
+        tgt_emb = target_embeddings[:, tgt_idx:tgt_idx+1, :]
 
         n_src_desc = src_emb.shape[1]
         n_tgt_desc = tgt_emb.shape[1]  # always 1 for regular sections
@@ -119,7 +158,7 @@ def compute_fused_similarity_matrix(
         # Max-pooled cross-similarity (ASYMMETRIC)
         # cross_matrix[i][j] = max over descriptor pairs (s, t) of cos_sim(src_i_s, tgt_j_t)
         # With n_descriptors=1, this is just a single matmul.
-        cross_matrix = np.full((n_users, n_users), -np.inf)
+        cross_matrix = np.full((n_source, n_target), -np.inf)
         for src_d in range(n_src_desc):
             for tgt_d in range(n_tgt_desc):
                 pair_sim = src_norm[:, src_d, :] @ tgt_norm[:, tgt_d, :].T
@@ -132,9 +171,9 @@ def compute_fused_similarity_matrix(
         cross_section_matrices[cross_key] = cross_matrix
 
         # Directional presence: source i (HyDE of i's needs) and target j (j's section).
-        src_present = np.linalg.norm(src_emb, axis=2).max(axis=1) > 1e-8
-        tgt_present = section_present[tgt_section]
-        mask = np.outer(src_present, tgt_present).astype(float)
+        src_hyde_present = np.linalg.norm(src_emb, axis=2).max(axis=1) > 1e-8
+        tgt_sec_present = np.linalg.norm(tgt_emb[:, 0, :], axis=1) > 1e-8
+        mask = np.outer(src_hyde_present, tgt_sec_present).astype(float)
         weighted_sum += weight * mask * cross_matrix
         weight_mass += abs(weight) * mask
 
@@ -270,3 +309,38 @@ def generate_similarity_matrix(
     print(f"Generated similarity matrices of shape {dir_matrix.shape}")
 
     return dir_matrix, sym_matrix, user_ids, matrices_dict
+
+
+def generate_rectangular_similarity(
+    source: EmbeddingsBundle,
+    target: EmbeddingsBundle,
+    recipe_config: Dict,
+) -> SimilarityResult:
+    """Source × target fused similarity over two embeddings bundles.
+
+    The rectangular core primitive for query (1×M) and subset batch (M×N)
+    modes. The directional matrix is NEVER symmetrized here; ``sym_matrix`` is
+    only filled when source and target are the identical user list (the legacy
+    square path goes through ``generate_similarity_matrix`` instead).
+    """
+    dir_matrix, matrices_dict = compute_fused_similarity_matrix(
+        embeddings=source.embeddings,
+        section_names=source.section_names,
+        section_weights=recipe_config.get('section_weights', {}),
+        cross_section_weights=recipe_config.get('cross_section_weights', {}),
+        hyde_embeddings=source.hyde or None,
+        target_embeddings=target.embeddings,
+        target_section_names=target.section_names,
+    )
+
+    sym_matrix = None
+    if source.user_ids == target.user_ids:
+        sym_matrix = (dir_matrix + dir_matrix.T) / 2
+
+    return SimilarityResult(
+        source_ids=list(source.user_ids),
+        target_ids=list(target.user_ids),
+        dir_matrix=dir_matrix,
+        sym_matrix=sym_matrix,
+        matrices_dict=matrices_dict,
+    )

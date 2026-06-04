@@ -10,17 +10,19 @@ models:
   # always stored on disk, so this is re-tunable without re-embedding. Set to an
   # int (e.g. 1536, 768); leave null/omit to use the full native size (3072).
   embedding_dimensions: 1536
-  extraction_llm: "google/gemini-3.5-flash"
-  pair_llm: "google/gemini-3.5-flash"
+  extraction_llm: "google/gemini-3.1-flash-lite"
+  pair_llm: "google/gemini-3.1-flash-lite"
   # Reasoning effort forwarded to OpenRouter via `reasoning: {effort}`. This is
-  # the global default for every phase; pair scoring overrides it to "medium"
-  # (see score.py) since that's the quality-critical step. OpenRouter ignores
-  # the param on non-reasoning models, and reasoning models that can't be turned
-  # off would otherwise default to "medium" (~50% of tokens) — so pinning "low"
-  # (~20%) is the cost-effective, recommended baseline. Valid values:
+  # the global default for every phase. OpenRouter ignores the param on
+  # non-reasoning models, and reasoning models that can't be turned off would
+  # otherwise default to "medium" (~50% of tokens) — so pinning "low" (~20%) is
+  # the cost-effective, recommended baseline. Valid values:
   # xhigh | high | medium | low | minimal | none ("none" disables reasoning
   # where the provider supports it; null/omit lets the model pick its default).
   reasoning_effort: "low"
+  # Effort for the quality-critical pair-scoring step (cohort scoring AND the
+  # query re-rank) — overrides reasoning_effort for that phase only.
+  pair_reasoning_effort: "medium"
 
 instruction_prompt:
   goal: "We are matching participants at an AI hackathon at Wintercircus Gent. Most attendees are here for professional reasons: to form teams and build product demos during the event (eg AI agents), while also making valuable professional connections. We want to surface pairs who should connect — where one person's skills fill another's build gap, and/or they share a project direction worth building together. Stay focused on the hackathon, but keep an eye slightly wider than the event itself: also surface connections with real potential beyond the weekend (career moves, co-founders, startups, business and network opportunities)."
@@ -52,6 +54,28 @@ matching:
   b_min: 3
   b_max: 4
   min_profiles_required: 2
+  # Subset batch mode (M members × N pool): optional degree cap for POOL-side
+  # users so one popular person can't saturate every member's matches.
+  # null = uncapped. Member-side degrees are bound by b_min/b_max as usual.
+  pool_b_max: null
+  # Novelty window for batch mode: pairs surfaced within the last N months are
+  # excluded ("N novel matches"). Adapters apply this when building the
+  # excluded_pairs input (FileStore reads match_history.jsonl; an external app
+  # applies it to its own past_matches data). Older matches become eligible again.
+  novelty_window_months: 6
+
+# Mode B: query match (1 transient query × M pool candidates).
+query:
+  top_k: 5                     # shortlist size returned to the caller
+  llm_rerank: true             # LLM re-rank of the top-K (ON by default; false = pure-embedding, cheaper)
+  generate_intros: true        # per-candidate intro for the final shortlist
+  # Optional query-specific recipe override. A query is a partial profile
+  # (usually only `needs`), so same-section weights rarely make sense — match
+  # on the directional cross term only. Callers can still override per call.
+  recipe:
+    section_weights: {}
+    cross_section_weights:
+      needs_skills: 1.0
 
 io:
   raw_dir: "data/raw"

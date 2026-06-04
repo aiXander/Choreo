@@ -1,44 +1,48 @@
 #!/usr/bin/env python3
-"""Main entrypoint for running pipelines in the prompt-mesh project."""
+"""Main entrypoint for running pipelines in the Choreo project.
 
+This file is the filesystem/CLI ADAPTER: it owns argument parsing, IO path
+resolution, plots and cost reporting. The actual matching compute lives in the
+mode runners (choreo/runners.py — ``run_full_match`` / ``run_query_match`` /
+``run_batch_match``), which take schema objects in and return schema objects
+out and are equally importable by external apps that own their own storage.
+
+Config comes from the packaged defaults (``choreo/defaults/``), optionally
+overlaid by ``--config-dir <dir>`` (any subset of config.yaml + prompt yamls)
+and per-run ``--set dotted.key=value`` overrides — see ``choreo/config.py``.
+"""
+
+import json
+import sys
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+import yaml
 from dotenv import load_dotenv
 
-# Add src to path for direct execution
-import sys
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-# Import modules
-from utils import load_yaml
-from llm import LLMWrapper
-from ingest import load_profiles
-from extract import extract_sections_from_profiles
-from embed import create_section_embeddings, truncate_embeddings, supports_mrl
-from hyde import generate_hyde_descriptors
-from candidate import generate_similarity_matrix, CandidatePair
-from score import score_pairs_with_llm, create_sections_dict
-from score_correlation import (
+from choreo.config import load_config, resolve_prompt_paths, set_by_path
+from choreo.utils import DEFAULT_PROMPT_PATHS
+from choreo.llm import LLMWrapper
+from choreo.ingest import load_profiles
+from choreo.store import FileStore
+from choreo.runners import run_full_match, run_query_match, run_batch_match
+from choreo.score_correlation import (
     create_normalized_score_correlation_plot,
     create_normalized_detailed_score_analysis,
 )
-from raw_data import save_score_correlation_raw_data
-from match import create_matches
-from introduction import generate_introductions_for_matches
-from report import generate_all_reports
-from cost_tracker import get_cost_tracker
-from visualize_similarity import create_similarity_plots
-from tsne import create_tsne_plots
+from choreo.raw_data import save_score_correlation_raw_data
+from choreo.report import write_reports, print_cohort_summary
+from choreo.cost_tracker import get_cost_tracker
+from choreo.visualize_similarity import create_similarity_plots
+from choreo.tsne import create_tsne_plots
 
 
-DEFAULT_CONFIG_PATH = "config/config.yaml"
-DEFAULT_SECTIONS_CONFIG_PATH = "config/section_prompt.yaml"
-DEFAULT_SCORING_PROMPT_PATH = "config/scoring_prompt.yaml"
-DEFAULT_INTRODUCTION_PROMPT_PATH = "config/introduction_prompt.yaml"
-DEFAULT_HYDE_PROMPT_PATH = "config/hyde_prompt.yaml"
+DEFAULT_SECTIONS_CONFIG_PATH = DEFAULT_PROMPT_PATHS["sections"]
+DEFAULT_SCORING_PROMPT_PATH = DEFAULT_PROMPT_PATHS["scoring"]
+DEFAULT_INTRODUCTION_PROMPT_PATH = DEFAULT_PROMPT_PATHS["introduction"]
+DEFAULT_HYDE_PROMPT_PATH = DEFAULT_PROMPT_PATHS["hyde"]
 
 
 @dataclass
@@ -48,8 +52,10 @@ class PipelineContext:
     config: Dict[str, Any]
     force: bool = False
     group_name: Optional[str] = None
-    config_path: str = DEFAULT_CONFIG_PATH
+    config_dir: Optional[str] = None  # optional dir of config/prompt overrides
     input_dir: Optional[str] = None
+    query: Optional[str] = None      # query_match: raw text or JSON section mapping
+    members: Optional[str] = None    # batch_match: comma-separated member ids
 
     @property
     def user_profiles_dir(self) -> str:
@@ -130,51 +136,6 @@ def apply_io_overrides(
     return config
 
 
-def _first_existing(mapping: Dict[str, Any], *keys: str, default: str) -> str:
-    for key in keys:
-        value = mapping.get(key)
-        if value:
-            return value
-    return default
-
-
-def resolve_prompt_paths(config: Dict[str, Any]) -> Dict[str, str]:
-    """Determine which prompt configuration files should be used."""
-
-    prompt_sections: Dict[str, Any] = {}
-    for candidate_key in ("prompt_files", "prompts"):
-        candidate = config.get(candidate_key)
-        if isinstance(candidate, dict):
-            prompt_sections.update(candidate)
-
-    return {
-        "sections": _first_existing(
-            prompt_sections,
-            "section_prompt_path",
-            "section_prompt",
-            default=DEFAULT_SECTIONS_CONFIG_PATH,
-        ),
-        "scoring": _first_existing(
-            prompt_sections,
-            "scoring_prompt_path",
-            "scoring_prompt",
-            default=DEFAULT_SCORING_PROMPT_PATH,
-        ),
-        "introduction": _first_existing(
-            prompt_sections,
-            "introduction_prompt_path",
-            "introduction_prompt",
-            default=DEFAULT_INTRODUCTION_PROMPT_PATH,
-        ),
-        "hyde": _first_existing(
-            prompt_sections,
-            "hyde_prompt_path",
-            "hyde_prompt",
-            default=DEFAULT_HYDE_PROMPT_PATH,
-        ),
-    }
-
-
 def _execute_matching_pipeline(
     config: Dict[str, Any],
     *,
@@ -185,7 +146,11 @@ def _execute_matching_pipeline(
     force: bool = False,
     group_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run the matching pipeline with the provided configuration."""
+    """Run the matching pipeline with the provided configuration.
+
+    Adapter composition: FileStore (disk caches + persistence) around
+    ``run_full_match`` (the in-memory compute), plus plots and cost reporting.
+    """
 
     print("🚀 Starting prompt-mesh matching pipeline...")
 
@@ -199,6 +164,7 @@ def _execute_matching_pipeline(
     if group_name:
         print(f"📁 Using group-specific data: {group_name}")
 
+    store = FileStore.from_io_config(io_config)
     llm_wrapper = LLMWrapper(
         cache_dir=io_config.get("cache_dir"),
         reasoning_effort=config.get("models", {}).get("reasoning_effort", "low"),
@@ -227,95 +193,34 @@ def _execute_matching_pipeline(
             "min_required": MIN_PROFILES_REQUIRED,
         }
 
-    print("\n🧠 Step 2: Extracting sections with LLM...")
     try:
-        goal = config.get("instruction_prompt", {}).get("goal")
-        extracted_sections = extract_sections_from_profiles(
-            profiles=profiles,
-            sections_config_path=sections_config_path,
-            model=config.get("models", {}).get("extraction_llm"),
+        run = run_full_match(
+            profiles,
+            config,
+            store=store,
             llm_wrapper=llm_wrapper,
-            processed_dir=io_config.get("processed_dir"),
-            budgets=config.get("budgets", {}),
-            goal=goal,
+            prompt_paths={
+                "sections": sections_config_path,
+                "scoring": scoring_prompt_path,
+                "introduction": introduction_prompt_path,
+                "hyde": hyde_prompt_path,
+            },
             force=force,
         )
-        print(f"✅ Extracted sections for {len(extracted_sections)} profiles")
     except Exception as exc:  # pylint: disable=broad-except
-        message = f"Error extracting sections: {exc}"
-        print(f"❌ {message}")
-        return {"success": False, "error": message}
+        print(f"❌ {exc}")
+        return {"success": False, "error": str(exc)}
 
-    # HyDE generation step (only runs when cross_section_weights are configured)
-    cross_section_weights = config.get("recipe", {}).get("cross_section_weights", {})
-    hyde_descriptors = {}
-    if cross_section_weights:
-        print("\n🔮 Step 2.5: Generating HyDE descriptors...")
-        try:
-            from utils import load_yaml as _load_yaml
-            hyde_prompt_config = _load_yaml(hyde_prompt_path)
-            hyde_prompt_template = hyde_prompt_config['hyde_generation']
-            sections_config = _load_yaml(sections_config_path)
-
-            hyde_descriptors = generate_hyde_descriptors(
-                extracted_sections=extracted_sections,
-                cross_section_weights=cross_section_weights,
-                hyde_config=config.get("hyde", {}),
-                prompt_template=hyde_prompt_template,
-                goal=goal,
-                llm_wrapper=llm_wrapper,
-                model=config.get("models", {}).get("extraction_llm"),
-                cache_dir=Path(io_config.get("processed_dir")),
-                sections_config=sections_config,
-                force=force,
-            )
-            print(f"✅ Generated HyDE descriptors for {len(hyde_descriptors)} cross-section pairs")
-        except Exception as exc:
-            message = f"Error generating HyDE descriptors: {exc}"
-            print(f"❌ {message}")
-            return {"success": False, "error": message}
-
-    print("\n🔢 Step 3: Creating embeddings...")
-    user_ids, section_names, embeddings, hyde_embeddings = create_section_embeddings(
-        extracted_sections=extracted_sections,
-        embedding_model=config.get("models", {}).get("embedding"),
-        embeds_dir=io_config.get("embeds_dir"),
-        hyde_descriptors=hyde_descriptors if hyde_descriptors else None,
-        force=force,
-    )
-    print(f"✅ Created embeddings: {embeddings.shape}")
-
-    # Matryoshka (MRL) truncation. Full-size vectors are always stored on disk;
-    # here we (optionally) truncate the working copy to embedding_dimensions for
-    # cheaper similarity math. Re-tunable without re-embedding — see embed.py.
-    # Skipped (with a warning) on models not known to be MRL-trained, since
-    # truncating those would silently corrupt similarity.
-    embedding_dimensions = config.get("models", {}).get("embedding_dimensions")
-    embedding_model = config.get("models", {}).get("embedding")
-    if embedding_dimensions:
-        if supports_mrl(embedding_model):
-            embeddings = truncate_embeddings(embeddings, embedding_dimensions)
-            hyde_embeddings = {k: truncate_embeddings(v, embedding_dimensions)
-                               for k, v in hyde_embeddings.items()}
-            print(f"   MRL-truncated to {embedding_dimensions} dims: {embeddings.shape}")
-        else:
-            print(f"⚠️  embedding_dimensions={embedding_dimensions} is set, but model "
-                  f"'{embedding_model}' is not known to support Matryoshka (MRL) "
-                  f"truncation — keeping full {embeddings.shape[-1]} dims. Add it to "
-                  f"MRL_CAPABLE_MODELS in src/embed.py if it does, or unset "
-                  f"embedding_dimensions to silence this warning.")
-
-    if hyde_embeddings:
-        for k, v in hyde_embeddings.items():
-            print(f"   HyDE embeddings [{k}]: {v.shape}")
+    final_edges = run["edges"]
+    similarity = run["similarity"]
 
     print("\n📊 Step 3.5: Creating t-SNE visualizations...")
     tsne_results = None
     try:
         tsne_results = create_tsne_plots(
-            embeddings=embeddings,
-            user_ids=user_ids,
-            section_names=section_names,
+            embeddings=run["working_embeddings"],
+            user_ids=run["embeddings"].user_ids,
+            section_names=run["embeddings"].section_names,
             output_dir=io_config.get("outputs_dir"),
             metric="cosine",
             perplexity=7,
@@ -325,139 +230,40 @@ def _execute_matching_pipeline(
         # t-SNE visualization is non-essential, don't fail the pipeline
         print(f"⚠️ Warning: Could not create t-SNE visualizations: {exc}")
 
-    print("\n🎯 Step 4: Generating similarity matrix...")
+    normalized_embed_scores = run["normalized_embed_scores"]
+    normalized_llm_scores = run["normalized_llm_scores"]
+    if normalized_embed_scores and normalized_llm_scores:
+        try:
+            create_normalized_score_correlation_plot(
+                normalized_embed_scores=normalized_embed_scores,
+                normalized_llm_scores=normalized_llm_scores,
+                output_dir=io_config.get("outputs_dir"),
+                group_name=group_name,
+            )
+            create_normalized_detailed_score_analysis(
+                normalized_embed_scores=normalized_embed_scores,
+                normalized_llm_scores=normalized_llm_scores,
+                output_dir=io_config.get("outputs_dir"),
+                group_name=group_name,
+            )
+            # Persist the per-pair scores behind these plots (crash-safe).
+            save_score_correlation_raw_data(
+                output_dir=io_config.get("outputs_dir"),
+                normalized_embed_scores=normalized_embed_scores,
+                normalized_llm_scores=normalized_llm_scores,
+                group_name=group_name,
+            )
+            print("✅ Generated score correlation plots")
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"⚠️ Warning: Failed to generate correlation plots: {exc}")
+    else:
+        print("⚠️ Skipping correlation plots: normalized scores not available")
+
+    print("\n📝 Step 8: Writing reports...")
     try:
-        dir_similarity_matrix, similarity_matrix, user_ids_sorted, matrices_dict = generate_similarity_matrix(
-            embeddings=embeddings,
-            user_ids=user_ids,
-            section_names=section_names,
-            recipe_config=config.get("recipe", {}),
-            hyde_embeddings=hyde_embeddings if hyde_embeddings else None,
-        )
-        print(f"✅ Generated similarity matrix for {len(user_ids_sorted)} users")
-    except Exception as exc:  # pylint: disable=broad-except
-        message = f"Error generating similarity matrix: {exc}"
-        print(f"❌ {message}")
-        return {"success": False, "error": message}
-
-    print("\n⚡ Step 5: LLM pair scoring...")
-    try:
-        sections_dict = create_sections_dict(extracted_sections)
-
-        instruction = config.get("recipe", {}).get("instruction", "find good matches")
-        goal = config.get("instruction_prompt", {}).get("goal")
-
-        llm_scores = score_pairs_with_llm(
-            similarity_matrix=similarity_matrix,
-            user_ids=user_ids_sorted,
-            sections_dict=sections_dict,
-            instruction=instruction,
-            goal=goal,
-            prompts_config_path=scoring_prompt_path,
-            llm_wrapper=llm_wrapper,
-            model=config.get("models", {}).get("pair_llm"),
-            max_n_llm_evaluations_per_profile=config.get("budgets", {}).get("max_n_llm_evaluations_per_profile"),
-            global_cap=config.get("budgets", {}).get("max_pair_llm_calls"),
-            n_profiles_to_score_together=config.get("budgets", {}).get("n_profiles_to_score_together"),
-            force=force,
-        )
-        print(f"✅ Scored {len(llm_scores)} pairs with LLM")
-    except Exception as exc:  # pylint: disable=broad-except
-        message = f"Error scoring pairs: {exc}"
-        print(f"❌ {message}")
-        return {"success": False, "error": message}
-
-    print("\n🔗 Step 6: Greedy b-matching...")
-    try:
-        scored_candidates = [
-            CandidatePair.create(score.user1, score.user2, score.embed_score)
-            for score in llm_scores.values()
-        ]
-
-        final_edges, normalized_embed_scores, normalized_llm_scores = create_matches(
-            candidates=scored_candidates,
-            llm_scores=llm_scores,
-            all_user_ids=user_ids_sorted,
-            matching_config=config.get("matching", {}),
-            blending_config=config.get("blending", {}),
-            similarity_matrix=similarity_matrix,
-        )
-        print(f"✅ Created {len(final_edges)} final matches")
-
-        if normalized_embed_scores and normalized_llm_scores:
-            try:
-                create_normalized_score_correlation_plot(
-                    normalized_embed_scores=normalized_embed_scores,
-                    normalized_llm_scores=normalized_llm_scores,
-                    output_dir=io_config.get("outputs_dir"),
-                    group_name=group_name,
-                )
-                create_normalized_detailed_score_analysis(
-                    normalized_embed_scores=normalized_embed_scores,
-                    normalized_llm_scores=normalized_llm_scores,
-                    output_dir=io_config.get("outputs_dir"),
-                    group_name=group_name,
-                )
-                # Persist the per-pair scores behind these plots (crash-safe).
-                save_score_correlation_raw_data(
-                    output_dir=io_config.get("outputs_dir"),
-                    normalized_embed_scores=normalized_embed_scores,
-                    normalized_llm_scores=normalized_llm_scores,
-                    group_name=group_name,
-                )
-                print("✅ Generated score correlation plots")
-            except Exception as exc:  # pylint: disable=broad-except
-                print(f"⚠️ Warning: Failed to generate correlation plots: {exc}")
-        else:
-            print("⚠️ Skipping correlation plots: normalized scores not available")
-
-    except Exception as exc:  # pylint: disable=broad-except
-        message = f"Error creating matches: {exc}"
-        print(f"❌ {message}")
-        return {"success": False, "error": message}
-
-    print("\n💬 Step 7: Generating introductions for matches...")
-    try:
-        introductions = generate_introductions_for_matches(
-            final_edges=final_edges,
-            sections_dict=sections_dict,
-            instruction=instruction,
-            goal=goal,
-            introduction_config_path=introduction_prompt_path,
-            llm_wrapper=llm_wrapper,
-            model=config.get("models", {}).get("pair_llm"),
-            force=force,
-        )
-
-        introduction_lookup = {intro.pair_id: intro for intro in introductions.values()}
-        for edge in final_edges:
-            if edge.pair_id in introduction_lookup:
-                intro_obj = introduction_lookup[edge.pair_id]
-                edge.intro = intro_obj.intro
-                edge.starter_topics = intro_obj.starter_topics
-            else:
-                edge.intro = (
-                    f"For {edge.user1}: You've been matched with {edge.user2} — "
-                    f"explore how their skills could support your project.\n\n"
-                    f"For {edge.user2}: You've been matched with {edge.user1} — "
-                    f"explore how their skills could support your project."
-                )
-                edge.starter_topics = "• Share what you're each building • Identify where your skills meet the other's needs • Plan a concrete next step"
-
-        print(f"✅ Generated introductions for {len(introductions)} matches")
-    except Exception as exc:  # pylint: disable=broad-except
-        message = f"Error generating introductions: {exc}"
-        print(f"❌ {message}")
-        return {"success": False, "error": message}
-
-    print("\n📝 Step 8: Generating reports...")
-    try:
-        cohort_summary = generate_all_reports(
-            all_edges=final_edges,
-            extracted_sections=extracted_sections,
-            outputs_dir=io_config.get("outputs_dir"),
-            top_matches_per_user=config.get("matching", {}).get("b_max"),
-        )
+        write_reports(run["report_data"], io_config.get("outputs_dir"))
+        cohort_summary = run["report_data"]["cohort_summary"]
+        print_cohort_summary(cohort_summary)
         print("✅ Generated reports for all users")
     except Exception as exc:  # pylint: disable=broad-except
         message = f"Error generating reports: {exc}"
@@ -477,8 +283,8 @@ def _execute_matching_pipeline(
     plots_results = None
     try:
         plots_results = create_similarity_plots(
-            matrices_dict=matrices_dict,
-            user_ids=user_ids_sorted,
+            matrices_dict=similarity["matrices_dict"],
+            user_ids=similarity["user_ids"],
             recipe_config=config.get("recipe", {}),
             output_dir=io_config.get("outputs_dir"),
             group_name=group_name,
@@ -530,7 +336,7 @@ class MatchingPipeline(BasePipeline):
         config_copy.setdefault("io", {})
         apply_io_overrides(config_copy, context.group_name, context.input_dir)
 
-        prompt_paths = resolve_prompt_paths(config_copy)
+        prompt_paths = resolve_prompt_paths(config_dir=context.config_dir, config=config_copy)
 
         return _execute_matching_pipeline(
             config=config_copy,
@@ -543,8 +349,138 @@ class MatchingPipeline(BasePipeline):
         )
 
 
+class QueryMatchPipeline(BasePipeline):
+    """Mode B: rank the stored community pool against one transient query."""
+
+    name = "query_match"
+    description = ("Match a single query (e.g. \"find me a CTO who…\") against the "
+                   "group's pre-built embeddings. Pass --query '<text>' or "
+                   "--query '{\"needs\": \"…\"}'.")
+
+    def run(self, context: PipelineContext) -> Dict[str, Any]:
+        config_copy = deepcopy(context.config)
+        config_copy.setdefault("io", {})
+        apply_io_overrides(config_copy, context.group_name, context.input_dir)
+        io_config = config_copy["io"]
+
+        if not context.query:
+            message = "query_match needs --query '<text>' (or a JSON section mapping)"
+            print(f"❌ {message}")
+            return {"success": False, "error": message}
+
+        query: Any = context.query
+        if query.strip().startswith("{"):
+            try:
+                query = json.loads(query)
+            except json.JSONDecodeError as exc:
+                message = f"--query looks like a JSON section mapping but failed to parse: {exc}"
+                print(f"❌ {message}")
+                return {"success": False, "error": message}
+
+        store = FileStore.from_io_config(io_config)
+        try:
+            pool = store.get_embeddings()
+        except FileNotFoundError:
+            message = (f"No embeddings found in {io_config.get('embeds_dir')} — run the "
+                       "'matching' pipeline (or upsert profiles) for this group first.")
+            print(f"❌ {message}")
+            return {"success": False, "error": message}
+        pool_sections = {s.id: s.sections for s in store.get_sections()}
+
+        llm_wrapper = LLMWrapper(
+            cache_dir=io_config.get("cache_dir"),
+            reasoning_effort=config_copy.get("models", {}).get("reasoning_effort", "low"),
+        )
+
+        result = run_query_match(
+            query=query,
+            pool=pool,
+            config=config_copy,
+            pool_sections=pool_sections,
+            llm_wrapper=llm_wrapper,
+            prompt_paths=resolve_prompt_paths(config_dir=context.config_dir, config=config_copy),
+        )
+
+        print(f"\n🔎 Query shortlist ({len(result.shortlist)} of {result.pool_size} pool users):")
+        for entry in result.shortlist:
+            llm_part = f", llm {entry['llm_score']}" if entry["llm_score"] is not None else ""
+            print(f"  #{entry['rank']} {entry['user_id']} — score {entry['score']} "
+                  f"(embed {entry['embed_score']}{llm_part})")
+        for note in result.notes:
+            print(f"  ⚠️ {note}")
+
+        return {"success": True, "query_result": result.to_dict()}
+
+
+class BatchMatchPipeline(BasePipeline):
+    """Mode C: subset batch match (members × pool) with novelty exclusions."""
+
+    name = "batch_match"
+    description = ("Match an explicit member subset (--members a,b,c) against the "
+                   "group's pool, excluding pairs surfaced within the configured "
+                   "novelty window. Appends new pairs to match_history.jsonl.")
+
+    def run(self, context: PipelineContext) -> Dict[str, Any]:
+        config_copy = deepcopy(context.config)
+        config_copy.setdefault("io", {})
+        apply_io_overrides(config_copy, context.group_name, context.input_dir)
+        io_config = config_copy["io"]
+
+        if not context.members:
+            message = "batch_match needs --members '<id1,id2,…>'"
+            print(f"❌ {message}")
+            return {"success": False, "error": message}
+        member_ids = [m.strip() for m in context.members.split(",") if m.strip()]
+
+        store = FileStore.from_io_config(io_config)
+        try:
+            pool = store.get_embeddings()
+        except FileNotFoundError:
+            message = (f"No embeddings found in {io_config.get('embeds_dir')} — run the "
+                       "'matching' pipeline (or upsert profiles) for this group first.")
+            print(f"❌ {message}")
+            return {"success": False, "error": message}
+        pool_sections = {s.id: s.sections for s in store.get_sections()}
+
+        novelty_window = config_copy.get("matching", {}).get("novelty_window_months", 6)
+        excluded_pairs = store.get_match_history(window_months=novelty_window)
+        print(f"🚫 Excluding {len(excluded_pairs)} previously surfaced pairs "
+              f"(novelty window: {novelty_window} months)")
+
+        llm_wrapper = LLMWrapper(
+            cache_dir=io_config.get("cache_dir"),
+            reasoning_effort=config_copy.get("models", {}).get("reasoning_effort", "low"),
+        )
+
+        result = run_batch_match(
+            member_ids=member_ids,
+            pool=pool,
+            config=config_copy,
+            excluded_pairs=excluded_pairs,
+            pool_sections=pool_sections,
+            llm_wrapper=llm_wrapper,
+            prompt_paths=resolve_prompt_paths(config_dir=context.config_dir, config=config_copy),
+        )
+
+        # Persist: member reports to outputs/batch/, new pairs to history.
+        batch_outputs = str(Path(io_config.get("outputs_dir")) / "batch")
+        write_reports(result.report_data, batch_outputs)
+        store.put_matches(result.edges)
+        print(f"📒 Appended {len(result.new_pairs)} new pairs to {store.history_path}")
+        print_cohort_summary(result.report_data["cohort_summary"])
+
+        return {
+            "success": True,
+            "edges": [e.to_dict() for e in result.edges],
+            "new_pairs": result.new_pairs,
+            "outputs_dir": batch_outputs,
+        }
+
+
 PIPELINE_REGISTRY = PipelineRegistry()
 PIPELINE_REGISTRY.register(MatchingPipeline())
+PIPELINE_REGISTRY.register(QueryMatchPipeline())
+PIPELINE_REGISTRY.register(BatchMatchPipeline())
 
 
 def run_matching_pipeline(
@@ -577,12 +513,30 @@ def run_matching_pipeline(
     )
 
 
+def _parse_set_overrides(assignments: Optional[List[str]]) -> Dict[str, Any]:
+    """Parse repeated ``--set dotted.key=value`` flags into an overrides dict.
+
+    Values go through yaml.safe_load so ``--set query.top_k=3`` yields an int,
+    ``--set query.llm_rerank=false`` a bool, and plain strings stay strings.
+    """
+    overrides: Dict[str, Any] = {}
+    for assignment in assignments or []:
+        key, sep, raw_value = assignment.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--set expects dotted.key=value, got: {assignment!r}")
+        set_by_path(overrides, key.strip(), yaml.safe_load(raw_value))
+    return overrides
+
+
 def main(
     group_name: Optional[str] = None,
     force: bool = False,
     pipeline_name: str = MatchingPipeline.name,
-    config_path: str = DEFAULT_CONFIG_PATH,
+    config_dir: Optional[str] = None,
+    set_overrides: Optional[List[str]] = None,
     input_dir: Optional[str] = None,
+    query: Optional[str] = None,
+    members: Optional[str] = None,
 ) -> int:
     """CLI entrypoint for running pipelines via main.py."""
 
@@ -598,8 +552,13 @@ def main(
         if not group_name:
             group_name = Path(input_dir).resolve().name
 
-    config = load_yaml(config_path)
-    config_copy = deepcopy(config)
+    try:
+        overrides = _parse_set_overrides(set_overrides)
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        return 1
+
+    config_copy = load_config(config_dir=config_dir, overrides=overrides)
     config_copy.setdefault("io", {})
     apply_io_overrides(config_copy, group_name, input_dir)
 
@@ -613,8 +572,10 @@ def main(
         config=config_copy,
         force=force,
         group_name=group_name,
-        config_path=config_path,
+        config_dir=config_dir,
         input_dir=input_dir,
+        query=query,
+        members=members,
     )
 
     try:
@@ -645,10 +606,23 @@ if __name__ == "__main__":
         help="Name of the pipeline to run",
     )
     parser.add_argument(
-        "--config",
+        "--config-dir",
         type=str,
-        default=DEFAULT_CONFIG_PATH,
-        help="Path to the configuration YAML file",
+        default=None,
+        help="Directory holding config/prompt overrides (any subset of "
+             "config.yaml, section_prompt.yaml, scoring_prompt.yaml, "
+             "introduction_prompt.yaml, hyde_prompt.yaml). config.yaml is "
+             "deep-merged over the packaged defaults in choreo/defaults/; "
+             "prompt files replace the packaged ones.",
+    )
+    parser.add_argument(
+        "--set",
+        dest="set_overrides",
+        action="append",
+        metavar="KEY=VALUE",
+        help="Override any config value by dotted path, e.g. "
+             "--set query.top_k=3 --set models.pair_llm=openai/gpt-5. "
+             "Repeatable; applied after --config-dir.",
     )
     parser.add_argument(
         "--group",
@@ -663,6 +637,20 @@ if __name__ == "__main__":
         help="Path to a folder of profile .txt files (one per user). The group "
              "name is derived from the folder name and all artifacts/outputs are "
              "written inside it (e.g. <folder>/outputs). Takes precedence over --group.",
+    )
+    parser.add_argument(
+        "--query",
+        type=str,
+        default=None,
+        help="query_match pipeline: the query, either raw text or a JSON "
+             "section mapping like '{\"needs\": \"a CTO great at agents\"}'.",
+    )
+    parser.add_argument(
+        "--members",
+        type=str,
+        default=None,
+        help="batch_match pipeline: comma-separated member ids (the 'who needs "
+             "matches' side).",
     )
     parser.add_argument(
         "--force",
@@ -691,7 +679,10 @@ if __name__ == "__main__":
         group_name=args.group,
         force=args.force,
         pipeline_name=args.pipeline,
-        config_path=args.config,
+        config_dir=args.config_dir,
+        set_overrides=args.set_overrides,
         input_dir=args.input,
+        query=args.query,
+        members=args.members,
     )
     sys.exit(exit_code)

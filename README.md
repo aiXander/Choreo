@@ -1,237 +1,218 @@
 # Choreo: AI-Powered Directional Profile Matching
 
-A flexible user profile matching system that uses LLM embeddings, HyDE (Hypothetical Document Embeddings), and directional cross-section similarity to create meaningful connections between people. The system matches users where one person's skills can directly address the other's project needs.
+Choreo is a **library of matchmaking compute**, not a database. It extracts
+structured sections from free-text profiles, embeds them, and computes
+**directional** "who can help whom" similarity (one person's `needs` vs.
+another's `skills`), then refines with LLM pair scoring to produce mutually
+useful connections. All behavior is config-driven — switching matching modes
+requires no code edits.
 
-## TODO
+Every stage is a pure transform with a declared IO schema; all persistence
+lives in adapters (the CLI + `FileStore` in this repo, Modal, or an external
+app's own store).
 
-Loose ends from the HyDE / directional-matching work, to pick up later (roughly highest-impact first):
+## Three matching modes
 
-1. **Existing groups need `--force`.** Embedding cache keys on (user set, section names); the section rename invalidates old caches anyway, but don't trust a stale `data/{group}/embeds`.
-2. **Commit hygiene.** This work-in-progress mixes the feature with model repricing, a Modal signature change, and regenerated `README.md`/`analysis_report.md` (the latter looks like a run artifact — decide if it belongs in git or `.gitignore`). Consider splitting doc regen from code before pushing.
+| Mode | Shape | Trigger | Use case |
+|------|-------|---------|----------|
+| **Full cohort** | N×N | `main.py --group <g>` | match everyone in a community against everyone |
+| **Query match** (B) | 1×M | `--pipeline query_match --query '…'` | hot path: "find me a CTO who…" against a pre-built pool |
+| **Batch match** (C) | M×N | `--pipeline batch_match --members a,b` | periodic re-matching of a subset, surfacing only **novel** pairs |
 
-_Resolved: starter-topics bullet char unified on `•`; cross-key parsing consolidated into `utils.parse_cross_key` (now `->`-aware for multi-word sections); error-path intros use the dual-direction format; `deploy_modal.py` dead `group_name` param removed._
+Semantics in [docs/reference/matching_modes.md](docs/reference/matching_modes.md).
 
 ## Features
 
-- **Directional Cross-Matching**: Asymmetric need-to-skill matching — "how well can B help A?" is computed independently from "how well can A help B?"
-- **HyDE Vocabulary Bridging**: Automatically bridges the semantic gap between needs ("make my installation respond to movement") and skills ("computer vision, sensor integration") using Hypothetical Document Embeddings
-- **Configurable Sections**: Active/inactive flags on extraction sections — switch between use-cases (need/skill matching vs. social connectivity) via config alone
-- **Multi-Signal Blending**: Combines directional embedding similarity with LLM pair scoring
-- **Smart Budgeting**: Configurable LLM call limits and hash-based caching at every step
-- **B-Matching Algorithm**: Ensures fair degree distribution across users
-- **Directional Introductions**: Each person learns what the other can specifically offer their project
-- **Extensible**: All behavior changes live in config — no code edits needed to switch matching modes
+- **Directional cross-matching**: asymmetric need-to-skill similarity — "how well can B help A?" is computed independently from "how well can A help B?"
+- **HyDE vocabulary bridging**: an LLM rewrites each need ("make my installation respond to movement") into skill-vocabulary text so it embeds close to the matching skills
+- **Pure stages, pluggable IO**: every stage (extract · hyde · embed · similarity · score · match · introduce · report) is a pure transform with a discoverable IO contract; chain them in-memory or via disk
+- **Incremental by content hash**: embedding reuse is addressed per (user, section) cell — adding or editing one profile never re-embeds anyone else
+- **Novelty-aware batch matching**: append-only match history excludes recently surfaced pairs within a configurable window
+- **Multi-signal blending**: directional embedding similarity fused with batched, budgeted LLM pair scoring
+- **B-matching**: fair degree distribution (`b_min`–`b_max` connections per user, asymmetric member/pool caps in batch mode)
+- **Config-only mode switching**: flip between need/skill matching and symmetric social-connectivity matching by editing YAML
 
 ## Quick Start
 
-1. **Setup Environment**
+1. **Setup**
    ```bash
-   cp .env.example .env
-   # Add your OpenRouter API key to .env (https://openrouter.ai/settings/keys)
-   uv sync   # creates .venv from pyproject.toml + uv.lock; prefix commands with `uv run`
+   cp .env.example .env   # add your OpenRouter key (https://openrouter.ai/settings/keys)
+   uv sync                # creates .venv from pyproject.toml + uv.lock
    ```
 
-2. **Add User Profiles** (one `.txt` file per user; filename becomes the user ID, e.g. `alice.txt` -> "alice")
-   - **Folder mode**: keep them in any folder you like and point Choreo at it with `--input` (below).
-   - **Group mode**: place them in `data/{group_name}/raw/` and use `--group`.
+2. **Add profiles** — one `.txt` per user, filename = user ID (`alice.txt` → "alice"):
+   - **Folder mode**: any folder, via `--input` (artifacts written inside it)
+   - **Group mode**: `data/<group>/raw/`, via `--group`
 
-3. **Configure Matching**
-   - Edit `config/config.yaml` to adjust models, budgets, weights, and matching parameters
-   - Modify `config/section_prompt.yaml` to customize profile sections (with `active` flags)
-   - Update `config/scoring_prompt.yaml` and `config/introduction_prompt.yaml` for prompts
-   - Adjust `config/hyde_prompt.yaml` to tune HyDE descriptor generation
-
-4. **Run Matching**
+3. **Run**
    ```bash
-   # Folder mode: group name derived from the folder; outputs go inside it.
+   # Full cohort
    uv run python main.py --input /path/to/folder --force
-
-   # Group mode: reads data/<group>/raw, writes to data/<group>/.
    uv run python main.py --group <group_name> --force
+
+   # Query match (pool must exist first): JSON section mapping or raw text
+   uv run python main.py --pipeline query_match --group <g> \
+       --query '{"needs": "someone who can build the agent backend"}'
+
+   # Subset batch match (novel pairs only)
+   uv run python main.py --pipeline batch_match --group <g> --members alice,bob
+
+   uv run python main.py --list-pipelines
    ```
 
-5. **View Results** (under `<folder>/outputs/` in folder mode, or `data/{group_name}/outputs/` in group mode)
-   - Individual reports: `…/outputs/{user_id}.md`
-   - Cohort summary: `…/outputs/cohort.json`
-   - Visualizations: `…/outputs/plots/`
+4. **Results** (under `data/<group>/outputs/` or `<folder>/outputs/`):
+   - Per-user reports: `outputs/<user_id>.json` (`{"profile": md, "matches": md}`)
+   - Cohort summary + costs: `outputs/cohort.json`, `outputs/cost_report.json`
+   - Plots: `outputs/plots/` (+ re-exportable raw arrays in `plots/raw_data/`)
+   - Batch-mode reports go to `outputs/batch/` (never clobber the full run)
 
-## How It Works: The Matching Algorithm
+5. **Tests** (offline by default — fake LLM + embedder, no API key needed)
+   ```bash
+   uv run pytest
+   RUN_LLM_TESTS=1 uv run pytest tests/test_e2e_regression.py   # live golden e2e
+   ```
 
-The system implements a 9-step pipeline that transforms raw user profiles into directional, skill-need-aware connections:
+## Architecture
 
-### Step 1: Profile Ingestion
-- Load raw text files from `data/{group}/raw/` (one `.txt` file per user)
-- Each filename becomes a user ID
-- Content hashing for change detection
+Three layers — adapters own all IO, stages stay pure:
 
-### Step 2: LLM Section Extraction
-- Use LLM to extract structured sections from each profile
-- Only **active** sections are extracted (controlled via `active` flag in `section_prompt.yaml`)
-- Default active sections for need/skill matching:
-  - **Skills**: Concrete tools, techniques, and expertise the person can contribute
-  - **Vision**: Broader direction — values, long-term interests, collaboration style
-  - **Project**: Current project description — what they're building, its state, and next step
-  - **Needs**: Project gaps framed in concrete skill vocabulary (wanted-ad style, so they embed close to others' skills)
-- Smart caching prevents re-processing unchanged profiles
+```
+Adapters (own ALL IO)              Orchestration (choreo/runners.py)    Core stages (pure transforms)
+  main.py (CLI + FileStore)    →     run_full_match()            →     extract · hyde · embed ·
+  deploy_modal.py (Modal)            run_query_match()                 similarity (rectangular) ·
+  external app (own store)           run_batch_match()                 score · match · introduce · report
+```
 
-### Step 2.5: HyDE Descriptor Generation (NEW)
-- **Only runs when `cross_section_weights` are configured** (e.g., `needs_skills: 0.85`)
-- For each user's needs, an LLM generates a **hypothetical skill descriptor** — text written in the vocabulary of the target section (skills), describing what the ideal helper's profile would look like
-- This bridges the vocabulary gap: "make my installation respond to audience movement" becomes a skill-vocabulary descriptor that will have high embedding similarity with "computer vision, motion sensors, interactive installations"
-- Produces a list of `n_descriptors` HyDE phrasings per user (default 1, configurable)
-- Results are cached per user keyed by source text hash
+- **Schemas** (`choreo/schemas.py`): every stage's IO is a dataclass with
+  `to_dict`/`from_dict` (`ExtractedSections`, `EmbeddingsBundle`, `Edge`, …)
+- **Stage registry** (`choreo/stages.py`): `describe_stage(name)` returns each
+  stage's IO contract at runtime; per-stage `load`/`dump` helpers let stages
+  chain in-memory **or** via disk
+- **Store protocol** (`choreo/store.py`): `FileStore` is the reference adapter;
+  an external app implements the same protocol against its own DB
+- **Entry at any stage**: raw `Profile`s, pre-sectioned input, or a pre-built
+  `EmbeddingsBundle`
 
-### Step 3: Multi-Section Embedding
-- Generate vector embeddings for each user's active sections -> 3D tensor `(n_users, n_sections, embedding_dim)`
-- **Additionally embed HyDE descriptors** into a separate tensor per cross-section pair: `(n_users, n_descriptors, embedding_dim)`
-- Uses OpenRouter embedding models (default: `google/gemini-embedding-2-preview`)
+Deep dive: [docs/reference/stages_and_adapters.md](docs/reference/stages_and_adapters.md).
+Full IO spec for wrapping Choreo as an external tool: [choreo_IO.md](choreo_IO.md).
 
-### Step 3.5: t-SNE Visualization
-- Generate t-SNE plots showing user clusters in embedding space per section
+```python
+# Programmatic API (what external apps import)
+from choreo import run_full_match, run_query_match, run_batch_match, FileStore, load_config
 
-### Step 4: Directional Similarity Matrix Generation
-- **Same-section similarity** (symmetric): cosine similarity within each section (e.g., project-to-project)
-- **Cross-section similarity** (ASYMMETRIC): HyDE-bridged needs vs. regular skills embeddings
-  - `cross_sim[i][j]` = "how well can j's skills address i's needs" (using i's HyDE descriptor vs. j's skill embedding)
-  - `cross_sim[j][i]` = "how well can i's skills address j's needs" (different value!)
-  - With `n_descriptors > 1`, max-pooling finds the best-matching descriptor pair
-- Weighted fusion produces a **directional** fused matrix
-- A **symmetric** version `(dir + dir.T) / 2` is derived for b-matching and candidate selection
+run_full_match(profiles, config, store=FileStore("data/grp"))     # or sections, or a bundle
+run_query_match({"needs": "a CTO great at agents"}, pool_bundle, config)
+run_batch_match(["alice", "bob"], pool_bundle, config,
+                excluded_pairs=store.get_match_history(window_months=6),
+                pool_sections={s.id: s.sections for s in store.get_sections()})
+```
 
-### Step 5: Smart LLM Pair Scoring
-- Candidate pairs selected using the symmetric similarity matrix
-- LLM evaluates each pair holistically — produces a **single score per pair** (not directional)
-- The embedding-level asymmetry handles directionality; the LLM excels at holistic "is this a good match?" judgment
-- Batch processing for efficiency
+## How the matching works
 
-### Step 6: Greedy B-Matching
-- Blend normalized embedding scores + LLM scores: `final = embed_weight * embed + llm_weight * llm`
-- Run greedy b-matching on **symmetric** blended scores
-- Every user gets between `b_min` and `b_max` connections
-
-### Step 7: Directional Introduction Generation
-- For each matched pair, generate **directional introductions**:
-  - `intro_for_a`: What person B can specifically offer person A's project
-  - `intro_for_b`: What person A can specifically offer person B's project
-- Plus concrete starter topics for collaboration
-
-### Step 8: Report Generation
-- Per-user markdown reports with directional match reasoning
-- Cohort summary JSON with network statistics
-
-### Step 9: Visualization & Analytics
-- Similarity heatmaps for same-section and cross-section matrices
-- Score correlation plots (embedding vs. LLM scores)
+1. **Ingest** — load `.txt` profiles, content-hash for change detection
+2. **Extract** — LLM pulls structured sections (default: `skills`, `vision`, `project`, `needs`; controlled by `active` flags in `section_prompt.yaml`)
+3. **HyDE** — for each cross-section weight (e.g. `needs_skills`), an LLM rewrites the source section into target-section vocabulary; runs **only** when `cross_section_weights` is non-empty
+4. **Embed** — sections → `(n_users, n_sections, dim)` tensor + HyDE tensors; full-size vectors stored on disk, MRL-truncated at compute time (re-tunable without re-embedding)
+5. **Similarity** — rectangular at the core (source set × target set): same-section cosine (symmetric) + HyDE-bridged cross-section (asymmetric: `cross[i][j]` = "how well can j's skills address i's needs"), weight-fused into a directional matrix; the square cohort path symmetrizes `(dir + dir.T) / 2` for selection. Absent sections are neutral (masked), not zero — which is what lets a needs-only query drop into the same machinery
+6. **Score** — batched LLM pair scoring (N profiles per call → N·(N−1)/2 pairs), budgeted, novelty-aware
+7. **Match** — greedy b-matching on blended scores (`final = embed_weight·embed + llm_weight·llm`)
+8. **Introduce + report** — directional intros (what each person offers the *other's* project) + per-user reports, cohort summary, cost report, plots
 
 ## Configuration
 
-### Main Config (`config/config.yaml`)
-
-All models are routed through OpenRouter (use `provider/model` slugs):
+The canonical config ships inside the package (`choreo/defaults/config.yaml` +
+four prompt yamls; annotated schema in [CLAUDE.md](CLAUDE.md)). Override per
+use-case with a config dir (`--config-dir` / `load_config(config_dir=…)`:
+config.yaml deep-merges, prompt files replace) and/or per-call overrides
+(`--set dotted.key=value` / `load_config(overrides={…})`). All models are
+OpenRouter slugs (`provider/model`):
 
 ```yaml
 models:
   embedding: "google/gemini-embedding-2-preview"
-  embedding_dimensions: 768   # MRL truncation; null = full native size (3072)
+  embedding_dimensions: 1536   # MRL truncation; null = full native size (3072)
   extraction_llm: "google/gemini-3.1-flash-lite"
   pair_llm: "google/gemini-3.1-flash-lite"
-  enable_reasoning: false   # true only for reasoning-capable models
-
-instruction_prompt:
-  goal: "We are matching community residents who are working on their finals projects..."
+  reasoning_effort: "low"      # global default; pair scoring overrides to "medium"
 
 hyde:
-  n_descriptors: 1   # HyDE phrasings per source section (ready for >1 in future)
+  n_descriptors: 1             # HyDE phrasings per source section
 
 recipe:
-  section_weights:        # Same-section similarity weights (negative = dissimilarity preferred)
-    skills:   -0.10
-    vision:    0.30
-    project:   0.10
-    needs:     0.00
-  cross_section_weights:  # Cross-section similarity weights (DIRECTIONAL)
-    needs_skills: 0.80   # A's needs vs B's skills
+  section_weights:             # same-section (symmetric); negative = dissimilarity preferred
+    skills:  -0.10
+    vision:   0.30
+    project:  0.30
+    needs:   -0.10
+  cross_section_weights:       # cross-section (DIRECTIONAL); "<source>_<target>"
+    needs_skills: 0.80
 
 blending:
   embed_weight: 0.35
   llm_weight:   0.65
 
 matching:
-  b_min: 2
+  b_min: 3                     # min connections per user (member side in batch mode)
   b_max: 4
+  pool_b_max: null             # batch mode: optional pool-side degree cap
+  novelty_window_months: 6     # batch mode: exclusion window for past matches
+
+query:                         # Mode B defaults
+  top_k: 5
+  llm_rerank: true             # false = pure-embedding, cheaper
 ```
 
-### Section Config (`config/section_prompt.yaml`)
+Prompt files in `config/`: `section_prompt.yaml` (section definitions with
+`active` flags), `hyde_prompt.yaml`, `scoring_prompt.yaml`,
+`introduction_prompt.yaml`.
 
-Each section has an `active` flag:
-```yaml
-sections:
-  capabilities:
-    active: false          # Deactivated for need/skill mode
-    guideline: "..."
-  skills:
-    active: true           # Active for need/skill mode
-    guideline: "..."
-```
+### Switching matching modes (config only)
 
-### Switching Between Matching Modes
+To move between need/skill matching and symmetric social-connectivity matching:
 
-To switch from **need/skill matching** to a symmetric **social-connectivity** mode, only config changes are needed:
+1. `section_prompt.yaml`: flip `active` flags on the relevant sections
+2. `config.yaml`: adjust `section_weights`; set/clear `cross_section_weights`
+   (empty disables HyDE and directionality entirely)
+3. Swap `scoring_prompt.yaml` / `introduction_prompt.yaml` if the framing changes
 
-1. In `section_prompt.yaml`: define/activate the sections you want to match on (e.g. interests, goals, persona) via their `active` flags, and deactivate the rest.
-2. In `config.yaml`: set `section_weights` for those sections; remove/empty `cross_section_weights`.
-3. Swap scoring and introduction prompts to match the new framing.
+## Module map (`choreo/`)
 
-**No Python code changes required.** When `cross_section_weights` is empty, no HyDE step runs and the pipeline operates in fully symmetric mode.
+| Module | Purpose |
+|--------|---------|
+| `schemas.py` | Typed IO dataclasses for every stage |
+| `stages.py` | Stage registry: `describe_stage`, per-stage `load`/`dump` |
+| `store.py` | `Store` protocol + `FileStore` reference adapter |
+| `runners.py` | Public mode runners: full / query / batch |
+| `query.py` · `batch_match.py` | Mode B and Mode C logic |
+| `ingest.py` · `extract.py` · `hyde.py` · `embed.py` | Profile → sections → descriptors → embeddings |
+| `candidate.py` | Rectangular + square fused similarity |
+| `score.py` · `match.py` | LLM pair scoring · greedy b-matching |
+| `introduction.py` · `report.py` | Directional intros · report data + writing |
+| `llm.py` · `cost_tracker.py` | OpenRouter wrapper (caching, batching) · cost accounting |
+| `tsne.py` · `visualize_similarity.py` · `score_correlation.py` · `raw_data.py` | Plots + raw plot data |
 
-## Technical Architecture
+## Key design decisions
 
-```
-main.py                # Pipeline orchestration
-├── src/ingest.py      # Profile loading & validation
-├── src/extract.py     # LLM section extraction (active-section filtering)
-├── src/hyde.py        # HyDE descriptor generation (vocabulary bridging)
-├── src/embed.py       # Multi-section + HyDE embedding generation
-├── src/candidate.py   # Directional similarity fusion & candidate generation
-├── src/score.py       # Batched LLM pair scoring
-├── src/match.py       # Greedy b-matching algorithm
-├── src/introduction.py # Directional introduction generation
-├── src/report.py      # Report generation & templating
-├── src/visualize_similarity.py  # Similarity heatmaps
-├── src/tsne.py        # t-SNE visualization
-├── src/llm.py         # LLM wrapper with caching & cost tracking
-├── src/utils.py       # Utilities, score normalization, I/O helpers
-└── src/cost_tracker.py # API cost tracking
-
-config/
-├── config.yaml              # Main pipeline configuration
-├── section_prompt.yaml      # Section definitions with active flags
-├── scoring_prompt.yaml      # LLM pair scoring prompt
-├── introduction_prompt.yaml # Directional introduction prompt
-└── hyde_prompt.yaml         # HyDE descriptor generation prompt
-```
-
-## Key Design Decisions
-
-- **Pair IDs**: Always alphabetically sorted for stability (`alice_bob` not `bob_alice`) — see `utils.stable_pair_id()`
-- **Caching**: Hash-based change detection at every step (extraction, HyDE, embeddings) prevents re-processing
-- **Lists by default**: HyDE descriptors are always stored as lists, even with `n_descriptors=1`. Same code path handles 1 or many descriptors.
-- **Directionality preserved**: The asymmetric cross-section matrix is never symmetrized during computation — symmetry is an aggregation choice made at the matching layer
-- **Backward compatible**: When `cross_section_weights` is absent/empty, the pipeline behaves identically to the original symmetric mode
+- **Pair IDs** are alphabetically sorted for stability (`alice_bob`, never `bob_alice`) — `utils.stable_pair_id()`
+- **Embedding ownership stays in-repo**: external stores hold the bundle (`EmbeddingsBundle.to_dict()`) and hand it back; bundles carry `embedding_model` + `dim` provenance, and a model mismatch raises or triggers a full re-embed
+- **Determinism is load-bearing**: anything feeding an LLM prompt or cache key iterates in sorted order; cache keys use sha256 (`utils.hash_text`), never the salted builtin `hash()`
+- **Directionality preserved at the core**: the asymmetric matrix is never symmetrized during computation — symmetrization is an aggregation choice on the square cohort path only
+- **Backward compatible**: empty `cross_section_weights` → no HyDE, fully symmetric mode
 
 ## Requirements
 
-- Python 3.9+
+- Python ≥ 3.11, managed with [uv](https://docs.astral.sh/uv/)
 - OpenRouter API key (in `.env` as `OPENROUTER_API_KEY`)
-- See `pyproject.toml` for full dependency list
 
-## Deployment
+## Deployment (Modal)
 
 ```bash
-# Local
-uv run python main.py --group <group_name> --force
-
-# Modal (serverless)
-uv run modal deploy deploy_modal.py
-uv run modal run deploy_modal.py::run_matching_pipeline --user-profiles-json=profiles.json
+uv run modal deploy deploy_modal.py                              # deploy all functions
+uv run modal run deploy_modal.py --input-dir data/test4 --force  # legacy full run
 ```
+
+Granular endpoints persist a `FileStore` per group on the `choreo-data` Volume:
+`upsert_profiles(user_profiles_json, group)` · `query_match(payload_json, group)` ·
+`batch_match(members_json, group)` — see the header of `deploy_modal.py` and
+[choreo_IO.md](choreo_IO.md) §1.4. Requires a `choreo-secrets` Modal secret
+holding `OPENROUTER_API_KEY` (add `AWS_*` keys to also push outputs to S3).

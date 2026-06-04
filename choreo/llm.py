@@ -10,13 +10,14 @@ model strings in config.yaml under `models:` (e.g. "google/gemini-3.1-flash-lite
 import os
 import json
 import asyncio
+import concurrent.futures
 from typing import Dict, Any, Optional, List
 
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 
-from utils import get_cache_path, load_json, save_json, ensure_dir
-from cost_tracker import get_cost_tracker
+from .utils import get_cache_path, load_json, save_json, ensure_dir
+from .cost_tracker import get_cost_tracker
 
 # Load environment variables (OPENROUTER_API_KEY) from the repo-root .env if present.
 load_dotenv()
@@ -199,14 +200,43 @@ class JSONExtractionError(ValueError):
     """
 
 
+def run_coro_blocking(coro):
+    """Run an async coroutine to completion from synchronous code.
+
+    From a plain sync context this is just ``asyncio.run`` (which also cancels
+    any tasks still pending when its loop shuts down — no manual cleanup
+    needed). When called from INSIDE a running event loop — e.g. choreo
+    imported by an async web backend or MCP server — ``asyncio.run`` raises
+    ``RuntimeError: cannot be called from a running event loop``, which the
+    pipeline's broad exception handlers used to swallow, silently degrading to
+    embedding-only scores. Here the coroutine instead runs on a fresh loop in a
+    worker thread and we block on its result, so both contexts work.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
     
-    def __init__(self, cache_dir: str, max_retries: int = 3, reasoning_effort: Optional[str] = "low"):
-        self.cache_dir = ensure_dir(cache_dir) / "llm"
-        ensure_dir(self.cache_dir)
+    def __init__(self, cache_dir: Optional[str] = None, max_retries: int = 3, reasoning_effort: Optional[str] = "low"):
+        # cache_dir=None disables the file-based response cache entirely
+        # (in-memory pipeline runs, e.g. transient query matching).
+        if cache_dir:
+            self.cache_dir = ensure_dir(cache_dir) / "llm"
+            ensure_dir(self.cache_dir)
+        else:
+            self.cache_dir = None
         self.max_retries = max_retries
         self.call_count = 0
+        # Number of new responses written to the file cache this run. Lets an
+        # adapter skip persistence work (e.g. Modal volume.commit) when a call
+        # was served entirely from cache and nothing on disk changed.
+        self.cache_writes = 0
         self.cost_tracker = get_cost_tracker()
         self.current_component = None  # Will be set by calling code
         # Default reasoning effort forwarded to OpenRouter (xhigh|high|medium|
@@ -402,7 +432,7 @@ class LLMWrapper:
         uncached_indices = []
         
         for i, (prompt, cache_key, schema_hint) in enumerate(zip(prompts, cache_keys, schema_hints)):
-            if cache_key:
+            if cache_key and self.cache_dir:
                 cache_path = get_cache_path(self.cache_dir, cache_key)
                 if cache_path.exists():
                     try:
@@ -482,7 +512,7 @@ class LLMWrapper:
     ) -> Dict[str, Any]:
         """Single async JSON completion with retry logic."""
         # Check cache first
-        if cache_key:
+        if cache_key and self.cache_dir:
             cache_path = get_cache_path(self.cache_dir, cache_key)
             if cache_path.exists():
                 try:
@@ -530,10 +560,11 @@ class LLMWrapper:
                 result = self._extract_json(content.strip())
                 
                 # Cache result
-                if cache_key:
+                if cache_key and self.cache_dir:
                     try:
                         cache_path = get_cache_path(self.cache_dir, cache_key)
                         save_json(result, cache_path)
+                        self.cache_writes += 1
                     except Exception as e:
                         print(f"Warning: Failed to save cache {cache_path}: {e}")
                 

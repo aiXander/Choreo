@@ -1,45 +1,47 @@
 [project]
-name = "Choreo"
+name = "choreo"
 version = "0.1.0"
-description = "User profile matching system using LLM embeddings and processing"
-authors = [{name = "Xander", email = "xander@eden.art"}]
+description = "AI matchmaking toolkit — extract, embed, and directionally match free-text profiles"
+authors = [{ name = "Xander Steenbrugge", email = "xander@eden.art" }]
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.3.3",
-    "scikit-learn>=1.7.2",
-    "matplotlib>=3.10.6",
-    "seaborn>=0.13.0",
     "openai>=1.30.0",
     "pyyaml>=6.0.2",
-    "tqdm>=4.66.2",
-    "python-dotenv>=1.0.1"
+    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]
+# Plotting adapters (choreo.tsne, choreo.visualize_similarity,
+# choreo.score_correlation) — not needed for the matching compute itself.
+plots = [
+    "matplotlib>=3.10.6",
+    "seaborn>=0.13.0",
+    "scikit-learn>=1.7.2",
+]
+
+[dependency-groups]
+# `uv sync` installs this by default: the full local dev experience
+# (tests + the CLI's plotting steps). Downstream installs stay slim.
 dev = [
-    "pytest>=7.0.0",
-    "black>=22.0.0",
-    "isort>=5.10.0",
-    "mypy>=0.991",
+    "pytest>=9.0.3",
+    "matplotlib>=3.10.6",
+    "seaborn>=0.13.0",
+    "scikit-learn>=1.7.2",
 ]
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.setuptools.packages.find]
-include = ["src*"]
+[tool.hatch.build.targets.wheel]
+# choreo/defaults/*.yaml ships as package data automatically (hatchling
+# includes every file inside the package directory).
+packages = ["choreo"]
 
-[tool.black]
-line-length = 88
-target-version = ['py311']
+[tool.ruff]
+line-length = 100
+target-version = "py311"
 
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
+[tool.pytest.ini_options]
+testpaths = ["tests"]

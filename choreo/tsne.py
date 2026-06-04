@@ -4,8 +4,8 @@ import numpy as np
 from pathlib import Path
 from typing import List
 
-from utils import ensure_dir
-from raw_data import save_tsne_raw_data
+from .utils import ensure_dir
+from .raw_data import save_tsne_raw_data
 
 
 def create_tsne_plots(
@@ -80,7 +80,7 @@ def create_tsne_plots(
 
         # Create plot
         plt.figure(figsize=(10, 8))
-        scatter = plt.scatter(
+        plt.scatter(
             tsne_coords[:, 0], 
             tsne_coords[:, 1], 
             alpha=0.7,
@@ -132,7 +132,7 @@ def create_tsne_plots(
     
     # Create combined plot
     plt.figure(figsize=(12, 9))
-    scatter = plt.scatter(
+    plt.scatter(
         tsne_coords_combined[:, 0], 
         tsne_coords_combined[:, 1], 
         alpha=0.7,

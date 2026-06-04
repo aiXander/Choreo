@@ -19,7 +19,7 @@ metadata), so it stays usable as an API building block.
 SECRET
 ------
 The attached secret ``choreo-secrets`` must contain ``OPENROUTER_API_KEY`` (all
-LLM + embedding calls route through OpenRouter — see src/llm.py). To also enable
+LLM + embedding calls route through OpenRouter — see choreo/llm.py). To also enable
 S3 upload, add AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION_NAME /
 AWS_BUCKET_NAME to that same secret.
 
@@ -28,7 +28,7 @@ Create it from your local .env with:
 
 COMMANDS
 --------
-# Deploy the function (callable via .remote / .spawn from other apps)
+# Deploy the functions (callable via .remote / .spawn from other apps)
 modal deploy deploy_modal.py
 
 # Run a matching job from a local folder of .txt profiles (one file per user).
@@ -42,6 +42,22 @@ modal run deploy_modal.py --profiles-json profiles.json
 modal app list
 modal app logs choreo-matching
 modal volume ls choreo-data
+
+GRANULAR ENDPOINTS (persistent FileStore at groups/<group> on the Volume)
+--------------------------------------------------------------------------
+Besides the legacy full run, three mode endpoints are exposed for standalone
+Modal use. (In the real product the app imports the runners directly with its
+own data; these endpoints are the FileStore-backed convenience path.)
+
+  upsert_profiles(user_profiles_json, group)   # Mode A: extract+HyDE+embed,
+                                               # incremental via content hashes
+  query_match(payload_json, group)             # Mode B: 1×M ranked shortlist
+  batch_match(members_json, group)             # Mode C: M×N novel matches,
+                                               # history on the Volume
+
+e.g. from another app:
+  f = modal.Function.from_name("choreo-matching", "upsert_profiles")
+  f.remote(json.dumps({"alice": "profile text…"}), group="wintercircus")
 """
 
 import modal
@@ -72,16 +88,16 @@ image = (
             "seaborn>=0.13.0",
             "openai>=1.30.0",
             "pyyaml>=6.0.2",
-            "tqdm>=4.66.2",
             "python-dotenv>=1.0.1",
             "boto3>=1.34.0",
         ]
     )
-    .add_local_dir("src", "/app/src", copy=True)
-    .add_local_dir("config", "/app/config", copy=True)
+    # The choreo package ships its default config + prompts as package data
+    # (choreo/defaults/), so copying the package dir is all that's needed.
+    .add_local_dir("choreo", "/app/choreo", copy=True)
     .add_local_file("main.py", "/app/main.py", copy=True)
     .workdir("/app")
-    .env({"PYTHONPATH": "/app:/app/src", "MPLBACKEND": "Agg"})
+    .env({"PYTHONPATH": "/app", "MPLBACKEND": "Agg"})
 )
 
 app = modal.App(
@@ -189,14 +205,15 @@ def maybe_upload_zip_to_s3(zip_path: str) -> Optional[str]:
 )
 def run_matching_pipeline(
     user_profiles_json: str,
-    config_path: str = "config/config.yaml",
+    config_overrides_json: Optional[str] = None,
     force: bool = False,
 ) -> Dict[str, Any]:
     """Run the Choreo matching pipeline on a JSON map of profiles.
 
     Args:
         user_profiles_json: JSON object string ``{user_id: profile_text}``.
-        config_path: Path (inside the image) to the config YAML.
+        config_overrides_json: Optional JSON object deep-merged over the
+            packaged default config (see choreo/config.py).
         force: Re-run every step, ignoring caches.
 
     Returns:
@@ -206,7 +223,6 @@ def run_matching_pipeline(
         URL, or None when S3 isn't configured). On failure: ``{"success": False,
         "error": ...}``.
     """
-    import yaml
     from main import run_matching_pipeline as run_pipeline
 
     # Parse profiles -------------------------------------------------------
@@ -218,14 +234,11 @@ def run_matching_pipeline(
     if not user_profiles:
         return {"success": False, "error": "No user profiles provided."}
 
-    # Load config ----------------------------------------------------------
+    # Load config (packaged defaults + optional overrides) ------------------
     try:
-        with open(config_path, "r") as f:
-            config_dict = yaml.safe_load(f)
-    except FileNotFoundError:
-        return {"success": False, "error": f"Configuration file not found: {config_path}"}
-    except yaml.YAMLError as e:
-        return {"success": False, "error": f"Invalid YAML in configuration file: {e}"}
+        config_dict = _load_config(config_overrides_json)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON in config_overrides_json: {e}"}
 
     config_dict.setdefault("io", {})
 
@@ -295,6 +308,275 @@ def run_matching_pipeline(
         }
     )
     return _to_jsonable(response)
+
+
+# ---------------------------------------------------------------------------
+# Granular mode endpoints (Mode A/B/C) — persistent FileStore per group
+# ---------------------------------------------------------------------------
+def _group_store(group: str):
+    """FileStore rooted at the group's directory on the Volume."""
+    from choreo.store import FileStore
+
+    return FileStore(f"{VOLUME_MOUNT}/groups/{group}")
+
+
+# Warm-container cache of each group's loaded pool (bundle + sections), keyed
+# on the on-disk file signature so it invalidates automatically when
+# upsert_profiles rewrites the embeds/sections (including writes committed by
+# OTHER containers — endpoints call volume.reload() first).
+_POOL_CACHE: Dict[str, tuple] = {}
+
+
+def _pool_signature(store) -> tuple:
+    sig = []
+    for path in (
+        Path(store.embeds_dir) / "vectors.npz",
+        Path(store.embeds_dir) / "bundle_meta.json",
+        store.sections_file,
+    ):
+        try:
+            st = os.stat(path)
+            sig.append((str(path), st.st_mtime_ns, st.st_size))
+        except FileNotFoundError:
+            sig.append((str(path), None, None))
+    return tuple(sig)
+
+
+def _get_group_pool(group: str, store):
+    """Load (or reuse) the group's embeddings bundle + sections.
+
+    Avoids re-reading the full-size vectors.npz and re-parsing sections.jsonl
+    on every warm query — the pool only changes on upsert.
+    """
+    sig = _pool_signature(store)
+    cached = _POOL_CACHE.get(group)
+    if cached and cached[0] == sig:
+        return cached[1], cached[2]
+    bundle = store.get_embeddings()  # raises FileNotFoundError if absent
+    sections = {s.id: s.sections for s in store.get_sections()}
+    _POOL_CACHE[group] = (sig, bundle, sections)
+    return bundle, sections
+
+
+def _load_config(config_overrides_json: Optional[str] = None) -> Dict[str, Any]:
+    """Packaged default config, deep-merged with optional JSON overrides."""
+    from choreo.config import load_config
+
+    overrides = json.loads(config_overrides_json) if config_overrides_json else None
+    return load_config(overrides=overrides)
+
+
+@app.function(image=image, volumes={VOLUME_MOUNT: volume}, cpu=2.0, timeout=3600)
+def upsert_profiles(
+    user_profiles_json: str,
+    group: str = "default",
+    config_overrides_json: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Mode A: upsert profiles into a group's persistent store.
+
+    Extracts sections (content-hash cached — unchanged profiles skip the LLM),
+    regenerates HyDE for the whole roster (cached per content hash), and
+    re-embeds ONLY changed/new cells (content-hash diff). The refreshed
+    sections + embeddings bundle persist on the Volume for query/batch calls.
+
+    ``user_profiles_json`` values are either plain profile text or
+    ``{"text": ..., "last_updated_at": "<ISO-8601>"}`` — the latter lets an
+    external store propagate its own updated_at timestamps onto the derived
+    sections/embeddings (defaults to "now" when omitted).
+    """
+    from choreo.utils import hash_text, filter_active_sections, load_yaml, utc_now_iso, DEFAULT_PROMPT_PATHS
+    from choreo.ingest import Profile
+    from choreo.llm import LLMWrapper
+    from choreo.extract import extract_sections
+    from choreo.hyde import generate_hyde_descriptors
+    from choreo.embed import create_section_embeddings_bundle
+    from pathlib import Path as _Path
+
+    try:
+        user_profiles = json.loads(user_profiles_json)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON in user_profiles_json: {e}"}
+    if not user_profiles:
+        return {"success": False, "error": "No user profiles provided."}
+
+    volume.reload()  # see writes committed by other containers
+    config = _load_config(config_overrides_json)
+    store = _group_store(group)
+    models_cfg = config.get("models", {})
+    llm_wrapper = LLMWrapper(
+        cache_dir=str(store.cache_dir),
+        reasoning_effort=models_cfg.get("reasoning_effort", "low"),
+    )
+    goal = config.get("instruction_prompt", {}).get("goal")
+
+    now = utc_now_iso()
+    profiles = []
+    for user_id, value in user_profiles.items():
+        if isinstance(value, dict):
+            text = (value.get("text") or "").strip()
+            ts = value.get("last_updated_at") or now
+        else:
+            text, ts = value.strip(), now
+        profiles.append(Profile(id=user_id, text=text, hash=hash_text(text),
+                                last_updated_at=ts))
+
+    # Extract (upsert semantics: force only re-extracts the GIVEN profiles,
+    # it never wipes the rest of the roster).
+    sections_config = filter_active_sections(load_yaml(DEFAULT_PROMPT_PATHS["sections"]))
+    existing_by_hash = {} if force else {s.hash: s.sections for s in store.get_sections()}
+    failed: list = []
+    extracted = extract_sections(
+        profiles=profiles,
+        sections_config=sections_config,
+        model=models_cfg.get("extraction_llm"),
+        llm_wrapper=llm_wrapper,
+        goal=goal,
+        existing=existing_by_hash,
+        max_calls=config.get("budgets", {}).get("extraction_llm_calls", 300),
+        use_llm_cache=not force,
+        failed_out=failed,
+    )
+    store.put_sections([es for es in extracted if es.id not in set(failed)])
+
+    # HyDE + embed over the FULL roster — content-hash caches make this
+    # incremental (only new/changed users actually hit the APIs).
+    all_sections = store.get_sections()
+    cross_weights = config.get("recipe", {}).get("cross_section_weights", {}) or {}
+    hyde_descriptors = {}
+    if cross_weights:
+        hyde_prompt_template = load_yaml(DEFAULT_PROMPT_PATHS["hyde"])["hyde_generation"]
+        hyde_descriptors = generate_hyde_descriptors(
+            extracted_sections=all_sections,
+            cross_section_weights=cross_weights,
+            hyde_config=config.get("hyde", {}),
+            prompt_template=hyde_prompt_template,
+            goal=goal,
+            llm_wrapper=llm_wrapper,
+            model=models_cfg.get("extraction_llm"),
+            cache_dir=_Path(store.processed_dir),
+            sections_config=load_yaml(DEFAULT_PROMPT_PATHS["sections"]),
+            force=force,
+        )
+
+    bundle = create_section_embeddings_bundle(
+        extracted_sections=all_sections,
+        embedding_model=models_cfg.get("embedding"),
+        embeds_dir=str(store.embeds_dir),
+        hyde_descriptors=hyde_descriptors or None,
+        force=force,
+    )
+
+    volume.commit()
+    _POOL_CACHE.pop(group, None)  # next query/batch reloads the fresh pool
+    return _to_jsonable({
+        "success": True,
+        "group": group,
+        "upserted": [p.id for p in profiles],
+        "failed": failed,
+        "roster_size": len(bundle.user_ids),
+        "embedding_model": bundle.embedding_model,
+        "embedding_dim": bundle.dim,
+    })
+
+
+@app.function(image=image, volumes={VOLUME_MOUNT: volume}, cpu=2.0, timeout=1800)
+def query_match(
+    payload_json: str,
+    group: str = "default",
+    config_overrides_json: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Mode B: rank the group's stored pool against one query (the hot path).
+
+    ``payload_json``: {"query": "raw text" | {"needs": "…"}, "top_k": …,
+    "llm_rerank": …, "recipe_override": …, "exclude_ids": […]}. The pool is
+    read from the group's Volume store and never re-embedded.
+    """
+    from choreo.llm import LLMWrapper
+    from choreo.query import run_query_match_json
+
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON in payload_json: {e}"}
+
+    volume.reload()  # see writes committed by other containers (e.g. upserts)
+    config = _load_config(config_overrides_json)
+    store = _group_store(group)
+    if not payload.get("pool"):  # honor a caller-supplied inline pool
+        try:
+            pool, pool_sections = _get_group_pool(group, store)
+        except FileNotFoundError:
+            return {"success": False,
+                    "error": f"No embeddings for group '{group}' — call upsert_profiles first."}
+        payload["pool"] = pool
+        payload.setdefault("pool_sections", pool_sections)
+
+    llm_wrapper = LLMWrapper(
+        cache_dir=str(store.cache_dir),
+        reasoning_effort=config.get("models", {}).get("reasoning_effort", "low"),
+    )
+    result = run_query_match_json(payload, config, llm_wrapper=llm_wrapper)
+    if llm_wrapper.cache_writes:  # nothing to persist on a fully cache-hit call
+        volume.commit()
+    return _to_jsonable(result)
+
+
+@app.function(image=image, volumes={VOLUME_MOUNT: volume}, cpu=2.0, timeout=3600)
+def batch_match(
+    members_json: str,
+    group: str = "default",
+    config_overrides_json: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Mode C: match a member subset against the group's pool, novel pairs only.
+
+    ``members_json``: JSON array of member ids. Pairs surfaced within
+    ``matching.novelty_window_months`` (from the group's match_history.jsonl
+    on the Volume) are excluded; this run's new pairs are appended back.
+    """
+    from choreo.llm import LLMWrapper
+    from choreo.batch_match import run_batch_match
+
+    try:
+        member_ids = json.loads(members_json)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON in members_json: {e}"}
+    if not isinstance(member_ids, list) or not member_ids:
+        return {"success": False, "error": "members_json must be a non-empty JSON array of user ids"}
+
+    volume.reload()  # see writes committed by other containers (e.g. upserts)
+    config = _load_config(config_overrides_json)
+    store = _group_store(group)
+
+    try:
+        pool, pool_sections = _get_group_pool(group, store)
+    except FileNotFoundError:
+        return {"success": False,
+                "error": f"No embeddings for group '{group}' — call upsert_profiles first."}
+
+    novelty_window = config.get("matching", {}).get("novelty_window_months", 6)
+    excluded_pairs = store.get_match_history(window_months=novelty_window)
+
+    llm_wrapper = LLMWrapper(
+        cache_dir=str(store.cache_dir),
+        reasoning_effort=config.get("models", {}).get("reasoning_effort", "low"),
+    )
+
+    try:
+        result = run_batch_match(
+            member_ids=member_ids,
+            pool=pool,
+            config=config,
+            excluded_pairs=excluded_pairs,
+            pool_sections=pool_sections,
+            llm_wrapper=llm_wrapper,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        return {"success": False, "error": f"batch_match failed: {e}"}
+
+    store.put_matches(result.edges)
+    volume.commit()
+    return _to_jsonable({"success": True, "group": group, **result.to_dict()})
 
 
 # ---------------------------------------------------------------------------

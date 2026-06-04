@@ -1,22 +1,36 @@
 """Introduction and conversation starter generation for matched pairs."""
 
 from typing import List, Dict
-from dataclasses import dataclass
-import asyncio
 
-from llm import LLMWrapper
-from utils import load_yaml
-from match import Edge
+from .llm import LLMWrapper, run_coro_blocking
+from .utils import load_yaml, hash_text
+from .schemas import Edge, Introduction  # noqa: F401 — Introduction re-exported
 
 
-@dataclass
-class Introduction:
-    """Generated introduction for a matched pair."""
-    pair_id: str
-    user1: str
-    user2: str
-    intro: str
-    starter_topics: str
+def fallback_introduction(pair_id: str, user1: str, user2: str) -> Introduction:
+    """Generic fallback when intro generation failed/was skipped for a pair."""
+    return Introduction(
+        pair_id=pair_id,
+        user1=user1,
+        user2=user2,
+        intro=(
+            f"For {user1}: You've been matched with {user2} — "
+            f"explore how their skills could support your project.\n\n"
+            f"For {user2}: You've been matched with {user1} — "
+            f"explore how their skills could support your project."
+        ),
+        starter_topics=(
+            "• Share what you're each building • Identify where your skills "
+            "meet the other's needs • Plan a concrete next step"
+        ),
+    )
+
+
+def attach_fallback_intro(edge: Edge) -> None:
+    """Attach the generic fallback intro text directly onto an edge."""
+    fallback = fallback_introduction(edge.pair_id, edge.user1, edge.user2)
+    edge.intro = fallback.intro
+    edge.starter_topics = fallback.starter_topics
 
 
 def build_introduction_prompt(
@@ -59,14 +73,15 @@ def generate_introductions_for_matches(
     sections_dict: Dict[str, Dict[str, str]],
     instruction: str,
     goal: str,
-    introduction_config_path: str,
-    llm_wrapper: LLMWrapper,
-    model: str,
-    force: bool = False
+    introduction_config_path: str = None,
+    llm_wrapper: LLMWrapper = None,
+    model: str = None,
+    force: bool = False,
+    prompt_template: str = None,
 ) -> Dict[str, Introduction]:
     """
     Generate introductions and conversation starters for final matched pairs.
-    
+
     Args:
         final_edges: List of final matched edges
         sections_dict: Dictionary mapping user_id to their sections
@@ -76,13 +91,17 @@ def generate_introductions_for_matches(
         llm_wrapper: LLM wrapper instance
         model: LLM model name
         force: Force re-generation
-        
+        prompt_template: The introduction_generation template string itself
+            (keeps the transform free of file IO; takes precedence over
+            introduction_config_path)
+
     Returns:
         Dictionary mapping pair_id to Introduction
     """
     # Load prompt template
-    introduction_config = load_yaml(introduction_config_path)
-    prompt_template = introduction_config['introduction_generation']
+    if prompt_template is None:
+        introduction_config = load_yaml(introduction_config_path)
+        prompt_template = introduction_config['introduction_generation']
     
     introductions = {}
     
@@ -115,7 +134,12 @@ def generate_introductions_for_matches(
         )
         prompts.append(prompt)
         
-        cache_key = None if force else f"intro_{edge.pair_id}_{hash(instruction)}"
+        # Cache key = pair_id (readability) + hash of the full prompt, which
+        # embeds both profiles' section CONTENT plus instruction/goal/template
+        # — so an edited profile invalidates its intros automatically instead
+        # of replaying stale prose. hash_text (sha256) — NOT the builtin
+        # hash(), which is salted per process and would never hit across runs.
+        cache_key = None if force else f"intro_{edge.pair_id}_{hash_text(prompt)}"
         cache_keys.append(cache_key)
         
         valid_edges.append(edge)
@@ -123,26 +147,13 @@ def generate_introductions_for_matches(
     if valid_edges:
         # Run batch introduction generation
         llm_wrapper.set_component("introduction_generation")
-        
-        async def _async_generate_with_cleanup():
-            """Run batch introduction generation with proper async cleanup."""
-            try:
-                responses = await llm_wrapper.batch_json_complete(
-                    prompts=prompts,
-                    model=model,
-                    cache_keys=cache_keys
-                )
-                return responses
-            finally:
-                # Force cleanup of any remaining tasks
-                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-                if tasks:
-                    for task in tasks:
-                        task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
-            responses = asyncio.run(_async_generate_with_cleanup())
+            responses = run_coro_blocking(llm_wrapper.batch_json_complete(
+                prompts=prompts,
+                model=model,
+                cache_keys=cache_keys,
+            ))
             
             # Process batch responses
             for edge, response in zip(valid_edges, responses):
@@ -172,20 +183,9 @@ def generate_introductions_for_matches(
                     
                 except Exception as e:
                     print(f"Error processing introduction response for edge {edge.pair_id}: {e}")
-                    # Create fallback introduction
-                    introduction = Introduction(
-                        pair_id=edge.pair_id,
-                        user1=edge.user1,
-                        user2=edge.user2,
-                        intro=(
-                            f"For {edge.user1}: You've been matched with {edge.user2} — "
-                            f"explore how their skills could support your project.\n\n"
-                            f"For {edge.user2}: You've been matched with {edge.user1} — "
-                            f"explore how their skills could support your project."
-                        ),
-                        starter_topics="• Share what you're each building • Identify where your skills meet the other's needs • Plan a concrete next step"
+                    introductions[edge.pair_id] = fallback_introduction(
+                        edge.pair_id, edge.user1, edge.user2
                     )
-                    introductions[edge.pair_id] = introduction
                     continue
             
         except Exception as e:

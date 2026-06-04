@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
 
-from utils import ensure_dir
+from .utils import ensure_dir
 
 
 def create_normalized_score_correlation_plot(

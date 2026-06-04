@@ -3,23 +3,56 @@
 import json
 import hashlib
 import yaml
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
+
+
+# Default config + prompt files shipped INSIDE the package (choreo/defaults/),
+# so they resolve regardless of the caller's working directory — CLI, pytest,
+# a Modal container or an external app importing choreo all see the same
+# canonical defaults. Override per use-case via `choreo.config.load_config(
+# config_dir=...)` / `resolve_prompt_paths(...)`, or per-run via config
+# `prompt_files:`/`prompts:` keys.
+DEFAULTS_DIR = Path(__file__).resolve().parent / "defaults"
+
+PROMPT_FILENAMES = {
+    "sections": "section_prompt.yaml",
+    "scoring": "scoring_prompt.yaml",
+    "introduction": "introduction_prompt.yaml",
+    "hyde": "hyde_prompt.yaml",
+}
+
+DEFAULT_PROMPT_PATHS = {
+    key: str(DEFAULTS_DIR / fname) for key, fname in PROMPT_FILENAMES.items()
+}
+
+
+def _unit_normalize(vectors: np.ndarray) -> np.ndarray:
+    """L2-normalize rows; zero vectors stay zero (norm clamped to 1)."""
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    return vectors / norms
 
 
 def cosine_matrix(vectors: np.ndarray) -> np.ndarray:
     """Compute pairwise cosine similarity matrix for a set of vectors using vectorized operations."""
-    # Normalize vectors to unit length
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    # Handle zero vectors
-    norms = np.where(norms == 0, 1, norms)
-    normalized_vectors = vectors / norms
-    
+    normalized_vectors = _unit_normalize(vectors)
     # Compute similarity matrix with single matrix multiplication
     similarity_matrix = np.dot(normalized_vectors, normalized_vectors.T)
-    
+
     return similarity_matrix
+
+
+def cosine_rect(source_vectors: np.ndarray, target_vectors: np.ndarray) -> np.ndarray:
+    """Rectangular cosine similarity: (n_source, dim) × (n_target, dim) -> (n_source, n_target).
+
+    Uses the exact same normalization rule as ``cosine_matrix`` (zero vectors
+    clamped, not NaN), so ``cosine_rect(A, A) == cosine_matrix(A)`` bit-exactly
+    — the WS2 square-mode regression guarantee.
+    """
+    return np.dot(_unit_normalize(source_vectors), _unit_normalize(target_vectors).T)
 
 
 def stable_pair_id(u: str, v: str) -> str:
@@ -30,6 +63,38 @@ def stable_pair_id(u: str, v: str) -> str:
 def hash_text(text: str) -> str:
     """Create a stable hash for text content."""
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+
+
+def utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 string — the canonical timestamp format
+    for every ``last_updated_at`` field in the pipeline."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_stale(artifact_ts: Optional[str], source_ts: Optional[str]) -> bool:
+    """Whether a derived artifact is stale w.r.t. the data it was computed from.
+
+    Both arguments are ISO-8601 ``last_updated_at`` strings (or None when
+    unknown). An artifact is fresh when its timestamp matches or supersedes the
+    source's. Content hashes remain the *internal* invalidation mechanism
+    (exact, change-proof); timestamps are the adapter-level freshness signal —
+    an external store (e.g. a Neon ``updated_at`` column) compares its row
+    timestamps against the ones choreo propagates onto sections/embeddings to
+    decide whether to re-run upstream stages.
+
+    Rules:
+      - no source timestamp  -> not stale (nothing to compare against)
+      - no artifact timestamp but source has one -> stale (provenance unknown)
+      - unparsable timestamp -> stale (safe side)
+    """
+    if not source_ts:
+        return False
+    if not artifact_ts:
+        return True
+    try:
+        return datetime.fromisoformat(artifact_ts) < datetime.fromisoformat(source_ts)
+    except ValueError:
+        return True
 
 
 def parse_cross_key(cross_key: str) -> Tuple[str, str]:
@@ -221,59 +286,77 @@ def prepare_normalized_scores(
     candidates: List,  # List[CandidatePair] - avoiding import here
     llm_scores: Dict[str, Any],  # Dict[str, PairScore] - avoiding import here
     full_similarity_matrix: np.ndarray = None,
-    all_user_ids: List[str] = None
+    all_user_ids: List[str] = None,
+    reference_scores: np.ndarray = None,
 ) -> Tuple[Dict[str, float], Dict[str, float], bool]:
     """
     Prepare normalized embedding and LLM scores for final weight computation.
-    
+
+    The reference distribution is an EXPLICIT input: pass ``reference_scores``
+    (a flat array of comparable similarity values — e.g. all entries of a
+    rectangular member×pool matrix, or caller-supplied stable stats from an
+    external store) and it is used directly. The legacy square-cohort behavior
+    — deriving the reference from the upper triangle of
+    ``full_similarity_matrix`` — only kicks in when ``reference_scores`` is not
+    given. This keeps query/subset scores comparable across runs of different
+    size instead of being silently rescaled by whatever cohort happened to be
+    in the current matrix.
+
     Args:
         candidates: All candidate pairs
         llm_scores: LLM scores by pair_id
-        full_similarity_matrix: Full similarity matrix for reference distribution (optional)
+        full_similarity_matrix: Full square similarity matrix for the legacy
+            reference derivation (optional)
         all_user_ids: All user IDs corresponding to similarity matrix (optional)
-        
+        reference_scores: Explicit flat reference distribution (optional;
+            takes precedence)
+
     Returns:
         Tuple of (normalized_embed_lookup, normalized_llm_lookup, normalization_applied)
     """
     # Check if we can apply normalization
-    should_normalize = (
-        full_similarity_matrix is not None and 
-        all_user_ids is not None and 
-        len(llm_scores) > 0
+    should_normalize = len(llm_scores) > 0 and (
+        reference_scores is not None
+        or (full_similarity_matrix is not None and all_user_ids is not None)
     )
-    
+
     normalized_embed_lookup = {}
     normalized_llm_lookup = {}
-    
-    if not should_normalize:
-        # Return original scores without normalization
+
+    def _passthrough() -> Tuple[Dict[str, float], Dict[str, float], bool]:
+        """Fallback: return the original scores without normalization."""
         for candidate in candidates:
             normalized_embed_lookup[candidate.pair_id] = candidate.similarity_score
             if candidate.pair_id in llm_scores:
                 normalized_llm_lookup[candidate.pair_id] = llm_scores[candidate.pair_id].score
         return normalized_embed_lookup, normalized_llm_lookup, False
-    
+
+    if not should_normalize:
+        return _passthrough()
+
     print("Applying reference distribution normalization...")
-    
-    # Extract all scores from full similarity matrix (upper triangle only)
-    n_users = len(all_user_ids)
-    all_matrix_scores = []
-    for i in range(n_users):
-        for j in range(i + 1, n_users):
-            all_matrix_scores.append(full_similarity_matrix[i, j])
-    all_matrix_scores = np.array(all_matrix_scores)
-    
+
+    if reference_scores is not None:
+        all_matrix_scores = np.asarray(reference_scores, dtype=float).ravel()
+    else:
+        # Legacy square path: reference = upper triangle of the cohort matrix
+        n_users = len(all_user_ids)
+        all_matrix_scores = []
+        for i in range(n_users):
+            for j in range(i + 1, n_users):
+                all_matrix_scores.append(full_similarity_matrix[i, j])
+        all_matrix_scores = np.array(all_matrix_scores)
+
+    if all_matrix_scores.size == 0:
+        print("Warning: Empty reference distribution, skipping normalization")
+        return _passthrough()
+
     # Get reference range
     ref_min, ref_max = all_matrix_scores.min(), all_matrix_scores.max()
-    
+
     if ref_max <= ref_min:
         print("Warning: All matrix scores identical, skipping normalization")
-        # Fallback to original scores
-        for candidate in candidates:
-            normalized_embed_lookup[candidate.pair_id] = candidate.similarity_score
-            if candidate.pair_id in llm_scores:
-                normalized_llm_lookup[candidate.pair_id] = llm_scores[candidate.pair_id].score
-        return normalized_embed_lookup, normalized_llm_lookup, False
+        return _passthrough()
     
     # Normalize all embedding scores to 0-1
     for candidate in candidates:

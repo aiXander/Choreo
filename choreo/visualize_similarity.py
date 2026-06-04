@@ -9,8 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from utils import ensure_dir
-from raw_data import save_similarity_raw_data
+from .utils import ensure_dir
+from .raw_data import save_similarity_raw_data
 
 
 def create_similarity_plots(
@@ -62,8 +62,7 @@ def create_similarity_plots(
     plt.figure(figsize=(10, 10))  # Square figure
     plt.imshow(combined_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')  # Equal aspect ratio
     plt.colorbar(label='Combined Similarity Score')
-    recipe_type = 'custom'
-    
+
     # Add weights summary to title
     weights_str = ", ".join([f"{k}: {v:.2f}" for k, v in section_weights.items()])
     plt.title(f'Combined Similarity Matrix\n{weights_str}')
@@ -79,7 +78,6 @@ def create_similarity_plots(
     
     # Create final combined visualization
     n_sections = len(section_matrices)
-    grid_cols = 2
     grid_rows = (n_sections + 1) // 2  # +1 for ceiling division
     
     fig = plt.figure(figsize=(16, 4 * grid_rows + 2))
@@ -93,7 +91,7 @@ def create_similarity_plots(
         col = idx % 2
         
         ax = fig.add_subplot(gs[row, col])
-        im = ax.imshow(matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')  # Equal aspect ratio
+        ax.imshow(matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')  # Equal aspect ratio
         weight = section_weights.get(section_name, 0.0)
         ax.set_title(f'{section_name.capitalize()}\n(w={weight:.2f})', 
                     fontsize=12)

@@ -5,3 +5,5 @@ data/
 !data/test*/
 *.egg-info/
 .venv/
+# repo-root scratch walkthrough (references personal data in data/real)
+final_test.md

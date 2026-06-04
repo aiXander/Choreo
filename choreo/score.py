@@ -1,25 +1,20 @@
 """LLM-based pair scoring for candidate pairs."""
 
 from typing import List, Dict, Set, Tuple, Optional
-from dataclasses import dataclass
-import asyncio
 import numpy as np
 from itertools import combinations
 
-from candidate import CandidatePair
-from extract import ExtractedSections
-from llm import LLMWrapper
-from utils import load_yaml
+from .candidate import CandidatePair
+from .llm import LLMWrapper, run_coro_blocking
+from .utils import load_yaml, hash_text
+from .schemas import ExtractedSections, PairScore  # noqa: F401 — PairScore re-exported
 
 
-@dataclass 
-class PairScore:
-    """LLM score for a user pair."""
-    pair_id: str
-    user1: str
-    user2: str
-    embed_score: float
-    score: float
+# Extra re-ask rounds for pair scores that come back missing/unparsable in an
+# otherwise-successful response. (Transport-level failures — rate limits, 5xx,
+# malformed JSON — are already retried per call inside LLMWrapper; this covers
+# the other failure mode: valid JSON that omits some of the requested keys.)
+MAX_SCORE_RETRIES = 3
 
 
 def create_profile_groups_from_pairs(
@@ -65,6 +60,10 @@ def create_profile_groups_from_pairs(
             pair_key_set.add(key)
             pair_keys.append(key)
 
+    # Deterministic iteration order: set iteration is hash-salted per process,
+    # which would make grouping (and thus LLM cache keys) vary between runs.
+    users_sorted = sorted(all_users)
+
     covered: Set[frozenset] = set()
     groups: List[Set[str]] = []
 
@@ -91,7 +90,7 @@ def create_profile_groups_from_pairs(
         # Grow greedily to size n by maximum uncovered-pair gain.
         while len(group) < n:
             best_user, best_gain = None, 0
-            for user in all_users:
+            for user in users_sorted:
                 if user in group:
                     continue
                 gain = uncovered_gain(user, group)
@@ -134,10 +133,16 @@ def build_batch_scoring_prompt(
     sections_dict: Dict[str, Dict[str, str]],
     instruction: str,
     prompt_template: str,
-    goal: str
+    goal: str,
+    pairs: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[str, Dict[str, float]]:
-    """Build prompt for batch LLM scoring of multiple profiles."""
-    
+    """Build prompt for batch LLM scoring of multiple profiles.
+
+    By default every C(n,2) pair among ``user_profiles`` is requested. Pass
+    ``pairs`` to request only a subset — query mode uses this to score
+    query↔candidate pairs without asking for candidate↔candidate scores.
+    """
+
     # Format all user profiles
     def format_sections(sections: Dict[str, str], user_id: str) -> str:
         lines = [f"Profile of {user_id}:"]
@@ -145,7 +150,7 @@ def build_batch_scoring_prompt(
             if content and content.strip() and content != "Not specified":
                 lines.append(f"  {section_name.title()}: {content}")
         return "\n".join(lines)
-    
+
     # Create XML formatted profiles
     profiles_xml = "<profiles>\n"
     for user_id in user_profiles:
@@ -153,17 +158,18 @@ def build_batch_scoring_prompt(
         profile_text = format_sections(user_sections, user_id)
         profiles_xml += f"  <profile id=\"{user_id}\">\n    {profile_text.replace(chr(10), chr(10) + '    ')}\n  </profile>\n"
     profiles_xml += "</profiles>"
-    
-    # Generate all possible pairs and create JSON format hint
-    pairs = list(combinations(user_profiles, 2))
+
+    # Generate requested pairs and create JSON format hint
+    if pairs is None:
+        pairs = list(combinations(user_profiles, 2))
     pair_scores = {}
     json_format = {}
-    
+
     for user1, user2 in pairs:
         pair_key = f"{user1}_{user2}"
         pair_scores[pair_key] = 0.0  # placeholder
         json_format[pair_key] = 0.0
-    
+
     json_format_hint = str(json_format).replace("0.0", "0..1")
     
     # Build the complete prompt
@@ -177,38 +183,97 @@ def build_batch_scoring_prompt(
     return prompt, pair_scores
 
 
+def _run_scoring_batch(
+    llm_wrapper: LLMWrapper,
+    prompts: List[str],
+    cache_keys: List[Optional[str]],
+    model: str,
+    reasoning_effort: str = "medium",
+) -> List:
+    """Run one parallel batch of scoring prompts (async-host safe)."""
+    return run_coro_blocking(llm_wrapper.batch_json_complete(
+        prompts=prompts,
+        model=model,
+        cache_keys=cache_keys,
+        reasoning_effort=reasoning_effort,
+        print_reasoning_summary=False,
+        verbosity=0,
+    ))
+
+
+def _merge_scores_from_response(
+    response,
+    pairs: List[CandidatePair],
+    pair_scores: Dict[str, PairScore],
+) -> List[CandidatePair]:
+    """Parse one batch response into ``pair_scores``; return the pairs whose
+    score came back missing or unparsable (the retry input)."""
+    if isinstance(response, Exception) or not isinstance(response, dict):
+        print(f"Warning: unusable scoring response "
+              f"({response if isinstance(response, Exception) else type(response).__name__})")
+        return list(pairs)
+
+    missing: List[CandidatePair] = []
+    for pair in pairs:
+        score = response.get(f"{pair.user1}_{pair.user2}",
+                             response.get(f"{pair.user2}_{pair.user1}"))
+        if score is None:
+            missing.append(pair)
+            continue
+        try:
+            score_val = float(score)
+        except (ValueError, TypeError):
+            print(f"Error parsing score for pair {pair.pair_id}: {score!r}")
+            missing.append(pair)
+            continue
+        pair_scores[pair.pair_id] = PairScore(
+            pair_id=pair.pair_id,
+            user1=pair.user1,
+            user2=pair.user2,
+            embed_score=pair.similarity_score,
+            score=max(0.0, min(1.0, score_val)),
+        )
+    return missing
+
+
 def select_pairs_for_llm_scoring_optimal(
     similarity_matrix: np.ndarray,
     user_ids: List[str],
     max_n_llm_evaluations_per_profile: int,
-    global_cap: int
+    global_cap: int,
+    excluded_pairs: Optional[Set[str]] = None,
 ) -> List[CandidatePair]:
     """
     Select optimal subset of pairs for LLM scoring using greedy per-profile selection.
     Works directly with similarity matrix instead of pre-filtered candidates.
-    
+
     Args:
         similarity_matrix: Full similarity matrix (n_users, n_users)
         user_ids: List of user IDs
         max_n_llm_evaluations_per_profile: Maximum number of evaluations per profile
         global_cap: Global max pairs to score (for backward compatibility)
-        
+        excluded_pairs: Optional set of pair_ids to skip entirely (novelty
+            exclusions — pairs already surfaced in prior runs)
+
     Returns:
         Optimally selected pairs for scoring
     """
     n_users = len(user_ids)
     if n_users == 0:
         return []
-    
+
     print(f"Greedy pair selection for {n_users} users with max {max_n_llm_evaluations_per_profile} evaluations per profile")
-    
+
     # Create all possible pairs with their scores (upper triangle only to avoid duplicates)
+    excluded_pairs = excluded_pairs or set()
     all_pairs = []
     for i in range(n_users):
         for j in range(i + 1, n_users):
             score = similarity_matrix[i, j]
             if score > 0:  # Only positive similarities
                 pair = CandidatePair.create(user_ids[i], user_ids[j], score)
+                if pair.pair_id in excluded_pairs:
+                    continue
                 all_pairs.append(pair)
     
     # Sort by similarity score (highest first)
@@ -285,45 +350,70 @@ def score_pairs_with_llm(
     sections_dict: Dict[str, Dict[str, str]],  # user_id -> sections
     instruction: str,
     goal: str,
-    prompts_config_path: str,
-    llm_wrapper: LLMWrapper,
-    model: str,
-    max_n_llm_evaluations_per_profile: int,
-    global_cap: int,
-    n_profiles_to_score_together: int,
-    force: bool = False
+    prompts_config_path: Optional[str] = None,
+    llm_wrapper: LLMWrapper = None,
+    model: str = None,
+    max_n_llm_evaluations_per_profile: int = None,
+    global_cap: int = None,
+    n_profiles_to_score_together: int = None,
+    force: bool = False,
+    prompt_template: Optional[str] = None,
+    excluded_pairs: Optional[Set[str]] = None,
+    selected_pairs: Optional[List[CandidatePair]] = None,
+    reasoning_effort: str = "medium",
+    unscored_out: Optional[List[CandidatePair]] = None,
 ) -> Dict[str, PairScore]:
     """
     Score pairs using LLM with batch scoring approach.
-    
+
     Args:
         similarity_matrix: Full similarity matrix (n_users, n_users)
         user_ids: List of user IDs
         sections_dict: Dictionary mapping user_id to their sections
         instruction: Instruction for what kind of matching to do
         goal: Goal instruction for matching
-        prompts_config_path: Path to prompts.yaml
+        prompts_config_path: Path to prompts.yaml (alternative: prompt_template)
         llm_wrapper: LLM wrapper instance
         model: LLM model name
         max_n_llm_evaluations_per_profile: Max number of evaluations per profile
         global_cap: Global max pairs to score
         n_profiles_to_score_together: Number of profiles to score together in each batch
         force: Force re-evaluation
-        
+        prompt_template: The pair_scoring template string itself (keeps the
+            transform free of file IO; takes precedence over prompts_config_path)
+        excluded_pairs: Optional set of pair_ids to never score (novelty
+            exclusions from match history)
+        selected_pairs: Optional pre-selected candidate pairs. When given,
+            the internal square-matrix selection is skipped entirely — this is
+            how rectangular (member × pool) modes feed their own selection in.
+        reasoning_effort: Reasoning effort for the scoring calls
+            (config ``models.pair_reasoning_effort``; default "medium" — this
+            is the quality-critical step).
+        unscored_out: Optional list that collects every SELECTED pair that
+            ends up without an LLM score (budget-capped grouping, exhausted
+            retries, or a failed batch). Callers append these to the matching
+            candidates so they keep their embedding-only weight instead of
+            being dropped entirely (mirrors ``extract_sections(failed_out=)``).
+
     Returns:
         Dictionary mapping pair_id to PairScore
     """
     # Load prompt template
-    prompts_config = load_yaml(prompts_config_path)
-    prompt_template = prompts_config['pair_scoring']
-    
+    if prompt_template is None:
+        prompts_config = load_yaml(prompts_config_path)
+        prompt_template = prompts_config['pair_scoring']
+
     # Select pairs for scoring based on budget
-    selected_pairs = select_pairs_for_llm_scoring_optimal(
-        similarity_matrix=similarity_matrix,
-        user_ids=user_ids,
-        max_n_llm_evaluations_per_profile=max_n_llm_evaluations_per_profile,
-        global_cap=global_cap
-    )
+    if selected_pairs is None:
+        selected_pairs = select_pairs_for_llm_scoring_optimal(
+            similarity_matrix=similarity_matrix,
+            user_ids=user_ids,
+            max_n_llm_evaluations_per_profile=max_n_llm_evaluations_per_profile,
+            global_cap=global_cap,
+            excluded_pairs=excluded_pairs,
+        )
+    elif excluded_pairs:
+        selected_pairs = [p for p in selected_pairs if p.pair_id not in excluded_pairs]
     
     if not selected_pairs:
         print("No pairs selected for LLM scoring")
@@ -368,9 +458,13 @@ def score_pairs_with_llm(
             goal=goal
         )
         
-        # Create cache key for this group
-        group_signature = "_".join(sorted(user_profiles))
-        cache_key = None if force else f"batch_score_{hash(group_signature)}_{hash(instruction)}"
+        # Cache key = hash of the full prompt: it embeds the roster, every
+        # profile's section CONTENT, the instruction, goal and template — so an
+        # edited profile (or any prompt change) invalidates automatically. A
+        # roster-only key would silently replay stale scores after a profile
+        # edit. hash_text (sha256) — NOT the builtin hash(), which is salted
+        # per process and would never hit across runs.
+        cache_key = None if force else f"batch_score_{hash_text(prompt)}"
         
         group_prompts.append(prompt)
         group_cache_keys.append(cache_key)
@@ -378,79 +472,109 @@ def score_pairs_with_llm(
     
     if not group_prompts:
         print("No groups to process")
+        if unscored_out is not None:
+            unscored_out.extend(selected_pairs)
         return {}
-    
+
     print(f"Processing {len(group_prompts)} groups in parallel...")
-    
+
     # Run all group scoring in parallel using batch_json_complete
     llm_wrapper.set_component("batch_pair_scoring")
-    
-    async def _async_score_all_groups():
-        """Score all groups in parallel with proper async cleanup."""
-        try:
-            responses = await llm_wrapper.batch_json_complete(
-                prompts=group_prompts,
-                model=model,
-                cache_keys=group_cache_keys,
-                reasoning_effort="medium",
-                print_reasoning_summary=False,
-                verbosity=0
-            )
-            return responses
-        finally:
-            # Force cleanup of any remaining tasks
-            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            if tasks:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-    
     try:
-        responses = asyncio.run(_async_score_all_groups())
-        
-        # Process all group responses
-        for (group_idx, profile_group, pairs_to_score), response in zip(group_metadata, responses):
-            try:
-                if isinstance(response, Exception):
-                    print(f"Error in group {group_idx + 1}: {response}")
-                    continue
-                
-                # Extract scores for pairs in this group
-                for pair in pairs_to_score:
-                    pair_key1 = f"{pair.user1}_{pair.user2}"
-                    pair_key2 = f"{pair.user2}_{pair.user1}"
-                    
-                    score = None
-                    if pair_key1 in response:
-                        score = response[pair_key1]
-                    elif pair_key2 in response:
-                        score = response[pair_key2]
-                    
-                    if score is not None:
-                        try:
-                            score_val = float(score)
-                            pair_score = PairScore(
-                                pair_id=pair.pair_id,
-                                user1=pair.user1,
-                                user2=pair.user2,
-                                embed_score=pair.similarity_score,
-                                score=max(0.0, min(1.0, score_val))
-                            )
-                            pair_scores[pair.pair_id] = pair_score
-                        except (ValueError, TypeError) as e:
-                            print(f"Error parsing score for pair {pair.pair_id}: {e}")
-                            continue
-                    else:
-                        print(f"Warning: No score found for pair {pair.pair_id} in group {group_idx + 1} response")
-            
-            except Exception as e:
-                print(f"Error processing group {group_idx + 1}: {e}")
-                continue
-    
+        responses = _run_scoring_batch(
+            llm_wrapper, group_prompts, group_cache_keys, model, reasoning_effort
+        )
     except Exception as e:
         print(f"Error in parallel batch scoring: {e}")
+        if unscored_out is not None:
+            unscored_out.extend(selected_pairs)
         return {}
-    
+
+    missing: List[CandidatePair] = []
+    for (group_idx, profile_group, pairs_to_score), response in zip(group_metadata, responses):
+        still_missing = _merge_scores_from_response(response, pairs_to_score, pair_scores)
+        if still_missing:
+            print(f"Warning: group {group_idx + 1} response missing "
+                  f"{len(still_missing)}/{len(pairs_to_score)} pair score(s)")
+        missing.extend(still_missing)
+
+    # ---- Retry pass: re-ask ONLY the pairs whose scores came back missing or
+    # unparsable. The transport layer already retries failed calls; this covers
+    # the parsed-but-incomplete case. Note the retry round is baked into the
+    # cache key — an earlier cached-but-incomplete response must never
+    # short-circuit its own retry.
+    group_width = max(2, n_profiles_to_score_together or 2)
+    for retry_round in range(1, MAX_SCORE_RETRIES + 1):
+        missing = [p for p in {p.pair_id: p for p in missing}.values()
+                   if p.pair_id not in pair_scores]
+        if not missing:
+            break
+        print(f"Retrying {len(missing)} unscored pair(s) "
+              f"(retry {retry_round}/{MAX_SCORE_RETRIES})")
+
+        # Pack the missing pairs into prompt-sized groups (≤ group_width users).
+        retry_groups: List[List[CandidatePair]] = []
+        current: List[CandidatePair] = []
+        current_users: Set[str] = set()
+        for pair in missing:
+            pair_users = {pair.user1, pair.user2}
+            if current and len(current_users | pair_users) > group_width:
+                retry_groups.append(current)
+                current, current_users = [], set()
+            current.append(pair)
+            current_users |= pair_users
+        if current:
+            retry_groups.append(current)
+
+        retry_prompts, retry_keys, retry_pair_lists = [], [], []
+        for group_pairs in retry_groups:
+            users = sorted({u for p in group_pairs for u in (p.user1, p.user2)})
+            prompt, _ = build_batch_scoring_prompt(
+                user_profiles=users,
+                sections_dict=sections_dict,
+                instruction=instruction,
+                prompt_template=prompt_template,
+                goal=goal,
+                pairs=[(p.user1, p.user2) for p in group_pairs],
+            )
+            retry_prompts.append(prompt)
+            # Prompt hash covers roster + content + requested pairs; the retry
+            # round stays in the key so a cached-but-incomplete response can
+            # never short-circuit its own retry.
+            retry_keys.append(
+                None if force else
+                f"batch_score_retry{retry_round}_{hash_text(prompt)}"
+            )
+            retry_pair_lists.append(group_pairs)
+
+        try:
+            retry_responses = _run_scoring_batch(
+                llm_wrapper, retry_prompts, retry_keys, model, reasoning_effort
+            )
+        except Exception as e:
+            print(f"Error in scoring retry round {retry_round}: {e}")
+            continue  # the same missing set goes into the next round
+
+        next_missing: List[CandidatePair] = []
+        for group_pairs, response in zip(retry_pair_lists, retry_responses):
+            next_missing.extend(_merge_scores_from_response(response, group_pairs, pair_scores))
+        missing = next_missing
+
+    missing = [p for p in {p.pair_id: p for p in missing}.values()
+               if p.pair_id not in pair_scores]
+    if missing:
+        print(f"⚠️  WARNING: {len(missing)} pair(s) still unscored after "
+              f"{MAX_SCORE_RETRIES} retries (they fall back to embedding-only "
+              f"weight): {sorted(p.pair_id for p in missing)[:10]}")
+
+    # Report EVERY selected-but-unscored pair (retry-exhausted AND pairs that
+    # never made it into a group under the max_groups budget) so callers can
+    # keep them as embedding-only matching candidates.
+    if unscored_out is not None:
+        unscored_out.extend(
+            p for p in selected_pairs if p.pair_id not in pair_scores
+        )
+
     print(f"Successfully scored {len(pair_scores)} pairs with batch LLM scoring")
     return pair_scores
 

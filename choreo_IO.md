@@ -1,468 +1,241 @@
 # Choreo Pipeline IO Specification
 
-Reference document for wrapping the Choreo matching pipeline as an external tool call. Covers all inputs, outputs, filesystem artifacts, and the programmatic API surface.
+Reference for wrapping Choreo as an external tool: all entry points, inputs,
+outputs, filesystem artifacts and the programmatic API surface. Architecture
+rationale lives in
+[docs/reference/stages_and_adapters.md](docs/reference/stages_and_adapters.md)
+and [docs/reference/matching_modes.md](docs/reference/matching_modes.md).
 
 ---
 
 ## 1. Entry Points
 
-### CLI Entry Point
+### 1.1 CLI (`main.py`) — three registered pipelines
+
 ```bash
-python main.py --group <group_name> --force
+uv run python main.py --group <group> [--force]                         # matching (full N×N)
+uv run python main.py --input /path/to/folder [--force]                 # matching, folder mode
+uv run python main.py --pipeline query_match --group <g> --query '…'    # Mode B (1×M)
+uv run python main.py --pipeline batch_match --group <g> --members a,b  # Mode C (M×N, novel)
+uv run python main.py --list-pipelines
 ```
-- `--group`: String identifier for data isolation. Determines all IO paths via `data/{group}/...`
-- `--force`: Boolean. Skips all caches, re-runs every step from scratch.
-- `--config`: Path to config YAML (default: `config/config.yaml`)
-- `--pipeline`: Pipeline name (default: `"matching"`, only option currently)
 
-**Ref:** `main.py:564-616`
+- `--group`: data isolation under `data/<group>/…`. `--input`: any folder of
+  `.txt` profiles (artifacts written inside it). `--force`: bypass all caches.
+- `--query`: raw text, or a JSON section mapping (`'{"needs": "…"}'`).
+- `--members`: comma-separated member ids for the batch side.
+- `--config-dir <dir>`: overlay any subset of the five config/prompt yamls over
+  the packaged defaults (`choreo/defaults/`). `--set dotted.key=value`
+  (repeatable): override single config values on top. See §2.2.
 
-### Programmatic Entry Point (for wrapping)
+### 1.2 Programmatic — the mode runners (`choreo/runners.py`)
+
+The public API external apps import. Schema objects in, schema objects out;
+an optional `FileStore` adds disk caching/persistence but is never required.
+
 ```python
-from main import run_matching_pipeline
+from choreo import run_full_match, run_query_match, run_batch_match
+from choreo import sections_from_dict, EmbeddingsBundle, FileStore
+from choreo.config import load_config, resolve_prompt_paths
 
-result = run_matching_pipeline(
-    user_profiles_dir="path/to/profiles/",   # Directory of .txt files
-    config_dict={...},                         # Parsed config.yaml dict
-    sections_config_path="config/section_prompt.yaml",
-    scoring_prompt_path="config/scoring_prompt.yaml",
-    introduction_prompt_path="config/introduction_prompt.yaml",
-    hyde_prompt_path="config/hyde_prompt.yaml",
-    force=False,
-    group_name="my_group"                      # Optional
-)
+config = load_config(config_dir=..., overrides={...})   # packaged defaults ← dir ← dict
+
+# Full cohort — enter at ANY stage:
+run_full_match(profiles, config, store=FileStore("data/grp"))      # raw text
+run_full_match(sections_from_dict({uid: {sec: txt}}), config)      # pre-sectioned
+run_full_match(bundle, config, sections=sections)                  # pre-embedded
+# -> {edges, report_data, embeddings (bundle), llm_scores, introductions,
+#     similarity{dir_matrix, sym_matrix, user_ids, matrices_dict}, …}
+
+# Query (Mode B) — pool comes in as an argument, never re-embedded:
+run_query_match({"needs": "a CTO great at agents"}, pool_bundle, config,
+                pool_sections=…, recipe_override=…, top_k=…, llm_rerank=…)
+# -> QueryMatchResult{shortlist, query_sections, recipe, notes, …}
+
+# Batch (Mode C) — members + history are caller-supplied:
+run_batch_match(member_ids, pool_bundle, config,
+                excluded_pairs=store.get_match_history(window_months=6),
+                pool_sections=…)
+# -> BatchMatchResult{edges, report_data (members only), new_pairs, …}
 ```
-**Ref:** `main.py:496-523`
 
-### Modal (Serverless) Entry Point
+JSON-in/JSON-out wrapper for agent tool-calls:
+`choreo.run_query_match_json(payload, config)` — payload takes `query` plus
+either `store_dir` (FileStore path) or an inline `pool`
+(`EmbeddingsBundle.to_dict()` shape).
+
+### 1.3 Stage-level access (`choreo/stages.py`)
+
+Each stage is individually invokable with a discoverable contract:
+
 ```python
-# Input: JSON string of {user_id: profile_text, ...}
-run_matching_pipeline(
-    user_profiles_json='{"alice": "profile text...", "bob": "..."}',
-    config_path="config/config.yaml",   # Optional, default shown
-    force=False                          # Optional, default shown
-)
-```
-The Modal function parses the JSON into a dict, writes profile texts to temp `.txt` files, loads the config YAML, and delegates to the programmatic `run_matching_pipeline()` (passing only `user_profiles_dir`, `config_dict`, and `force` — no prompt paths or group name). A unique UUID-based data directory on a Modal volume is used for intermediate files and cleaned up after each run. On success it returns `cohort_summary` (the same dict described in section 5 below) with `success: True` and `outputs_zip_url` added (the latter may be `None` if S3 upload fails).
-
-**App name:** `profile-matching` (Modal secret: `eve-secrets-PROD`)
-
-**Deployment & Invocation:**
-```bash
-# Deploy to Modal
-modal deploy deploy_modal.py
-
-# Invoke the deployed function
-modal run deploy_modal.py::run_matching_pipeline --user-profiles-json=profiles.json --config-path=config/config.yaml
-
-# Monitor deployments
-modal app list
-modal app logs profile-matching
+from choreo import stages
+stages.list_stages()              # extract · hyde · embed · similarity · score · match · introduce · report
+stages.describe_stage("embed")    # JSON-serializable input/output schema
+spec = stages.get_stage("embed"); spec.run(...); spec.dump(out, path); spec.load(path)
 ```
 
-**Ref:** `deploy_modal.py:185-343`
+`load`/`dump` define each stage's canonical disk format, so stages chain
+in-memory **or** via files — both supported.
+
+### 1.4 Modal (serverless, `deploy_modal.py`)
+
+App `choreo-matching`, secret `choreo-secrets` (`OPENROUTER_API_KEY`, optional
+`AWS_*` for S3). Legacy full run (`run_matching_pipeline`, throwaway
+`run_<uuid>` dir, returns cohort summary + outputs zip) is unchanged. New
+granular endpoints persist a `FileStore` per group at `groups/<group>` on the
+`choreo-data` Volume:
+
+| Function | Mode | Input | Notes |
+|----------|------|-------|-------|
+| `upsert_profiles(user_profiles_json, group)` | A | `{user_id: text}` or `{user_id: {"text": …, "last_updated_at": "<ISO>"}}` JSON | incremental: unchanged profiles/cells skip LLM + embedding; `force` only re-extracts the given profiles; timestamps propagate onto sections/bundle |
+| `query_match(payload_json, group)` | B | see §1.2 payload | pool read from the Volume (warm-container cached); an inline `pool` in the payload takes precedence |
+| `batch_match(members_json, group)` | C | JSON array of ids | novelty window from config; appends new pairs to the group's history |
+
+Every endpoint also accepts `config_overrides_json` — a JSON object
+deep-merged over the packaged default config (same semantics as
+`load_config(overrides=…)`).
 
 ---
 
 ## 2. Required Inputs
 
-### 2.1 User Profile Files
+### 2.1 Profiles
+One UTF-8 `.txt` per user, filename stem = user ID (or `{user_id: text}` JSON
+via Modal / `sections_from_dict` for pre-sectioned input). Minimum cohort size:
+`matching.min_profiles_required` (config; full run only).
 
-| Property | Value |
-|----------|-------|
-| Location | `data/{group}/raw/*.txt` |
-| Format | One plain `.txt` file per user |
-| Naming | Filename stem = user ID (e.g., `alice.txt` → ID `"alice"`) |
-| Encoding | UTF-8 |
-| Minimum | **4 profiles** required (hard-coded check in `main.py:192-205`) |
-| Content | Free-form text describing the person's skills, projects, needs, etc. |
+### 2.2 Config files
+The canonical config ships inside the package at `choreo/defaults/`:
+`config.yaml` (models / recipe / blending / matching / budgets / hyde / query /
+io) + the four prompt files (`section_prompt.yaml`, `scoring_prompt.yaml`,
+`introduction_prompt.yaml`, `hyde_prompt.yaml`). See CLAUDE.md for the
+annotated schema. All models are OpenRouter slugs; all LLM/embedding calls go
+through OpenRouter (`choreo/llm.py`).
 
-**Ref:** `src/ingest.py:27-59` — `load_profiles()` reads all `.txt` from `raw_dir`, creates `Profile(id, text, hash)` objects.
+Override layering (`choreo/config.py`), lowest to highest precedence:
+1. packaged defaults (`choreo/defaults/`);
+2. `config_dir` — a directory holding any subset of the five files
+   (`config.yaml` deep-merges; prompt yamls replace wholesale);
+3. `overrides` — a dict deep-merged per call
+   (`load_config(config_dir=…, overrides={"query": {"top_k": 3}})`).
+Prompt paths resolve the same way via `resolve_prompt_paths(config_dir=…,
+config=…)`, with explicit `prompt_files:`/`prompts:` keys in the config dict
+taking final precedence.
 
-### 2.2 Configuration Files
-
-All paths are relative to repo root. The pipeline requires these config files to exist:
-
-| File | Purpose | Key Fields |
-|------|---------|------------|
-| `config/config.yaml` | Main pipeline config | `models`, `recipe`, `blending`, `matching`, `budgets`, `instruction_prompt`, `hyde`, `io` |
-| `config/section_prompt.yaml` | Section extraction definitions | `sections` (with `active`, `guideline`, `max_words` per section), `sections_prompt` template |
-| `config/scoring_prompt.yaml` | LLM pair scoring prompt | `pair_scoring` template string |
-| `config/introduction_prompt.yaml` | Introduction generation prompt | `introduction_generation` template string |
-| `config/hyde_prompt.yaml` | HyDE descriptor generation prompt | `hyde_generation` template string |
-
-**Ref:** `main.py:36-41` for default paths, `main.py:121-155` for `resolve_prompt_paths()`
-
-### 2.3 Environment Variables
-
-| Variable | Required | Used By |
-|----------|----------|---------|
-| `OPENAI_API_KEY` | Yes | `src/llm.py` — OpenAI client initialization |
-
-Loaded via `python-dotenv` from `.env` file at CLI startup (`main.py:534`).
-
-### 2.4 Config YAML Schema (key fields)
-
-```yaml
-models:
-  embedding: "text-embedding-3-small"    # OpenAI embedding model
-  extraction_llm: "gpt-5.4"             # LLM for section extraction + HyDE
-  pair_llm: "gpt-5.4"                   # LLM for pair scoring + introductions
-
-instruction_prompt:
-  goal: "string describing matching context"  # Injected into all LLM prompts
-
-budgets:
-  extraction_llm_calls: 100              # Max extraction calls
-  max_pair_llm_calls: 300                # Global cap on pair scoring calls
-  max_n_llm_evaluations_per_profile: 16  # Per-user cap on LLM evaluations
-  n_profiles_to_score_together: 4        # Batch size for scoring groups
-
-hyde:
-  n_descriptors: 1                       # HyDE phrasings per source section
-
-recipe:
-  instruction: "string"                  # Scoring instruction
-  section_weights:                       # Same-section similarity weights
-    skills: -0.10                        # Negative = dissimilarity preferred
-    vision: 0.30
-    project: 0.10
-    needs: 0.00
-  cross_section_weights:                 # Cross-section (asymmetric) weights
-    needs_skills: 0.80                   # Key format: "{source}_{target}"
-
-blending:
-  embed_weight: 0.35                     # Weight for embedding score
-  llm_weight: 0.65                       # Weight for LLM score
-
-matching:
-  b_min: 2                               # Min connections per user
-  b_max: 4                               # Max connections per user
-
-io:                                      # Overridden by --group flag
-  raw_dir: "data/raw"
-  processed_dir: "data/processed"
-  embeds_dir: "data/embeds"
-  outputs_dir: "data/outputs"
-  cache_dir: "data/cache"
-```
-
-When `--group <name>` is passed, all `io.*` paths are overridden to `data/{name}/{subdir}`.
-
-**Ref:** `main.py:94-110` — `apply_group_overrides()`
+### 2.3 Environment
+`OPENROUTER_API_KEY` as an environment variable (a `.env` in the calling
+process's cwd is auto-loaded via python-dotenv; on Modal it comes from the
+attached secret). There is no other key plumbing.
 
 ---
 
-## 3. Pipeline Steps & Intermediate IO
+## 3. Stage IO contracts
 
-All paths below assume `--group mygroup`, so base = `data/mygroup/`.
+The §1.3 registry is authoritative; summary:
 
-### Step 1: Ingest
-- **Reads:** `data/mygroup/raw/*.txt`
-- **Produces:** In-memory `List[Profile]` — `Profile(id: str, text: str, hash: str)`
-- **No disk output**
-- **Ref:** `src/ingest.py`
+| Stage | Input | Output |
+|-------|-------|--------|
+| `extract` | `list[Profile]` + sections config (+ optional `existing` `{hash: sections}`) | `list[ExtractedSections{id, sections, hash, last_updated_at?}]` |
+| `hyde` | sections + cross weights + `{n_descriptors}` (+ optional `existing`) | `{cross_key: [HydeDescriptors{…, descriptors: list[str]}]}` |
+| `embed` | sections (+ HyDE, + optional `existing` bundle) | `EmbeddingsBundle{user_ids, section_names, embeddings[N,S,D], hyde{key:[N,d,D]}, embedding_model, dim, section_hashes, hyde_hashes, user_timestamps}` |
+| `similarity` | source bundle + target bundle + recipe | `SimilarityResult{dir_matrix[n_src,n_tgt], sym_matrix?, matrices_dict, source_ids, target_ids}` |
+| `score` | sym matrix (or `selected_pairs`) + sections + budgets + `excluded_pairs?` | `{pair_id: PairScore}` |
+| `match` | candidates + llm_scores + matching/blending cfg + `member_ids?`/`excluded_pairs?`/`reference_scores?` | `list[Edge]` |
+| `introduce` | edges + sections | `{pair_id: Introduction}` |
+| `report` | edges + sections (+ `scope_user_ids?`) | `{user_reports: {uid: {profile, matches}}, cohort_summary}` |
 
-### Step 2: Section Extraction
-- **Reads:** Profile texts, `config/section_prompt.yaml`
-- **Produces:**
-  - In-memory: `List[ExtractedSections]` — `ExtractedSections(id: str, sections: Dict[str, str], hash: str)`
-  - Disk: `data/mygroup/processed/sections.jsonl`
-    ```jsonl
-    {"id": "alice", "sections": {"skills": "...", "vision": "...", "project": "...", "needs": "..."}, "hash": "abc123..."}
-    ```
-- **Cache key:** Profile content hash. Only re-extracts if profile text changed.
-- **Ref:** `src/extract.py:43-234`
-
-### Step 2.5: HyDE Descriptor Generation
-- **Condition:** Only runs when `config.recipe.cross_section_weights` is non-empty
-- **Reads:** Extracted sections, `config/hyde_prompt.yaml`, `config/section_prompt.yaml`
-- **Produces:**
-  - In-memory: `Dict[str, List[HydeDescriptors]]` — keyed by cross_key (e.g., `"needs_skills"`)
-  - Disk: `data/mygroup/processed/hyde/{cross_key}.jsonl`
-    ```jsonl
-    {"cache_key": "...", "user_id": "alice", "cross_key": "needs_skills", "descriptors": ["hypothetical skill text..."]}
-    ```
-- **Ref:** `src/hyde.py:35-212`
-
-### Step 3: Embedding Generation
-- **Reads:** Extracted sections, HyDE descriptors (if any)
-- **Produces:**
-  - `data/mygroup/embeds/vectors.npz` — numpy array shape `(n_users, n_sections, embedding_dim)`
-  - `data/mygroup/embeds/ids.json` — `["alice", "bob", ...]` (user ID ordering)
-  - `data/mygroup/embeds/section_names.json` — `["skills", "vision", "project", "needs"]`
-  - `data/mygroup/embeds/hyde_vectors.npz` — (if HyDE) keyed by cross_key, shape `(n_users, n_descriptors, embedding_dim)`
-- **Cache:** Reuses existing embeddings if user set + section names haven't changed
-- **Ref:** `src/embed.py:61-197`
-
-### Step 3.5: t-SNE Visualization
-- **Produces:** `data/mygroup/outputs/plots/tsne_*.png` (one plot per section)
-- **Non-essential** — pipeline continues if this fails
-- **Ref:** `src/tsne.py`
-
-### Step 4: Similarity Matrix Generation
-- **Reads:** Embeddings, HyDE embeddings, recipe config
-- **Produces:** In-memory only:
-  - `dir_similarity_matrix` — possibly asymmetric `(n_users, n_users)` numpy array
-  - `similarity_matrix` — symmetric version `(dir + dir.T) / 2`
-  - `user_ids_sorted` — user IDs in matrix order
-  - `matrices_dict` — contains per-section matrices, cross-section matrices, weights, combined matrix
-- **No disk output** at this step
-- **Ref:** `src/candidate.py:29-255`
-
-### Step 5: LLM Pair Scoring
-- **Reads:** Similarity matrix, extracted sections, `config/scoring_prompt.yaml`
-- **Produces:** In-memory `Dict[str, PairScore]` keyed by `pair_id`
-  - `PairScore(pair_id: str, user1: str, user2: str, embed_score: float, score: float)`
-  - `pair_id` is always alphabetically sorted: `stable_pair_id("bob", "alice") = "alice_bob"`
-- **LLM cache:** Individual call results cached in `data/mygroup/cache/llm/` as JSON files
-- **Ref:** `src/score.py:263-433`
-
-### Step 6: B-Matching
-- **Reads:** Candidate pairs, LLM scores, similarity matrix, blending/matching config
-- **Produces:** In-memory `List[Edge]`
-  ```python
-  Edge(
-      user1: str, user2: str, pair_id: str,
-      final_weight: float,           # Blended score
-      embed_score: float,            # Raw embedding similarity
-      llm_score: float,              # Raw LLM score (0-1)
-      embed_score_normalized: float, # Normalized embedding score
-      llm_score_normalized: float,   # Normalized LLM score
-      intro: str,                    # Filled in Step 7
-      starter_topics: str            # Filled in Step 7
-  )
-  ```
-- **Ref:** `src/match.py:237-287`
-
-### Step 7: Introduction Generation
-- **Reads:** Final edges, sections dict, `config/introduction_prompt.yaml`
-- **Produces:** In-memory `Dict[str, Introduction]`
-  - LLM returns JSON with either:
-    - Directional: `{"intro_for_a": "...", "intro_for_b": "...", "starter_topics": "..."}`
-    - Legacy: `{"intro": "...", "starter_topics": "..."}`
-  - Introduction text is attached to Edge objects (`edge.intro`, `edge.starter_topics`)
-- **LLM cache:** Results cached in `data/mygroup/cache/llm/`
-- **Ref:** `src/introduction.py:57-191`
-
-### Step 8: Report Generation
-- **Produces:**
-  - **Per-user reports:** `data/mygroup/outputs/{user_id}.json`
-    ```json
-    {
-      "profile": "Profile of alice:\n\n**Skills:** ...\n**Vision:** ...",
-      "matches": "### 1. bob\n\n**Match Score:** 0.742 ..."
-    }
-    ```
-  - **Cohort summary:** `data/mygroup/outputs/cohort.json` — see Section 5 for full schema
-- **Ref:** `src/report.py:183-267`
-
-### Step 9: Visualization & Cost Report
-- **Produces:**
-  - `data/mygroup/outputs/plots/` — similarity heatmaps, score correlation plots
-  - `data/mygroup/outputs/cost_report.json` — detailed API cost breakdown
-- **Non-essential** — pipeline continues if visualization fails
-- **Ref:** `src/visualize_similarity.py`, `src/score_correlation.py`, `src/cost_tracker.py`
+Reuse rules: `existing` arguments are how adapters hand cached data in —
+extraction by profile hash, HyDE by content-hash cache key, embeddings by
+per-(user, section) content hash (roster changes never trigger re-embeds).
+An `existing` bundle from a different `embedding_model` is ignored (full
+re-embed).
 
 ---
 
-## 4. Filesystem Layout (Complete)
+## 4. Filesystem Layout (FileStore)
 
 ```
-data/{group}/
-├── raw/                          # INPUT: User profiles
-│   ├── alice.txt
-│   ├── bob.txt
-│   └── ...
-├── processed/                    # INTERMEDIATE: Extracted data
-│   ├── sections.jsonl            # Extracted sections per user
-│   └── hyde/                     # HyDE descriptors (if cross_section_weights set)
-│       └── needs_skills.jsonl
-├── embeds/                       # INTERMEDIATE: Embedding vectors
-│   ├── vectors.npz               # Shape: (n_users, n_sections, embedding_dim)
-│   ├── hyde_vectors.npz          # Shape per key: (n_users, n_descriptors, embedding_dim)
-│   ├── ids.json                  # User ID ordering
-│   └── section_names.json        # Section name ordering
-├── cache/                        # CACHE: LLM call results
-│   └── llm/
-│       ├── extract_<hash>.json
-│       ├── hyde_<cross_key>_<hash>.json
-│       ├── batch_score_<hash>.json
-│       └── intro_<pair_id>_<hash>.json
-└── outputs/                      # OUTPUT: Final results
-    ├── alice.json                # Per-user report
-    ├── bob.json
-    ├── cohort.json               # Cohort summary (main output)
-    ├── cost_report.json          # API cost breakdown
-    └── plots/                    # Visualizations
-        ├── tsne_skills.png
-        ├── tsne_vision.png
-        ├── similarity_*.png
-        └── score_correlation_*.png
+data/<group>/
+├── raw/*.txt                     # INPUT (filename = user ID)
+├── processed/
+│   ├── sections.jsonl            # extracted sections (append-only; last row per id wins)
+│   └── hyde/<cross_key>.jsonl    # HyDE cache (content-hash keyed)
+├── embeds/
+│   ├── vectors.npz               # (n_users, n_sections, dim) full-size
+│   ├── hyde_vectors.npz          # per cross_key: (n_users, n_descriptors, dim)
+│   ├── ids.json · section_names.json
+│   └── bundle_meta.json          # provenance + content hashes (absent on legacy dirs — adopted on load)
+├── cache/llm/*.json              # LLM response cache (sha256-stable keys)
+├── match_history.jsonl           # {pair_id, user1, user2, matched_at} — batch-mode novelty input
+└── outputs/
+    ├── <user>.json               # {"profile": md, "matches": md}
+    ├── cohort.json · cost_report.json
+    ├── batch/                    # batch-mode reports (never clobber the full run)
+    └── plots/ (+ plots/raw_data/*.npz)
 ```
 
 ---
 
-## 5. Return Value Schema (`_execute_matching_pipeline`)
+## 5. Return Value Schemas
 
-On **success**, the pipeline returns:
+### Full run (`_execute_matching_pipeline` / Modal legacy)
+Unchanged from before the refactor: on success
+`{success: True, matches: list[Edge], profiles_count, outputs_dir,
+cost_report_path, cohort_summary{overview, degree_distribution,
+score_statistics, users}, stats}`; on failure `{success: False, error, …}`.
+`Edge.to_dict()` →
+`{user1, user2, pair_id, final_weight, embed_score, llm_score,
+embed_score_normalized, llm_score_normalized, intro, starter_topics}`.
 
+### Query match (`QueryMatchResult.to_dict()` / `run_query_match_json`)
 ```python
-{
-    "success": True,
-    "matches": List[Edge],              # List of Edge dataclass instances
-    "profiles_count": int,              # Number of input profiles
-    "outputs_dir": str,                 # Path to outputs directory
-    "cost_report_path": str,            # Path to cost_report.json
-    "cohort_summary": {                 # The cohort.json content (see below)
-        "overview": {
-            "total_users": int,
-            "total_edges": int,
-            "average_degree": float,
-            "edges_with_llm_scores": int
-        },
-        "degree_distribution": {
-            "2": int,                   # Count of users with degree 2
-            "3": int,                   # etc.
-        },
-        "score_statistics": {
-            "final_weights": {"min": float, "max": float, "avg": float},
-            "embedding_scores": {"min": float, "max": float, "avg": float},
-            "llm_scores": {"min": float, "max": float, "avg": float}
-        },
-        "users": {
-            "<user_id>": {
-                "degree": int,
-                "profile": "**Skills:** ...\n**Vision:** ...",
-                "matches": [
-                    {
-                        "partner": str,
-                        "weight": float,
-                        "intro": str
-                    }
-                ]
-            }
-        }
-    },
-    "stats": {
-        "llm_calls": int,
-        "matches_created": int
-    },
-    "tsne_plots_dir": str,              # Optional, only if t-SNE succeeded
-    "similarity_plots_dir": str         # Optional, only if plots succeeded
-}
+{"success": True,                      # json wrapper only
+ "query_sections": {section: text},
+ "shortlist": [{"rank", "user_id", "score", "embed_score",
+                 "embed_score_normalized", "llm_score",  # None if rerank off/skipped
+                 "intro", "starter_topics"}],
+ "recipe": {...}, "llm_rerank_applied": bool,
+ "pool_size": int, "notes": [str]}
 ```
 
-On **failure**:
+### Batch match (`BatchMatchResult.to_dict()`)
 ```python
-{
-    "success": False,
-    "error": str,                       # Human-readable error message
-    "profiles_count": int,              # Optional, present for min-profile errors
-    "min_required": int                 # Optional, present for min-profile errors (=4)
-}
+{"edges": [Edge.to_dict()],
+ "report_data": {"user_reports": {member: {...}}, "cohort_summary": {...}},
+ "new_pairs": [{"pair_id", "user1", "user2", "final_weight"}],  # append to your history
+ "member_ids": [...], "excluded_count": int}
 ```
-
-**Ref:** `main.py:446-465` (success), `main.py:195-205` (min-profile failure)
-
-### Modal Return Value
-
-**On success with `cohort_summary`** (normal case):
-The Modal entry point returns just the `cohort_summary` dict with two extra fields:
-```python
-cohort_summary["success"] = True
-cohort_summary["outputs_zip_url"] = "https://..." or None  # S3 URL of zipped outputs (None if upload failed)
-```
-
-**On success without `cohort_summary`** (edge case):
-```python
-{
-    "success": True,
-    "error": "Pipeline succeeded but cohort_summary not found in result",
-    "outputs_zip_url": "https://..." or None
-}
-```
-
-**On pipeline failure:**
-```python
-{
-    "success": False,
-    "error": str,                  # Human-readable error message
-    "profiles_count": int,         # Optional, present for min-profile errors
-    "min_required": int            # Optional, present for min-profile errors
-}
-```
-
-**On JSON parse error:**
-```python
-{"success": False, "error": "Invalid JSON in user_profiles_json: ..."}
-```
-
-**On empty profiles:**
-```python
-{"success": False, "error": "No user profiles provided. Please provide at least 6 user profiles."}
-```
-
-**On config file error:**
-```python
-{"success": False, "error": "Configuration file not found: ..." or "Invalid YAML in configuration file: ..."}
-```
-
-**On unexpected exception:**
-```python
-{"success": False, "error": "Unexpected error in matching pipeline: <ExceptionType>: <message>"}
-```
-
-**Ref:** `deploy_modal.py:302-343`
 
 ---
 
 ## 6. Key Conventions for Wrapping
 
-### Pair ID Stability
-All pair IDs are alphabetically sorted: `stable_pair_id(a, b) = f"{min(a,b)}_{max(a,b)}"`. Any external lookup by pair must use this convention.
-
-**Ref:** `src/utils.py:25-27`
-
-### Caching Behavior
-- **Profile hash:** SHA-256 of profile text content (first 16 hex chars). Drives extraction + HyDE caching.
-- **LLM cache:** File-based in `data/{group}/cache/llm/`. Cache key format varies by step.
-- **Embedding cache:** Reuses if user set + section names match exactly.
-- **`--force` flag:** Bypasses ALL caches. Use when config changes require full re-computation.
-
-### Minimum Group Size
-Hard minimum of **4 profiles**. Pipeline returns early with error if fewer are provided.
-
-**Ref:** `main.py:192-205`
-
-### Active Sections
-Only sections with `active: true` in `section_prompt.yaml` are extracted and embedded. This determines the dimensionality of the embedding tensor and which section_weights are valid.
-
-**Ref:** `src/utils.py:101-104` — `filter_active_sections()`
-
-### LLM Provider
-Uses the **OpenAI Responses API** (`openai.responses.create()`) for completions and **LiteLLM** for embeddings. The LLM wrapper handles JSON extraction, retry with exponential backoff, and file-based caching.
-
-**Ref:** `src/llm.py` (completions), `src/embed.py:15-58` (embeddings via LiteLLM)
-
-### Edge Serialization
-`Edge.to_dict()` produces a clean JSON-serializable dict. The `matches` field in the return value contains raw Edge dataclass instances (not dicts). The `cohort_summary` is already fully serializable.
-
-**Ref:** `src/match.py:27-40`
-
----
-
-## 7. Critical Files Reference
-
-| File | What to check when wrapping |
-|------|-----------------------------|
-| `main.py:496-523` | `run_matching_pipeline()` — primary programmatic API |
-| `main.py:158-465` | `_execute_matching_pipeline()` — full pipeline logic |
-| `main.py:94-110` | `apply_group_overrides()` — how IO paths are derived from group name |
-| `deploy_modal.py:185-343` | Modal entry point — shows how to pass profiles as JSON + get cohort_summary back |
-| `src/ingest.py` | Profile loading contract (`.txt` files, stem = user ID) |
-| `src/report.py:107-180` | `create_cohort_summary()` — schema of the main output |
-| `src/match.py:14-40` | `Edge` dataclass — shape of individual match results |
-| `src/extract.py:13-18` | `ExtractedSections` dataclass — shape of extracted profile data |
-| `config/config.yaml` | Full config schema with all tuneable parameters |
-| `config/section_prompt.yaml` | Active sections definition (drives embedding dimensions) |
+- **Pair IDs** are alphabetically sorted (`stable_pair_id(a, b)` →
+  `"alice_bob"`); any external lookup must use this convention — including the
+  `excluded_pairs` sets you pass in.
+- **Match history is yours.** Choreo accepts `excluded_pairs` and returns
+  `new_pairs`; the documented default window is
+  `matching.novelty_window_months` (6) — apply it when building the set.
+- **Embedding ownership**: always in-repo. Store the bundle
+  (`EmbeddingsBundle.to_dict()` or the `embeds/` dir format) and hand it back
+  as `existing` / `pool`; never embed externally. Bundles carry
+  `embedding_model` + `dim` provenance; a model mismatch raises (query) or
+  triggers a full re-embed (embed stage).
+- **`--force` / `force=True`** bypasses all caches. Modal `upsert_profiles`
+  scopes `force` to the given profiles only.
+- **Caching**: profile-hash for extraction, content-hash for HyDE and
+  per-cell embeddings; LLM response caches (scoring/intros/rerank) key on a
+  sha256 of the **full prompt**, so edited profile content invalidates them
+  automatically. Renaming/toggling sections invalidates embeddings via the
+  hashes; use `--force` when in doubt.
+- **Freshness timestamps (`last_updated_at`)**: optional ISO-8601 provenance
+  carried end-to-end — `Profile` (file mtime locally, or supplied by the
+  caller), `ExtractedSections.last_updated_at`,
+  `EmbeddingsBundle.user_timestamps` (persisted in `sections.jsonl` /
+  `bundle_meta.json`). Inject your store's `updated_at` via
+  `sections_from_dict(..., last_updated_at=…)` or the Modal upsert dict shape;
+  read it back from the returned objects and use `choreo.is_stale(artifact_ts,
+  source_ts)` to decide when a profile needs re-upserting. Content hashes
+  remain the internal invalidation mechanism — timestamps never trigger
+  recomputation by themselves.
