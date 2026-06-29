@@ -10,8 +10,8 @@ models:
   # always stored on disk, so this is re-tunable without re-embedding. Set to an
   # int (e.g. 1536, 768); leave null/omit to use the full native size (3072).
   embedding_dimensions: 1536
-  extraction_llm: "google/gemini-3.1-flash-lite"
-  pair_llm: "google/gemini-3.1-flash-lite"
+  extraction_llm: "minimax/minimax-m3"
+  pair_llm: "minimax/minimax-m3"
   # Reasoning effort forwarded to OpenRouter via `reasoning: {effort}`. This is
   # the global default for every phase. OpenRouter ignores the param on
   # non-reasoning models, and reasoning models that can't be turned off would
@@ -22,26 +22,36 @@ models:
   reasoning_effort: "low"
   # Effort for the quality-critical pair-scoring step (cohort scoring AND the
   # query re-rank) — overrides reasoning_effort for that phase only.
-  pair_reasoning_effort: "medium"
+  pair_reasoning_effort: "low"
 
 instruction_prompt:
-  goal: "We are matching participants at an AI hackathon at Wintercircus Gent. Most attendees are here for professional reasons: to form teams and build product demos during the event (eg AI agents), while also making valuable professional connections. We want to surface pairs who should connect — where one person's skills fill another's build gap, and/or they share a project direction worth building together. Stay focused on the hackathon, but keep an eye slightly wider than the event itself: also surface connections with real potential beyond the weekend (career moves, co-founders, startups, business and network opportunities)."
+  goal: "We are matching members of the Wintercircus Gent community at the fin-de-saison event, where this matchmaking tool is being demo'd to the whole community ahead of a networking session afterward. Most attendees are here for professional reasons: to make valuable, useful business and professional connections — people they should walk over and talk to during the networking event. We want to surface pairs who should connect — where one person's skills fill another's gap, and/or they share a project direction worth collaborating on. Focus on concrete, useful connections: career moves, co-founders, startups, clients, partnerships, and network opportunities."
 
 budgets:
   extraction_llm_calls: 300
-  max_pair_llm_calls: 1200
+  max_pair_llm_calls: 1600
   max_n_llm_evaluations_per_profile: 24
   n_profiles_to_score_together: 5
+
+# Concurrency for every batched LLM phase (extraction, HyDE, pair scoring,
+# query re-rank, introductions). This is the single knob that governs how many
+# LLM HTTP requests are in flight at once across the whole pipeline. The
+# dispatcher keeps exactly this many calls running and fires the next one the
+# instant any one completes (semaphore-gated, not fire-a-batch-then-wait), so
+# raising it shortens wall-clock at the cost of more concurrent load on the
+# provider. Lower it if you hit rate limits.
+concurrency:
+  max_concurrent_llm_calls: 16
 
 hyde:
   n_descriptors: 1
 
 recipe:
-  instruction: "Score this match on collaboration potential. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional signal is also valuable. Also reward a shared buildable direction or overlapping ambition (two people excited about the same problem who should team up), and connections with real potential beyond the hackathon (co-founder, startup, business, or network fit). Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
+  instruction: "Score this match on the value of connecting these two people at the networking event. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional signal is also valuable. Also reward a shared direction or overlapping ambition (two people excited about the same problem who should collaborate), and connections with real business potential (co-founder, startup, client, partnership, or network fit). Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
   section_weights:
     skills:   -0.10
-    vision:   0.30
-    project:  0.30
+    vision:   0.35
+    project:  0.25
     needs:    -0.10
   cross_section_weights:
     needs_skills: 0.80

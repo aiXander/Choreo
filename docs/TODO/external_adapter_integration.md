@@ -5,8 +5,8 @@
 validate is documented in
 [reference/stages_and_adapters.md](../reference/stages_and_adapters.md).
 The actual Neon adapter + Modal tool now being built lives in the motherbrain
-repo — see `motherbrain/docs/TODO/04_integrate_choreo_tool.md` (choreo stays
-unopinionated; all Neon/Modal/world plumbing is motherbrain-side).
+repo — see `motherbrain/docs/TODO/04_choreo_matchmaking_integration.md` (choreo
+stays unopinionated; all Neon/Modal/world plumbing is motherbrain-side).
 
 - [ ] **Confirm the `Store` protocol surface against the real Neon wrapper.**
       `choreo/store.py` defines `get/put_sections`, `get/put_embeddings`,

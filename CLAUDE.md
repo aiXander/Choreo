@@ -226,6 +226,9 @@ budgets:
   max_pair_llm_calls: 1200
   max_n_llm_evaluations_per_profile: 24
   n_profiles_to_score_together: 5
+
+concurrency:
+  max_concurrent_llm_calls: 16   # single global cap on in-flight LLM calls
 ```
 
 Prompts in `choreo/defaults/`:
@@ -269,6 +272,12 @@ store (Neon `updated_at`) can pass its timestamps in
 **MRL truncation**: only applied to models in `MRL_CAPABLE_MODELS` (`embed.py`); other models keep full dims with a warning. Full vectors are always stored on disk, so the truncation size is re-tunable without re-embedding.
 
 **Batching**: scoring evaluates `n_profiles_to_score_together` profiles per LLM call, generating N*(N-1)/2 pairs.
+
+**Concurrency**: every batched phase (extract, HyDE, scoring, query re-rank,
+intros) routes through `LLMWrapper.batch_json_complete`, which is semaphore-gated
+by `concurrency.max_concurrent_llm_calls` (default 16) — exactly that many calls
+are in flight at once and the next fires the instant one returns (continuous
+dispatch, not fire-a-window-then-await). One global knob; no per-stage batch sizes.
 
 **Blending**: `final = embed_weight * embed_score + llm_weight * llm_score`.
 Score normalization takes the reference distribution as an explicit input

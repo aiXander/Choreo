@@ -95,6 +95,7 @@ def run_full_match(
         llm_wrapper = LLMWrapper(
             cache_dir=cache_dir,
             reasoning_effort=models_cfg.get("reasoning_effort", "low"),
+            max_concurrent_llm_calls=config.get("concurrency", {}).get("max_concurrent_llm_calls", 16),
         )
 
     # ---- Stages 2 / 2.5 / 3: extract → HyDE → embed (or skip ahead) ----------

@@ -1,7 +1,7 @@
 introduction_generation: |
   Context: {goal}
 
-  Your task is to generate intro / collaboration guidance for a matched pair of hackathon participants.
+  Your task is to generate intro / collaboration guidance for a matched pair of community members at a networking event.
   "{instruction}"
 
   This pair ({user_a_name} and {user_b_name}) have been matched because they are complementary in the project context.
@@ -9,7 +9,7 @@ introduction_generation: |
   Create:
   1. A directional introduction for {user_a_name} explaining what {user_b_name} can specifically offer their project
   2. A directional introduction for {user_b_name} explaining what {user_a_name} can specifically offer their project
-  3. Specific, actionable starter topics — concrete things they could build or work on together (lead with what they could ship at the hackathon, but also note any longer-term collaboration worth exploring beyond the event)
+  3. Specific, actionable starter topics — concrete things they could build or work on together (lead with what they could start on right away, but also note any longer-term collaboration worth exploring)
 
   Be specific about WHICH skills match WHICH needs. Vague "you have shared interests" is not useful.
 

@@ -198,6 +198,7 @@ def _run_scoring_batch(
         reasoning_effort=reasoning_effort,
         print_reasoning_summary=False,
         verbosity=0,
+        progress_label="score",
     ))
 
 

@@ -194,6 +194,7 @@ def run_batch_match(
         llm_wrapper = LLMWrapper(
             cache_dir=None,
             reasoning_effort=models_cfg.get("reasoning_effort", "low"),
+            max_concurrent_llm_calls=config.get("concurrency", {}).get("max_concurrent_llm_calls", 16),
         )
 
     # MRL truncation working copies (mirrors the cohort pipeline)

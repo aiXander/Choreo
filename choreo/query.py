@@ -205,6 +205,7 @@ def _llm_rerank_query_candidates(
                 model=config.get("models", {}).get("pair_llm"),
                 cache_keys=cache_keys,
                 reasoning_effort=config.get("models", {}).get("pair_reasoning_effort", "medium"),
+                progress_label="query_rerank",
             ))
         except Exception as e:  # pylint: disable=broad-except
             print(f"Warning: query re-rank round failed entirely ({e})")
@@ -302,6 +303,7 @@ def run_query_match(
         llm_wrapper = LLMWrapper(
             cache_dir=None,
             reasoning_effort=models_cfg.get("reasoning_effort", "low"),
+            max_concurrent_llm_calls=config.get("concurrency", {}).get("max_concurrent_llm_calls", 16),
         )
 
     # ---- 1. Build the query atom (partial profile) -------------------------

@@ -153,6 +153,7 @@ def generate_introductions_for_matches(
                 prompts=prompts,
                 model=model,
                 cache_keys=cache_keys,
+                progress_label="introduce",
             ))
             
             # Process batch responses

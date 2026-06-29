@@ -223,7 +223,8 @@ def run_coro_blocking(coro):
 class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
     
-    def __init__(self, cache_dir: Optional[str] = None, max_retries: int = 3, reasoning_effort: Optional[str] = "low"):
+    def __init__(self, cache_dir: Optional[str] = None, max_retries: int = 3, reasoning_effort: Optional[str] = "low",
+                 max_concurrent_llm_calls: int = 16):
         # cache_dir=None disables the file-based response cache entirely
         # (in-memory pipeline runs, e.g. transient query matching).
         if cache_dir:
@@ -244,6 +245,12 @@ class LLMWrapper:
         # that doesn't pass an explicit reasoning_effort; "low" is the
         # cost-effective baseline and is ignored on non-reasoning models.
         self.reasoning_effort = reasoning_effort
+        # Global cap on how many LLM HTTP requests are in flight at once across
+        # every batched phase. The dispatcher in batch_json_complete keeps
+        # exactly this many calls running and fires the next the instant one
+        # completes (semaphore-gated continuous dispatch), so this is the single
+        # throughput/rate-limit knob. Set from config `concurrency:`.
+        self.max_concurrent_llm_calls = max(1, int(max_concurrent_llm_calls))
         # Request provider-native JSON mode (response_format={"type":"json_object"})
         # on JSON completions so the model is forced to emit syntactically valid
         # JSON at the source. Auto-disabled for the rest of the run if a provider
@@ -391,25 +398,34 @@ class LLMWrapper:
         model: str,
         cache_keys: Optional[List[Optional[str]]] = None,
         schema_hints: Optional[List[Optional[str]]] = None,
-        batch_size: int = 8,
+        max_concurrent: Optional[int] = None,
         max_retries: int = 3,
         reasoning_effort: Optional[str] = None,
         retry_delay_base: float = 1.0,
         verbosity: int = 0,
-        print_reasoning_summary: bool = False
+        print_reasoning_summary: bool = False,
+        max_tokens: Optional[int] = None,
+        progress_label: Optional[str] = None,
+        progress_interval: float = 10.0,
     ) -> List[Dict[str, Any]]:
         """
-        Process multiple prompts in parallel batches with rate limit retry handling.
-        
+        Process multiple prompts concurrently with rate-limit retry handling.
+
+        Dispatch is semaphore-gated: at most ``max_concurrent`` calls run at any
+        instant, and the next prompt fires the moment any in-flight call returns
+        — no fire-a-batch-then-wait barrier — so the slowest call in a notional
+        batch never stalls the others.
+
         Args:
             prompts: List of prompts to process
             model: Model name (e.g., "gpt-4o-mini")
             cache_keys: Optional list of cache keys (if None, no caching)
             schema_hints: Optional list of schema hints
-            batch_size: Maximum number of concurrent requests (default: 16)
+            max_concurrent: Max concurrent in-flight requests. None inherits the
+                wrapper's ``max_concurrent_llm_calls`` (config `concurrency:`).
             max_retries: Maximum retries for rate limit errors (default: 3)
             retry_delay_base: Base delay for exponential backoff (default: 1.0s)
-            
+
         Returns:
             List of parsed JSON responses in same order as input prompts
         """
@@ -421,11 +437,16 @@ class LLMWrapper:
         if reasoning_effort is None:
             reasoning_effort = self.reasoning_effort
 
+        # None means "inherit the wrapper default" (set from config concurrency:).
+        if max_concurrent is None:
+            max_concurrent = self.max_concurrent_llm_calls
+        max_concurrent = max(1, int(max_concurrent))
+
         n_prompts = len(prompts)
         cache_keys = cache_keys or [None] * n_prompts
         schema_hints = schema_hints or [None] * n_prompts
-        
-        print(f"Processing {n_prompts} prompts in batches of {batch_size}")
+
+        print(f"Processing {n_prompts} prompts with up to {max_concurrent} concurrent LLM calls")
         
         # Check cache first and prepare uncached tasks
         results = [None] * n_prompts
@@ -453,43 +474,69 @@ class LLMWrapper:
         # and close it when done — see make_async_openrouter_client.
         self._async_client = make_async_openrouter_client()
         try:
-            # Process uncached prompts in batches
-            for batch_start in range(0, len(uncached_indices), batch_size):
-                batch_end = min(batch_start + batch_size, len(uncached_indices))
-                batch_indices = uncached_indices[batch_start:batch_end]
+            # Semaphore-gated continuous dispatch: every uncached prompt becomes
+            # a task immediately, but the semaphore lets only `max_concurrent`
+            # actually hit the API at once. As soon as any call returns it
+            # releases its slot and the next queued task acquires it — so the
+            # provider is kept saturated at exactly `max_concurrent` without the
+            # slowest call in a window stalling the rest (the old fire-a-batch-
+            # then-await behavior).
+            semaphore = asyncio.Semaphore(max_concurrent)
+            total = len(uncached_indices)
+            completed = 0
 
-                print(f"Processing batch {batch_start//batch_size + 1}: items {batch_start + 1}-{batch_end} of {len(uncached_indices)} uncached")
+            async def _run_one(i: int):
+                nonlocal completed
+                async with semaphore:
+                    try:
+                        result = await self._async_json_complete_with_retry(
+                            prompt=prompts[i],
+                            model=model,
+                            cache_key=cache_keys[i],
+                            schema_hint=schema_hints[i],
+                            max_retries=max_retries,
+                            retry_delay_base=retry_delay_base,
+                            reasoning_effort=reasoning_effort,
+                            verbosity=verbosity,
+                            print_reasoning_summary=print_reasoning_summary,
+                            max_tokens=max_tokens,
+                        )
+                    except Exception as e:  # keep going; caller inspects per-item
+                        result = e
+                completed += 1
+                if isinstance(result, Exception):
+                    print(f"Task failed for prompt {i} ({completed}/{total}): {result}")
+                elif verbosity > 0:
+                    print(f"Completed {completed}/{total} LLM calls")
+                # Return the index alongside the result so out-of-order
+                # completion still maps back to the right slot.
+                return i, result
 
-                # Create tasks for this batch
-                tasks = []
-                for i in batch_indices:
-                    prompt = prompts[i]
-                    cache_key = cache_keys[i]
-                    schema_hint = schema_hints[i]
+            # Periodic progress ticker: prints the completed fraction every
+            # `progress_interval` seconds while the batch runs, so long phases
+            # show liveness instead of going silent until the final line. It
+            # only reads `completed`/`total`, never touches the result slots,
+            # and is cancelled the moment all tasks finish.
+            label = f"[{progress_label}] " if progress_label else ""
 
-                    task = asyncio.create_task(self._async_json_complete_with_retry(
-                        prompt=prompt,
-                        model=model,
-                        cache_key=cache_key,
-                        schema_hint=schema_hint,
-                        max_retries=max_retries,
-                        retry_delay_base=retry_delay_base,
-                        reasoning_effort=reasoning_effort,
-                        verbosity=verbosity,
-                        print_reasoning_summary=print_reasoning_summary
-                    ))
-                    tasks.append(task)
+            async def _progress_ticker():
+                try:
+                    while True:
+                        await asyncio.sleep(progress_interval)
+                        if completed >= total:
+                            break
+                        pct = 100.0 * completed / total if total else 100.0
+                        print(f"{label}LLM progress: {completed}/{total} ({pct:.0f}%)")
+                except asyncio.CancelledError:
+                    pass
 
-                # Execute batch
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Store results, handling exceptions
-                for i, result in zip(batch_indices, batch_results):
-                    if isinstance(result, Exception):
-                        print(f"Task failed for prompt {i}: {result}")
-                        results[i] = result  # Keep exception in results for caller to handle
-                    else:
-                        results[i] = result
+            tasks = [asyncio.create_task(_run_one(i)) for i in uncached_indices]
+            ticker = asyncio.create_task(_progress_ticker())
+            try:
+                for i, result in await asyncio.gather(*tasks):
+                    results[i] = result  # exceptions kept in-place for caller to handle
+            finally:
+                ticker.cancel()
         finally:
             await self._async_client.close()
             self._async_client = None
@@ -508,7 +555,8 @@ class LLMWrapper:
         retry_delay_base: float = 1.0,
         reasoning_effort: Optional[str] = None,
         verbosity: int = 0,
-        print_reasoning_summary: bool = False
+        print_reasoning_summary: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Single async JSON completion with retry logic."""
         # Check cache first
@@ -532,6 +580,8 @@ class LLMWrapper:
                 call_kwargs: Dict[str, Any] = {}
                 if self.json_mode:
                     call_kwargs["response_format"] = {"type": "json_object"}
+                if max_tokens is not None:
+                    call_kwargs["max_tokens"] = max_tokens
 
                 response = await async_chat_completion(
                     self._async_client,

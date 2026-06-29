@@ -130,7 +130,13 @@ def extract_sections(
             model=model,
             cache_keys=cache_keys,
             schema_hints=schema_hints,
-            batch_size=16,
+            progress_label="extract",
+            # Concurrency is governed globally by the wrapper's
+            # max_concurrent_llm_calls (config concurrency:).
+            # Generous cap so long profiles (full tech stacks) can't truncate
+            # the JSON mid-string — truncation is the usual cause of the
+            # "Could not extract valid JSON" retries at this step.
+            max_tokens=4096,
         ))
 
         # Process batch responses

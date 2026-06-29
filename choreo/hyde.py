@@ -128,7 +128,9 @@ def hyde_descriptors_for_sections(
                         model=model,
                         cache_keys=cache_keys_for_llm,
                         schema_hints=schema_hints,
-                        batch_size=16,
+                        progress_label="hyde",
+                        # Concurrency governed globally by the wrapper's
+                        # max_concurrent_llm_calls (config concurrency:).
                     )
                     return responses
                 finally:
