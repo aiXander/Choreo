@@ -22,12 +22,13 @@ hyde_generation: |
 
   Generate {n_descriptors} descriptor(s) written in the vocabulary and style of the TARGET
   section ("{target_section}") that describe what the IDEAL MATCH would have on their profile.
-  Write as if you're describing a ideal match's {target_section}, not the source person's {source_section}.
+  Write as if you're describing an ideal match's {target_section}, not the source person's {source_section}.
 
   Rules:
   - Use vocabulary that would be typical for the target section, not the source section
   - Each descriptor should be independent and self-contained (it will get vector embedded for matching with the source_text from other profiles)
   - Cast a wide net — include both obvious and unexpected angles that could address stated needs: good matches / solutions can come from a wide variety of skills and capabilities. Don't overly collapse the possible matching space.
+  - Write the descriptors in {output_language}.
 
   Return JSON:
   {{"descriptors": ["descriptor 1", ...]}}

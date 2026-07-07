@@ -1,4 +1,26 @@
-# Discovery Mode — Implementation Plan (V1 lean MVP + V2 roadmap)
+# Discovery Mode — engineered serendipity (V1 lean MVP + V2 roadmap)
+
+**Status:** plan / not started. Originally drafted pre-refactor at the repo
+root; relocated here 2026-07-07 during the improvement-sprint audit and merged
+with that sprint's positioning notes. Paths modernized to the current package
+layout (`src/` → `choreo/`, `config/` → `choreo/defaults/` + config-dir
+overlays).
+
+**Positioning (from [improvement_sprint.md](improvement_sprint.md)):** this is
+the **serendipity half** of the platform's "matchmaking and serendipity
+engine" — the capability Murmura / show-night orchestration actually needs
+(groups + project seeds, not 1:1 intros). Run it as its own sprint, sequenced
+after the improvement sprint, coupled through shared infrastructure:
+
+- The improvement sprint's **Track-1 fixture cohort doubles as this plan's
+  test cohort** (§7 below names the missing fixture as the first task —
+  author once, share).
+- The sprint's Track-2 HyDE work (sub-need decomposition, `matched_via`
+  provenance) feeds §6.7 complement-attraction directly.
+- Build the V1 lean MVP **plus the LLM-dump baseline** exactly as specified
+  below; resist V2 features until each is A/B-benchmarked (§5.8).
+
+---
 
 A new pipeline mode (`--pipeline discovery`) that, instead of producing N warm
 1:1 introductions, reads a whole cohort's onboarding inputs and engineers
@@ -194,22 +216,26 @@ A new `extract_atoms_from_profiles` — modeled on
 implementation: call `llm_wrapper.batch_json_complete` directly (one prompt per
 profile, like `score.py`), prompt returns `{"atoms": ["…", "…"]}`.
 
-- Prompt (`config/discovery_atoms_prompt.yaml`): *"Extract the distinct, interesting,
-  self-contained elements of this person — projects, skills, obsessions, side
-  hobbies, what they're building, and **what they want or need help with**. Each as
-  a standalone sentence that reads on its own. Surface the orthogonal and the quiet,
-  not just the headline. ~3–8 elements. Do not invent."* (Including "what they want"
-  seeds complementarity cheaply — a need-atom can sit near a skill-atom.)
+- Prompt (`choreo/defaults/discovery_atoms_prompt.yaml`): *"Extract the distinct,
+  interesting, self-contained elements of this person — projects, skills,
+  obsessions, side hobbies, what they're building, and **what they want or need
+  help with**. Each as a standalone sentence that reads on its own. Surface the
+  orthogonal and the quiet, not just the headline. ~3–8 elements. Do not invent."*
+  (Including "what they want" seeds complementarity cheaply — a need-atom can sit
+  near a skill-atom.)
 - Cache per profile via `utils.hash_text(profile_text)` (reuse the cache-key pattern
-  from extract.py), so re-runs are free and `--force` re-atomizes.
+  from extract.py), so re-runs are free and `--force` re-atomizes. Heed the
+  improvement sprint's F3 lesson: the cache key must also cover the rendered
+  prompt template + model, or prompt iteration silently replays stale atoms.
 - Embeddings cached as one `.npz` in `embeds_dir`; recompute if the atom set changes.
 
 ### 5.4 LLM proposal pass (the only analysis call)
 
-One batched call over the M selected groups (driven via `asyncio.run`, exactly like
-`score.py:386`). Prompt = members' atoms + their full profiles + the **event
-context** (theme, venue/vibe, time budget, ethos — the constraint is *generative*).
-Stance is a **provocation, not a prediction**. Structured JSON per group:
+One batched call over the M selected groups (driven via `run_coro_blocking`,
+exactly like `score.py` — async-host safe). Prompt = members' atoms + their full
+profiles + the **event context** (theme, venue/vibe, time budget, ethos — the
+constraint is *generative*). Stance is a **provocation, not a prediction**.
+Structured JSON per group:
 
 - `spark_score` (0–1) — the taste judgment geometry can't make;
 - `theme` — the latent thread, named;
@@ -221,17 +247,26 @@ Stance is a **provocation, not a prediction**. Structured JSON per group:
 Cached per group signature (sorted owner ids + atom texts), capped by
 `budgets.max_group_llm_calls`. Rank by `spark_score`; return top `K`.
 
+Single-responsibility caution (mirrors the improvement sprint's §6.1 decision
+to keep scoring and intro generation separate): `spark_score` here is
+**self-graded** — the model rates the proposal it just wrote, so scores will
+skew high across the board. Acceptable for V1 since ranking is relative and
+every group shares the bias; if the §5.8 eval shows poor separation between
+strong and weak provocations, split judging into its own cheap pass (one call
+ranking all M generated proposals comparatively, proposal text as input)
+before reaching for V2 §6.6's geometric scores.
+
 ### 5.5 Reuse map
 
 | Need | Reuse / extend |
 |------|----------------|
 | Load profiles | `ingest.load_profiles` — as-is |
-| Atomize | **NEW** `extract_atoms_from_profiles` (in `extract.py` or new `atomize.py`), reuses `LLMWrapper.batch_json_complete`, `utils.hash_text`, `get_cache_path` |
+| Atomize | **NEW** `extract_atoms_from_profiles` (in `choreo/extract.py` or new `choreo/atomize.py`), reuses `LLMWrapper.batch_json_complete`, `utils.hash_text`, `get_cache_path` |
 | Embed atoms | `embed.get_embeddings` — as-is (**not** `create_section_embeddings`); optional `truncate_embeddings` |
 | Similarity | `utils.cosine_matrix` — as-is |
-| Sample/gate/select | **NEW** `src/sampler.py` — pure numpy |
-| Proposal pass | **NEW** `src/analyze.py` — reuses `batch_json_complete` + `asyncio.run` |
-| Report | **NEW** `src/discovery_report.py` — mirrors `report.py`; reuse `utils` IO |
+| Sample/gate/select | **NEW** `choreo/sampler.py` — pure numpy |
+| Proposal pass | **NEW** `choreo/analyze.py` — reuses `batch_json_complete` + `run_coro_blocking` |
+| Report | **NEW** `choreo/discovery_report.py` — mirrors `report.py`; reuse `utils` IO |
 | Landscape plot | `tsne.py` — thin adapter for a flat `(A, d)` array |
 | Cost | `cost_tracker` — as-is |
 | Pipeline plumbing | `main.py`: `BasePipeline`, `PipelineRegistry`, `apply_io_overrides`, `resolve_prompt_paths`, `--group/--input/--force/--pipeline/--list-pipelines` — register a `DiscoveryPipeline` |
@@ -241,12 +276,15 @@ class.
 
 ### 5.6 Configuration sketch (minimal)
 
+Ships as new keys in `choreo/defaults/config.yaml` + two new packaged prompt
+yamls (overridable per deployment via the standard `--config-dir` overlay):
+
 ```yaml
 models:
   embedding:      "google/gemini-embedding-2-preview"
   embedding_dimensions: 768
-  extraction_llm: "google/gemini-3.1-flash-lite"   # atomization
-  analysis_llm:   "google/gemini-3.1-flash-lite"   # proposals
+  extraction_llm: "<models.extraction_llm default>"   # atomization
+  analysis_llm:   "<models.pair_llm default>"          # proposals
 
 discovery:
   atoms: { max_atoms_per_profile: 8 }
@@ -273,8 +311,8 @@ discovery:
   budgets: { atomize_llm_calls: 100, max_group_llm_calls: 30 }
 
 prompt_files:
-  atoms_prompt:     config/discovery_atoms_prompt.yaml
-  discovery_prompt: config/discovery_prompt.yaml
+  atoms_prompt:     choreo/defaults/discovery_atoms_prompt.yaml
+  discovery_prompt: choreo/defaults/discovery_prompt.yaml
 ```
 
 ### 5.7 Outputs
@@ -305,8 +343,8 @@ To know whether any of this works, V1 ships with a **baseline** to beat:
 
 1. **Scaffold:** `DiscoveryPipeline` (register + CLI), reuse ingest/embed, stub
    `atomize`/`sampler`/`analyze`/`discovery_report`, add the two prompt files. Run a
-   placeholder end-to-end. Author a ~20-person multi-domain fixture cohort to test
-   against (see Risks).
+   placeholder end-to-end. Test cohort = the improvement sprint's Track-1 fixture
+   (~20 diverse profiles — author it there if it doesn't exist yet; see Risks).
 2. **Atomize + landscape:** `extract_atoms_from_profiles`, `AtomTable`, atom t-SNE.
    **Eyeball the landscape before any LLM scoring.**
 3. **Sampler + selection (§5.2):** single-T tempered walk, coherence gate, diversity
@@ -368,6 +406,9 @@ LLM. Measure whether geometric pre-ranking beats pure LLM judging.
 ones (React dev ≠ near designer). *Sketch:* give each atom a HyDE-derived "complement
 vector" (what would *complete* it; reuse `hyde.py`) and blend into growth:
 `p(c) ∝ exp((α·sim + β·complement)/T)`. *Cost:* +1 HyDE LLM pass over atoms.
+*Note:* build on the improvement sprint's Track-2 HyDE upgrade (sub-need
+decomposition + pooling knob) rather than the single-descriptor V0 — the
+"distinct solution angles" semantics are exactly what a complement vector wants.
 
 ### 6.8 Missing→fill loop (answers Gemini #1)
 *Weakness:* V1 just records the LLM's `missing` field. *Sketch:* embed the missing-
@@ -388,7 +429,10 @@ cohered" ("art-student ↔ robotics 0.68, bridged to producer via sound 0.61").
 alternative, re-score. Cheap matrix ops; polishes raw samples. *Cost:* 0 LLM.
 
 ### 6.12 Modal entry point
-*Sketch:* a `run_discovery_pipeline` Modal entry mirroring the matching one.
+*Sketch:* a `run_discovery` entry mirroring the mode runners in
+`choreo/runners.py` + an endpoint on `deploy_modal.py` (and, motherbrain-side, a
+possible third tool_key — that decision belongs to
+`motherbrain/docs/TODO/01_choreo_matchmaking_integration.md`, not here).
 
 ---
 
@@ -407,10 +451,14 @@ alternative, re-score. Cheap matrix ops; polishes raw samples. *Cost:* 0 LLM.
   the baseline.
 - **No fixture cohort exists yet.** The vivid multi-domain cohort needed to validate
   serendipity must be authored (~20 `.txt` profiles); current `data/*` groups are
-  small and homogeneous. First task in §5.9.
+  small and homogeneous. Shared task with the improvement sprint's Track 1
+  ([improvement_sprint.md](improvement_sprint.md) §2) — whichever sprint runs
+  first authors it.
 - **Don't sample on a signed fused matrix.** Keep similarity a *soft probability
   landscape*; collapsing it into a single maximized score recreates mean-collapse.
 - **Randomness is a feature** — output varies run-to-run by design (fresh best-of-N
-  draw). To pin a batch, persist its `discovery.json`.
+  draw). To pin a batch, persist its `discovery.json`. (Note: `Workflow`-style
+  reproducibility isn't a goal here, but seed the RNG from config so a facilitator
+  *can* reproduce a batch.)
 - **No external frontend.** Output is the markdown report + JSON; the schema is owned
   by this doc.

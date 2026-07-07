@@ -117,9 +117,10 @@ writing and similarity plots (`main.py`).
   to movement") is rewritten by an LLM into skill-vocabulary text, so it
   embeds close to the matching skills. `n_descriptors > 1` is supported
   end-to-end (max-pool over descriptor pairs).
-- **Absent sections are neutral, not zero** — empty sections embed to zero
-  vectors and are masked out of the per-pair fusion. This is what lets a query
-  that only fills `needs` drop into the same machinery
+- **Absent sections are neutral, not zero** — empty sections AND the
+  `"Not specified"` extraction placeholder (`utils.is_absent`) embed to zero
+  vectors, skip HyDE entirely, and are masked out of the per-pair fusion. This
+  is what lets a query that only fills `needs` drop into the same machinery
   ([docs/reference/matching_modes.md](docs/reference/matching_modes.md)).
 
 ### Key Data Flow
@@ -179,7 +180,12 @@ stack on top (lowest → highest), implemented in `choreo/config.py`:
 
 Prompt paths resolve via `resolve_prompt_paths(config_dir=…, config=…)` with
 the same precedence (plus explicit `prompt_files:`/`prompts:` keys in the
-config dict as a final escape hatch).
+config dict as a final escape hatch). One layer above paths, the runners
+resolve prompt **content** via `resolve_prompt_templates(config_dir=…,
+config=…, prompt_paths=…)` — inline text in the config dict
+(`prompts.<name>_prompt_text`, e.g. `scoring_prompt_text`) takes precedence
+over any file, so an external app can carry fully custom prompts in its DB
+and pass them per call with no files at request time.
 
 All LLM and embedding calls route through **OpenRouter** (OpenAI-compatible endpoint, via the `openai` SDK in `llm.py`). Models use OpenRouter slugs (`provider/model`); swap providers or per-phase models by editing the strings.
 
@@ -187,10 +193,15 @@ All LLM and embedding calls route through **OpenRouter** (OpenAI-compatible endp
 models:
   embedding: "google/gemini-embedding-2-preview"
   embedding_dimensions: 1536  # MRL truncation; null = full native size (3072)
-  extraction_llm: "google/gemini-3.1-flash-lite"
-  pair_llm: "google/gemini-3.1-flash-lite"
+  extraction_llm: "minimax/minimax-m3"
+  pair_llm: "minimax/minimax-m3"
   reasoning_effort: "low"           # global default for every phase
-  pair_reasoning_effort: "medium"   # pair scoring + query re-rank override
+  pair_reasoning_effort: "low"      # pair scoring + query re-rank override
+
+instruction_prompt:
+  goal: "…"                    # matching goal injected into every prompt
+  language: null               # pin output language of embedded artifacts
+                               # (sections + HyDE); null = match each profile
 
 hyde:
   n_descriptors: 1             # HyDE phrasings per source section
@@ -198,8 +209,8 @@ hyde:
 recipe:
   section_weights:             # same-section (symmetric); negative = dissimilarity preferred
     skills:  -0.10
-    vision:   0.30
-    project:  0.30
+    vision:   0.35
+    project:  0.25
     needs:   -0.10
   cross_section_weights:       # cross-section (DIRECTIONAL); "<source>_<target>"
     needs_skills: 0.80
@@ -218,12 +229,14 @@ matching:
 query:                         # Mode B defaults
   top_k: 5
   llm_rerank: true             # false = pure-embedding, cheaper
-  generate_intros: true
+  rerank_pool_multiplier: 3    # over-fetch: LLM re-ranks top_k*3 candidates,
+                               # returns top_k (1 = legacy reorder-only)
+  generate_intros: true        # true | int top-N | false
   recipe:                      # query-specific recipe (cross-only by default)
     cross_section_weights: {needs_skills: 1.0}
 
 budgets:
-  max_pair_llm_calls: 1200
+  max_pair_llm_calls: 1600
   max_n_llm_evaluations_per_profile: 24
   n_profiles_to_score_together: 5
 
@@ -248,7 +261,10 @@ dirs (no `bundle_meta.json`) are adopted on first load when the roster matches.
 LLM response caches (scoring, intros, query rerank) key on a **hash of the
 full prompt**, so edited profile content invalidates automatically — never key
 on roster/pair-id alone (a past bug: edited profiles silently replayed stale
-scores). Cache keys must use `utils.hash_text` (sha256), never the builtin
+scores). HyDE cache keys fold in a **prompt-context fingerprint**
+(`hyde.hyde_context_fingerprint`: template + goal + model + language +
+guidelines), so editing `hyde_prompt.yaml` or the goal regenerates descriptors
+instead of replaying stale ones. Cache keys must use `utils.hash_text` (sha256), never the builtin
 `hash()` (salted per process — entries would never hit across runs). Same trap with
 `set` iteration order: anything that feeds an LLM prompt or cache key (scoring
 group composition, b-matching backfill order) must iterate `sorted(...)`, or
@@ -283,6 +299,12 @@ dispatch, not fire-a-window-then-await). One global knob; no per-stage batch siz
 Score normalization takes the reference distribution as an explicit input
 (`utils.prepare_normalized_scores(reference_scores=…)`); only the legacy square
 path derives it from the current matrix.
+
+**Display names**: all three runners accept `display_names={user_id: name}` —
+names go into scoring/intro prompt prose (and query mode's `"__query__"`
+pseudo-user can be named), score JSON and returned fields stay keyed by id.
+Required for readable intros when ids are uuids; without it prompts are
+byte-identical to before, so caches stay warm.
 
 ## Switching matching modes
 

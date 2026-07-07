@@ -26,6 +26,15 @@ models:
 
 instruction_prompt:
   goal: "We are matching members of the Wintercircus Gent community at the fin-de-saison event, where this matchmaking tool is being demo'd to the whole community ahead of a networking session afterward. Most attendees are here for professional reasons: to make valuable, useful business and professional connections — people they should walk over and talk to during the networking event. We want to surface pairs who should connect — where one person's skills fill another's gap, and/or they share a project direction worth collaborating on. Focus on concrete, useful connections: career moves, co-founders, startups, clients, partnerships, and network opportunities."
+  # Output language for the LLM-generated artifacts that get embedded
+  # (extracted sections + HyDE descriptors). null = match each profile's own
+  # language. For mixed-language communities pin ONE canonical language here
+  # (e.g. "Dutch" or "English") so section embeddings stay comparable across
+  # members — the raw profiles keep their original language either way.
+  # NOTE: extraction reuse is keyed on profile content, so switching language
+  # on an existing cohort needs --force to re-extract; HyDE picks it up
+  # automatically (its cache key covers the prompt context).
+  language: null
 
 budgets:
   extraction_llm_calls: 300
@@ -77,8 +86,13 @@ matching:
 # Mode B: query match (1 transient query × M pool candidates).
 query:
   top_k: 5                     # shortlist size returned to the caller
-  llm_rerank: true             # LLM re-rank of the top-K (ON by default; false = pure-embedding, cheaper)
-  generate_intros: true        # per-candidate intro for the final shortlist
+  llm_rerank: true             # LLM re-rank (ON by default; false = pure-embedding, cheaper)
+  # Over-fetch factor for the re-rank: the LLM scores top_k * this many
+  # embedding candidates and the shortlist is the re-ranked top_k — so a good
+  # match the embedding stage ranked just below the cut can be RECOVERED, not
+  # merely reordered. 1 = legacy behavior (re-rank only reorders the top_k).
+  rerank_pool_multiplier: 3
+  generate_intros: true        # true = intro per shortlist row; an int N = only the top N; false = none
   # Optional query-specific recipe override. A query is a partial profile
   # (usually only `needs`), so same-section weights rarely make sense — match
   # on the directional cross term only. Callers can still override per call.

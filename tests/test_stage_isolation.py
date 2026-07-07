@@ -102,10 +102,14 @@ def test_hyde_stage_single_and_multi_descriptor(synthetic_sections_dict, fake_ll
     alice_hyde = hyde3["needs_skills"][0]
     assert all("VISUALS" in d for d in alice_hyde.descriptors)
 
-    # `existing` reuse keyed by content hash -> zero LLM calls
-    from choreo.hyde import hyde_cache_key
+    # `existing` reuse keyed by content hash + prompt-context fingerprint
+    # -> zero LLM calls
+    from choreo.hyde import hyde_cache_key, hyde_context_fingerprint
+    template = load_yaml(DEFAULT_PROMPT_PATHS["hyde"])["hyde_generation"]
+    fingerprint = hyde_context_fingerprint(template, "test", "fake/llm", "needs_skills")
     existing = {"needs_skills": {
-        hyde_cache_key(s.sections["needs"], 3, "needs_skills"): hyde3["needs_skills"][i].descriptors
+        hyde_cache_key(s.sections["needs"], 3, "needs_skills", fingerprint):
+            hyde3["needs_skills"][i].descriptors
         for i, s in enumerate(sections)
     }}
     fake_llm.calls.clear()

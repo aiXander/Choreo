@@ -11,7 +11,7 @@ import time
 import numpy as np
 from typing import Callable, List, Dict, Optional, Tuple
 
-from .utils import ensure_dir, hash_text
+from .utils import ensure_dir, hash_text, is_absent
 from .schemas import (
     EmbeddingsBundle,
     ExtractedSections,
@@ -289,7 +289,13 @@ def embed_sections(
             text_hash = hash_text(text)
             user_hashes[section_name] = text_hash
 
-            if (
+            if is_absent(text):
+                # Absent section (empty OR the "Not specified" placeholder)
+                # -> zero vector ("no signal"), no API call. Checked BEFORE
+                # reuse so phantom placeholder vectors in older bundles get
+                # zeroed out instead of carried forward.
+                n_empty += 1
+            elif (
                 existing is not None
                 and profile.id in ex_user_idx
                 and section_name in ex_sec_idx
@@ -297,9 +303,6 @@ def embed_sections(
             ):
                 vector = existing.embeddings[ex_user_idx[profile.id], ex_sec_idx[section_name]]
                 reused.append((user_idx, section_idx, vector))
-            elif not text or not text.strip():
-                # Empty section -> zero vector ("no signal"), no API call.
-                n_empty += 1
             else:
                 to_embed.append((user_idx, section_idx, text))
         section_hashes[profile.id] = user_hashes
@@ -368,7 +371,7 @@ def embed_sections(
                     continue
 
                 for d, text in enumerate(ud.descriptors):
-                    if text and text.strip():
+                    if not is_absent(text):
                         hyde_to_embed.append((user_idx, d, text))
 
             print(f"  {cross_key}: {n_users} users x {n_desc} descriptors "

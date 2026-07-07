@@ -36,33 +36,50 @@ an optional `FileStore` adds disk caching/persistence but is never required.
 ```python
 from choreo import run_full_match, run_query_match, run_batch_match
 from choreo import sections_from_dict, EmbeddingsBundle, FileStore
-from choreo.config import load_config, resolve_prompt_paths
+from choreo.config import load_config, resolve_prompt_paths, resolve_prompt_templates
 
 config = load_config(config_dir=..., overrides={...})   # packaged defaults ← dir ← dict
 
 # Full cohort — enter at ANY stage:
 run_full_match(profiles, config, store=FileStore("data/grp"))      # raw text
 run_full_match(sections_from_dict({uid: {sec: txt}}), config)      # pre-sectioned
-run_full_match(bundle, config, sections=sections)                  # pre-embedded
+run_full_match(bundle, config, sections=sections,                  # pre-embedded
+               display_names={uid: "Name"})
 # -> {edges, report_data, embeddings (bundle), llm_scores, introductions,
 #     similarity{dir_matrix, sym_matrix, user_ids, matrices_dict}, …}
 
 # Query (Mode B) — pool comes in as an argument, never re-embedded:
 run_query_match({"needs": "a CTO great at agents"}, pool_bundle, config,
-                pool_sections=…, recipe_override=…, top_k=…, llm_rerank=…)
+                pool_sections=…, recipe_override=…, top_k=…, llm_rerank=…,
+                exclude_ids={...},                     # asker + novelty exclusions
+                display_names={uid: "Name", "__query__": "Asker Name"},
+                generate_intros=True)                  # True | int top-N | False
 # -> QueryMatchResult{shortlist, query_sections, recipe, notes, …}
 
 # Batch (Mode C) — members + history are caller-supplied:
 run_batch_match(member_ids, pool_bundle, config,
                 excluded_pairs=store.get_match_history(window_months=6),
-                pool_sections=…)
+                pool_sections=…, display_names={uid: "Name"})
 # -> BatchMatchResult{edges, report_data (members only), new_pairs, …}
 ```
+
+`display_names` (all three runners, optional): `{user_id: human name}` —
+names are woven into the scoring/re-rank/intro prompts and the intro prose
+("For <name>: …") while score JSON and every returned field stay keyed by id.
+Pass it whenever ids are opaque (uuids); prose generated from raw ids cannot
+be repaired afterwards. In query mode a `"__query__"` entry names the asker.
+
+**Mode-B novelty**: there is deliberately no `excluded_pairs` on
+`run_query_match` — for a 1×M query the asker is known, so recent-history
+pairs reduce to candidate user ids. Build that set from your match history
+(same `matching.novelty_window_months` window) and pass it as `exclude_ids`.
 
 JSON-in/JSON-out wrapper for agent tool-calls:
 `choreo.run_query_match_json(payload, config)` — payload takes `query` plus
 either `store_dir` (FileStore path) or an inline `pool`
-(`EmbeddingsBundle.to_dict()` shape).
+(`EmbeddingsBundle.to_dict()` shape); optional keys `top_k`, `llm_rerank`,
+`generate_intros` (bool or int), `recipe_override`, `exclude_ids`,
+`display_names`.
 
 ### 1.3 Stage-level access (`choreo/stages.py`)
 
@@ -122,6 +139,32 @@ Override layering (`choreo/config.py`), lowest to highest precedence:
 Prompt paths resolve the same way via `resolve_prompt_paths(config_dir=…,
 config=…)`, with explicit `prompt_files:`/`prompts:` keys in the config dict
 taking final precedence.
+
+**Inline prompt text** (highest-precedence prompt layer): the config dict can
+carry prompt *content* directly — no files at request time — under
+`prompts.<name>_prompt_text`:
+
+```python
+config = load_config(overrides={"prompts": {
+    "scoring_prompt_text": "…{user_profiles_xml_formatted}…{json_format_hint}",
+    "introduction_prompt_text": "…", "hyde_prompt_text": "…",
+    "section_prompt_text": "<full section-config YAML text or parsed dict>",
+}})
+```
+
+The runners resolve prompts through `resolve_prompt_templates(config_dir=…,
+config=…, prompt_paths=…)` → `{"sections": dict, "scoring"/"introduction"/
+"hyde": template str}`; inline text > explicit paths > config_dir files >
+packaged defaults. Scoring/intro/re-rank LLM caches key on the full prompt and
+the HyDE cache key folds in a prompt-context fingerprint, so switching prompt
+text invalidates the affected cached responses automatically.
+
+**Language pinning**: `instruction_prompt.language` (default null = match each
+profile's own language) pins the output language of the artifacts that get
+embedded (extracted sections + HyDE descriptors) — recommended for
+mixed-language communities so cosine similarity stays comparable. Extraction
+reuse is keyed on profile content, so switching language on an existing cohort
+needs `force`; HyDE picks it up automatically.
 
 ### 2.3 Environment
 `OPENROUTER_API_KEY` as an environment variable (a `.env` in the calling
@@ -194,10 +237,14 @@ embed_score_normalized, llm_score_normalized, intro, starter_topics}`.
  "query_sections": {section: text},
  "shortlist": [{"rank", "user_id", "score", "embed_score",
                  "embed_score_normalized", "llm_score",  # None if rerank off/skipped
-                 "intro", "starter_topics"}],
+                 "intro", "starter_topics"}],  # intro empty beyond generate_intros=N
  "recipe": {...}, "llm_rerank_applied": bool,
  "pool_size": int, "notes": [str]}
 ```
+
+The shortlist is always at most `top_k` rows; with `llm_rerank` on, the LLM
+scored `top_k * query.rerank_pool_multiplier` embedding candidates first
+(over-fetch — recovery, not just reorder) and this is the re-ranked top slice.
 
 ### Batch match (`BatchMatchResult.to_dict()`)
 ```python
@@ -214,9 +261,15 @@ embed_score_normalized, llm_score_normalized, intro, starter_topics}`.
 - **Pair IDs** are alphabetically sorted (`stable_pair_id(a, b)` →
   `"alice_bob"`); any external lookup must use this convention — including the
   `excluded_pairs` sets you pass in.
-- **Match history is yours.** Choreo accepts `excluded_pairs` and returns
-  `new_pairs`; the documented default window is
-  `matching.novelty_window_months` (6) — apply it when building the set.
+- **Match history is yours.** Choreo accepts `excluded_pairs` (Mode C /
+  cohort) and returns `new_pairs`; the documented default window is
+  `matching.novelty_window_months` (6) — apply it when building the set. For
+  Mode B, map the asker's recent-history partners to `exclude_ids` (§1.2) —
+  there is no pair-id mechanism on the query path by design.
+- **Absent sections**: empty strings AND the literal `"Not specified"`
+  placeholder are absent (`choreo.is_absent`) — they embed to zero vectors,
+  skip HyDE entirely, and are masked out of the per-pair fusion as neutral.
+  External stores can safely pass either shape for a missing section.
 - **Embedding ownership**: always in-repo. Store the bundle
   (`EmbeddingsBundle.to_dict()` or the `embeds/` dir format) and hand it back
   as `existing` / `pool`; never embed externally. Bundles carry

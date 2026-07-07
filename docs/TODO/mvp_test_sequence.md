@@ -82,11 +82,20 @@ Verify:
          (conditional commit: nothing new was cached). If logging is too
          coarse, verify instead that repeated cache-hit queries don't grow
          the Volume.
+   - *(sprint 2026-07-07)* The re-rank now **over-fetches**: with defaults it
+     LLM-scores `top_k * 3` embedding candidates and returns the re-ranked top
+     `top_k` — so a shortlist row that was NOT in the embedding top-5 is
+     expected recovery behavior, not a bug, and rerank cost per query is ~3×
+     the old wave. A note `"Re-ranked N embedding candidates (over-fetch …)"`
+     appears in `notes`.
 3. Same query with `"llm_rerank": false` → `llm_rerank_applied: false`,
    `llm_score: null` in shortlist rows, still ranked sensibly.
 4. `"exclude_ids": ["<top hit from #1>"]` → that user absent, next-best
    promoted.
-5. Sanity-check ranking quality by eye: the top hits should actually address
+5. `"display_names": {"<top hit>": "Some Name", "__query__": "Asker"}` →
+   intro prose says "For Asker: …" and uses the candidate's name; no raw ids
+   in the intro text (sprint F4).
+6. Sanity-check ranking quality by eye: the top hits should actually address
    the stated need (this is the product, not just the plumbing).
 
 ## Phase 4 — Stale-cache regression (the bug class we fixed)

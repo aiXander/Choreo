@@ -385,7 +385,8 @@ def upsert_profiles(
     external store propagate its own updated_at timestamps onto the derived
     sections/embeddings (defaults to "now" when omitted).
     """
-    from choreo.utils import hash_text, filter_active_sections, load_yaml, utc_now_iso, DEFAULT_PROMPT_PATHS
+    from choreo.utils import hash_text, filter_active_sections, utc_now_iso
+    from choreo.config import resolve_prompt_templates
     from choreo.ingest import Profile
     from choreo.llm import LLMWrapper
     from choreo.extract import extract_sections
@@ -409,6 +410,10 @@ def upsert_profiles(
         reasoning_effort=models_cfg.get("reasoning_effort", "low"),
     )
     goal = config.get("instruction_prompt", {}).get("goal")
+    language = config.get("instruction_prompt", {}).get("language") or ""
+    # Honors inline prompt-text overrides (config prompts.<name>_prompt_text)
+    # with the packaged defaults as fallback.
+    templates = resolve_prompt_templates(config=config)
 
     now = utc_now_iso()
     profiles = []
@@ -423,7 +428,7 @@ def upsert_profiles(
 
     # Extract (upsert semantics: force only re-extracts the GIVEN profiles,
     # it never wipes the rest of the roster).
-    sections_config = filter_active_sections(load_yaml(DEFAULT_PROMPT_PATHS["sections"]))
+    sections_config = filter_active_sections(templates["sections"])
     existing_by_hash = {} if force else {s.hash: s.sections for s in store.get_sections()}
     failed: list = []
     extracted = extract_sections(
@@ -436,6 +441,7 @@ def upsert_profiles(
         max_calls=config.get("budgets", {}).get("extraction_llm_calls", 300),
         use_llm_cache=not force,
         failed_out=failed,
+        language=language,
     )
     store.put_sections([es for es in extracted if es.id not in set(failed)])
 
@@ -445,18 +451,18 @@ def upsert_profiles(
     cross_weights = config.get("recipe", {}).get("cross_section_weights", {}) or {}
     hyde_descriptors = {}
     if cross_weights:
-        hyde_prompt_template = load_yaml(DEFAULT_PROMPT_PATHS["hyde"])["hyde_generation"]
         hyde_descriptors = generate_hyde_descriptors(
             extracted_sections=all_sections,
             cross_section_weights=cross_weights,
             hyde_config=config.get("hyde", {}),
-            prompt_template=hyde_prompt_template,
+            prompt_template=templates["hyde"],
             goal=goal,
             llm_wrapper=llm_wrapper,
             model=models_cfg.get("extraction_llm"),
             cache_dir=_Path(store.processed_dir),
-            sections_config=load_yaml(DEFAULT_PROMPT_PATHS["sections"]),
+            sections_config=templates["sections"],
             force=force,
+            language=language,
         )
 
     bundle = create_section_embeddings_bundle(

@@ -8,7 +8,7 @@ adapters (the bundled FileStore, or whatever store your app implements).
 Public API (the names most integrations need):
 
     from choreo import run_full_match, run_query_match, run_batch_match
-    from choreo import load_config, resolve_prompt_paths
+    from choreo import load_config, resolve_prompt_paths, resolve_prompt_templates
     from choreo import EmbeddingsBundle, sections_from_dict, FileStore, Store
 
 Plotting helpers (``choreo.tsne``, ``choreo.visualize_similarity``,
@@ -16,7 +16,7 @@ Plotting helpers (``choreo.tsne``, ``choreo.visualize_similarity``,
 ``choreo[plots]`` extra (matplotlib/seaborn/scikit-learn).
 """
 
-from .config import deep_merge, load_config, resolve_prompt_paths
+from .config import deep_merge, load_config, resolve_prompt_paths, resolve_prompt_templates
 from .ingest import Profile, load_profiles
 from .llm import LLMWrapper
 from .runners import run_batch_match, run_full_match, run_query_match
@@ -32,7 +32,7 @@ from .schemas import (
     sections_from_dict,
 )
 from .store import FileStore, Store
-from .utils import DEFAULT_PROMPT_PATHS, DEFAULTS_DIR, is_stale, stable_pair_id, utc_now_iso
+from .utils import DEFAULT_PROMPT_PATHS, DEFAULTS_DIR, is_absent, is_stale, stable_pair_id, utc_now_iso
 
 __all__ = [
     "DEFAULT_PROMPT_PATHS",
@@ -49,10 +49,12 @@ __all__ = [
     "SimilarityResult",
     "Store",
     "deep_merge",
+    "is_absent",
     "is_stale",
     "load_config",
     "load_profiles",
     "resolve_prompt_paths",
+    "resolve_prompt_templates",
     "run_batch_match",
     "run_full_match",
     "run_query_match",

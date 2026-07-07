@@ -19,7 +19,8 @@ persists the returned objects itself (e.g. into Neon).
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
-from .utils import DEFAULT_PROMPT_PATHS, filter_active_sections, load_yaml
+from .utils import filter_active_sections
+from .config import resolve_prompt_templates
 from .llm import LLMWrapper
 from .ingest import Profile
 from .schemas import EmbeddingsBundle, ExtractedSections, sections_from_dict  # noqa: F401
@@ -54,6 +55,7 @@ def run_full_match(
     llm_wrapper: Optional[LLMWrapper] = None,
     prompt_paths: Optional[Dict[str, str]] = None,
     excluded_pairs: Optional[Set[str]] = None,
+    display_names: Optional[Dict[str, str]] = None,
     force: bool = False,
 ) -> Dict[str, Any]:
     """Run the full all-to-all matching flow, entering at whatever stage
@@ -65,7 +67,7 @@ def run_full_match(
             - ``list[ExtractedSections]`` (pre-sectioned, e.g. from
               ``sections_from_dict``): HyDE → embed → match,
             - ``EmbeddingsBundle`` (pre-embedded): straight to similarity
-              (requires ``sections`` for LLM scoring / intros / reports).
+            (requires ``sections`` for LLM scoring / intros / reports).
         config: Full pipeline config dict.
         sections: Sections per user — required only with an EmbeddingsBundle.
         store: Optional FileStore. When given, extraction/HyDE/embeddings use
@@ -73,8 +75,13 @@ def run_full_match(
             Without it everything runs purely in memory.
         llm_wrapper: Optional LLM wrapper (default: store's cache dir, or none).
         prompt_paths: Optional prompt-file overrides
-            ({"sections"/"scoring"/"introduction"/"hyde": path}).
+            ({"sections"/"scoring"/"introduction"/"hyde": path}). Inline
+            prompt text in the config (``prompts.<name>_prompt_text``) takes
+            precedence over paths.
         excluded_pairs: Optional pair_ids never to score/match.
+        display_names: Optional {user_id: human name} map threaded into
+            scoring + intro prompts (prose speaks names, score JSON stays
+            keyed by id) — pass it when ids are uuids.
         force: Re-run every step, ignoring caches.
 
     Returns:
@@ -85,10 +92,11 @@ def run_full_match(
         MRL-truncated ``working_embeddings``/``working_hyde`` used for the
         similarity math (handy for plots).
     """
-    prompt_paths = {**DEFAULT_PROMPT_PATHS, **(prompt_paths or {})}
+    templates = resolve_prompt_templates(config=config, prompt_paths=prompt_paths)
     models_cfg = config.get("models", {})
     budgets = config.get("budgets", {})
     goal = config.get("instruction_prompt", {}).get("goal")
+    language = config.get("instruction_prompt", {}).get("language") or ""
 
     if llm_wrapper is None:
         cache_dir = str(store.cache_dir) if store is not None and store.cache_dir else None
@@ -125,16 +133,17 @@ def run_full_match(
                 if store is not None and store.processed_dir is not None:
                     extracted_sections = extract_sections_from_profiles(
                         profiles=items,
-                        sections_config_path=prompt_paths["sections"],
+                        sections_config=templates["sections"],
                         model=models_cfg.get("extraction_llm"),
                         llm_wrapper=llm_wrapper,
                         processed_dir=str(store.processed_dir),
                         budgets=budgets,
                         goal=goal,
                         force=force,
+                        language=language,
                     )
                 else:
-                    sections_config = filter_active_sections(load_yaml(prompt_paths["sections"]))
+                    sections_config = filter_active_sections(templates["sections"])
                     extracted_sections = extract_sections(
                         profiles=items,
                         sections_config=sections_config,
@@ -143,6 +152,7 @@ def run_full_match(
                         goal=goal,
                         max_calls=budgets.get("extraction_llm_calls", 300),  # matches defaults/config.yaml
                         use_llm_cache=not force,
+                        language=language,
                     )
                 print(f"✅ Extracted sections for {len(extracted_sections)} profiles")
             except Exception as exc:
@@ -161,19 +171,18 @@ def run_full_match(
         if cross_section_weights:
             print("\n🔮 Step 2.5: Generating HyDE descriptors...")
             try:
-                hyde_prompt_template = load_yaml(prompt_paths["hyde"])['hyde_generation']
-                sections_config = load_yaml(prompt_paths["sections"])
                 hyde_descriptors = generate_hyde_descriptors(
                     extracted_sections=extracted_sections,
                     cross_section_weights=cross_section_weights,
                     hyde_config=config.get("hyde", {}),
-                    prompt_template=hyde_prompt_template,
+                    prompt_template=templates["hyde"],
                     goal=goal,
                     llm_wrapper=llm_wrapper,
                     model=models_cfg.get("extraction_llm"),
                     cache_dir=Path(store.processed_dir) if store is not None and store.processed_dir else None,
-                    sections_config=sections_config,
+                    sections_config=templates["sections"],
                     force=force,
+                    language=language,
                 )
                 print(f"✅ Generated HyDE descriptors for {len(hyde_descriptors)} cross-section pairs")
             except Exception as exc:
@@ -247,7 +256,7 @@ def run_full_match(
             sections_dict=sections_dict,
             instruction=instruction,
             goal=goal,
-            prompts_config_path=prompt_paths["scoring"],
+            prompt_template=templates["scoring"],
             llm_wrapper=llm_wrapper,
             model=models_cfg.get("pair_llm"),
             max_n_llm_evaluations_per_profile=budgets.get("max_n_llm_evaluations_per_profile"),
@@ -257,6 +266,7 @@ def run_full_match(
             excluded_pairs=excluded_pairs,
             reasoning_effort=models_cfg.get("pair_reasoning_effort", "medium"),
             unscored_out=unscored_pairs,
+            display_names=display_names,
         )
         print(f"✅ Scored {len(llm_scores)} pairs with LLM")
     except Exception as exc:
@@ -294,10 +304,11 @@ def run_full_match(
             sections_dict=sections_dict,
             instruction=instruction,
             goal=goal,
-            introduction_config_path=prompt_paths["introduction"],
+            prompt_template=templates["introduction"],
             llm_wrapper=llm_wrapper,
             model=models_cfg.get("pair_llm"),
             force=force,
+            display_names=display_names,
         )
         for edge in final_edges:
             intro_obj = introductions.get(edge.pair_id)
@@ -305,7 +316,7 @@ def run_full_match(
                 edge.intro = intro_obj.intro
                 edge.starter_topics = intro_obj.starter_topics
             else:
-                attach_fallback_intro(edge)
+                attach_fallback_intro(edge, display_names=display_names)
         print(f"✅ Generated introductions for {len(introductions)} matches")
     except Exception as exc:
         raise RuntimeError(f"Error generating introductions: {exc}") from exc

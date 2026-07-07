@@ -5,15 +5,15 @@ from collections import defaultdict
 
 from .match import Edge
 from .extract import ExtractedSections
-from .utils import ensure_dir, save_json
+from .utils import ensure_dir, is_absent, save_json
 
 
 def format_sections_for_report(sections: Dict[str, str]) -> str:
     """Format user sections for markdown report."""
     lines = []
-    
+
     for section_name, content in sections.items():
-        if content and content.strip() and content != "Not specified":
+        if not is_absent(content):
             # Capitalize section name for display
             display_name = section_name.replace('_', ' ').title()
             lines.append(f"**{display_name}:** {content}")

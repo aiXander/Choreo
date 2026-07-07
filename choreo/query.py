@@ -19,13 +19,13 @@ from typing import Any, Dict, List, Optional, Set, Union
 import numpy as np
 
 from .utils import (
-    DEFAULT_PROMPT_PATHS,
     filter_active_sections,
     hash_text,
-    load_yaml,
+    is_absent,
     parse_cross_key,
     stable_pair_id,
 )
+from .config import resolve_prompt_templates
 from .llm import LLMWrapper, run_coro_blocking
 from .ingest import Profile
 from .schemas import Edge, EmbeddingsBundle, ExtractedSections
@@ -69,6 +69,7 @@ def build_query_atom(
     llm_wrapper: Optional[LLMWrapper] = None,
     model: Optional[str] = None,
     goal: str = "",
+    language: str = "",
 ) -> ExtractedSections:
     """Build the transient query atom: a partial ExtractedSections.
 
@@ -112,13 +113,14 @@ def build_query_atom(
         model=model,
         llm_wrapper=llm_wrapper,
         goal=goal,
+        language=language,
     )[0]
     # Re-shape to pool section order; treat "Not specified" as absent (empty)
     # so unfilled sections are masked as neutral rather than embedded literally.
     sections = {}
     for name in section_names:
         text = (extracted.sections.get(name) or "").strip()
-        sections[name] = "" if text == "Not specified" else text
+        sections[name] = "" if is_absent(text) else text
     extracted.sections = sections
     return extracted
 
@@ -145,7 +147,8 @@ def _llm_rerank_query_candidates(
     pool_sections: Dict[str, Dict[str, str]],
     config: Dict[str, Any],
     llm_wrapper: LLMWrapper,
-    scoring_prompt_path: str,
+    prompt_template: str,
+    display_names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, float]:
     """Score query↔candidate pairs with the LLM (no set-cover, no b-matching).
 
@@ -156,8 +159,6 @@ def _llm_rerank_query_candidates(
     retries failed calls; this covers parsed-but-incomplete responses).
     Returns {candidate_id: score 0..1} for every candidate the LLM answered.
     """
-    prompts_config = load_yaml(scoring_prompt_path)
-    prompt_template = prompts_config['pair_scoring']
     instruction = config.get("recipe", {}).get("instruction", "find good matches")
     goal = config.get("instruction_prompt", {}).get("goal", "")
 
@@ -189,6 +190,7 @@ def _llm_rerank_query_candidates(
                 prompt_template=prompt_template,
                 goal=goal,
                 pairs=[(QUERY_ID, cand) for cand in chunk],
+                display_names=display_names,
             )
             prompts.append(prompt)
             # Cache key = hash of the full prompt: covers the query content AND
@@ -244,8 +246,9 @@ def run_query_match(
     recipe_override: Optional[Dict[str, Any]] = None,
     top_k: Optional[int] = None,
     llm_rerank: Optional[bool] = None,
-    generate_intros: Optional[bool] = None,
+    generate_intros: Optional[Union[bool, int]] = None,
     exclude_ids: Optional[Set[str]] = None,
+    display_names: Optional[Dict[str, str]] = None,
     llm_wrapper: Optional[LLMWrapper] = None,
     prompt_paths: Optional[Dict[str, str]] = None,
     reference_scores: Optional[np.ndarray] = None,
@@ -259,18 +262,35 @@ def run_query_match(
         pool: Pre-built community embeddings (the caller pulls these from its
             store; never re-embedded here).
         config: Full pipeline config. ``query:`` keys provide defaults for
-            top_k / llm_rerank / generate_intros / recipe.
+            top_k / llm_rerank / generate_intros / recipe /
+            rerank_pool_multiplier.
         pool_sections: ``{user_id: sections}`` for the pool — required for LLM
             re-rank and intros (skipped with a note if absent).
         recipe_override: Per-call recipe (section_weights/cross_section_weights).
             Precedence: argument > config["query"]["recipe"] > config["recipe"].
         top_k: Shortlist size (default config query.top_k, else 5).
-        llm_rerank: LLM re-rank of the top-K. Defaults ON (config query.llm_rerank).
-        generate_intros: Per-candidate intro generation for the final shortlist.
+        llm_rerank: LLM re-rank. Defaults ON (config query.llm_rerank). The
+            re-rank pool is over-fetched to ``top_k *
+            query.rerank_pool_multiplier`` (default 3) embedding candidates so
+            the LLM can *recover* good matches the embedding stage ranked just
+            below the cut, not merely reorder the embedding top-K; the final
+            shortlist is the re-ranked top ``top_k``.
+        generate_intros: Per-candidate intro generation for the final
+            shortlist. ``True`` = all shortlist rows, an int N = only the top
+            N rows (cheaper hot path when the adapter renders fewer), ``False``
+            = none.
         exclude_ids: Pool users to skip (e.g. the asker themself, or users
-            already matched to this need).
+            already matched to this need). Mode-B novelty exclusion maps here:
+            the adapter turns the asker's recent match history into candidate
+            ids and passes them in.
+        display_names: Optional {user_id: human name} map threaded into the
+            re-rank and intro prompts, so prose speaks names even when ids are
+            uuids. Include a ``{"__query__": <asker name>}`` entry to name the
+            query side.
         llm_wrapper: Optional LLM wrapper (defaults to a cache-less one).
         prompt_paths: Optional {"sections"/"scoring"/"introduction"/"hyde": path}.
+            Inline prompt text in the config (``prompts.<name>_prompt_text``)
+            takes precedence over paths.
         reference_scores: Optional stable reference distribution for the
             embed-score normalization (defaults to this pool's own row values).
 
@@ -279,7 +299,8 @@ def run_query_match(
     """
     notes: List[str] = []
     query_cfg = config.get("query", {}) or {}
-    prompt_paths = {**DEFAULT_PROMPT_PATHS, **(prompt_paths or {})}
+    templates = resolve_prompt_templates(config=config, prompt_paths=prompt_paths)
+    language = config.get("instruction_prompt", {}).get("language") or ""
 
     top_k = top_k if top_k is not None else query_cfg.get("top_k", 5)
     llm_rerank = llm_rerank if llm_rerank is not None else query_cfg.get("llm_rerank", True)
@@ -309,7 +330,7 @@ def run_query_match(
     # ---- 1. Build the query atom (partial profile) -------------------------
     sections_config = None
     if isinstance(query, str):
-        sections_config = filter_active_sections(load_yaml(prompt_paths["sections"]))
+        sections_config = filter_active_sections(templates["sections"])
     query_atom = build_query_atom(
         query,
         section_names=pool.section_names,
@@ -317,6 +338,7 @@ def run_query_match(
         llm_wrapper=llm_wrapper,
         model=models_cfg.get("extraction_llm"),
         goal=config.get("instruction_prompt", {}).get("goal", ""),
+        language=language,
     )
 
     # ---- 2. HyDE the populated source section(s) ---------------------------
@@ -337,16 +359,16 @@ def run_query_match(
 
     hyde_descriptors = {}
     if cross_weights:
-        hyde_prompt_template = load_yaml(prompt_paths["hyde"])["hyde_generation"]
         hyde_descriptors = hyde_descriptors_for_sections(
             extracted_sections=[query_atom],
             cross_section_weights=cross_weights,
             hyde_config=config.get("hyde", {}),
-            prompt_template=hyde_prompt_template,
+            prompt_template=templates["hyde"],
             goal=config.get("instruction_prompt", {}).get("goal", ""),
             llm_wrapper=llm_wrapper,
             model=models_cfg.get("extraction_llm"),
-            sections_config=sections_config or load_yaml(prompt_paths["sections"]),
+            sections_config=sections_config or templates["sections"],
+            language=language,
         )
 
     # ---- 3. Embed the query atom (the pool is NEVER re-embedded) -----------
@@ -400,7 +422,15 @@ def run_query_match(
         if user_id not in exclude_ids and np.isfinite(row[j]) and row[j] > 0
     ]
     eligible.sort(key=lambda t: t[1], reverse=True)
-    shortlist_pairs = eligible[:top_k]
+
+    # Over-fetch for the re-rank: give the LLM a pool of top_k * multiplier
+    # embedding candidates so it can RECOVER a good match the embedding stage
+    # ranked just below the cut — a re-rank over exactly top_k candidates can
+    # only reorder, never recover. The final shortlist is truncated back to
+    # top_k after re-ranking; without re-rank the fetch stays at top_k.
+    rerank_pool_multiplier = query_cfg.get("rerank_pool_multiplier", 3) or 1
+    fetch_n = max(top_k, int(top_k * rerank_pool_multiplier)) if llm_rerank else top_k
+    shortlist_pairs = eligible[:fetch_n]
 
     if not shortlist_pairs:
         notes.append("No pool candidate had positive overlapping signal with the query.")
@@ -435,9 +465,15 @@ def run_query_match(
                 pool_sections=pool_sections,
                 config=config,
                 llm_wrapper=llm_wrapper,
-                scoring_prompt_path=prompt_paths["scoring"],
+                prompt_template=templates["scoring"],
+                display_names=display_names,
             )
             rerank_applied = bool(llm_scores)
+            if rerank_applied and len(candidate_ids) > top_k:
+                notes.append(
+                    f"Re-ranked {len(candidate_ids)} embedding candidates "
+                    f"(over-fetch x{rerank_pool_multiplier}) down to top {top_k}."
+                )
 
     blending = config.get("blending", {})
     embed_w = blending.get("embed_weight", 0.35)
@@ -457,11 +493,21 @@ def run_query_match(
             return embed_w * embed_norm[user_id] + llm_w * llm_scores[user_id]
         return embed_norm[user_id]
 
-    ranked = sorted(candidate_ids, key=final_score, reverse=True)
+    # Truncate the (possibly over-fetched) re-ranked pool to the final top_k.
+    ranked = sorted(candidate_ids, key=final_score, reverse=True)[:top_k]
 
     # ---- 6. Intros for the final shortlist ----------------------------------
+    # generate_intros: True = all shortlist rows; int N = only the top N
+    # (cheaper hot path when the adapter renders fewer); False/0 = none.
+    if generate_intros is True:
+        intro_ids = list(ranked)
+    elif generate_intros:
+        intro_ids = list(ranked[:int(generate_intros)])
+    else:
+        intro_ids = []
+
     intros = {}
-    if generate_intros:
+    if intro_ids:
         if pool_sections is None:
             notes.append("generate_intros requested but pool_sections not provided — skipped.")
         else:
@@ -474,7 +520,7 @@ def run_query_match(
                     embed_score=embed_scores[user_id],
                     llm_score=llm_scores.get(user_id, 0.0),
                 )
-                for user_id in ranked
+                for user_id in intro_ids
             ]
             # Intro cache keys hash the full prompt (query text + candidate
             # content), so distinct queries can never collide on the __query__
@@ -484,9 +530,10 @@ def run_query_match(
                 sections_dict={**pool_sections, QUERY_ID: query_atom.sections},
                 instruction=config.get("recipe", {}).get("instruction", "find good matches"),
                 goal=config.get("instruction_prompt", {}).get("goal", ""),
-                introduction_config_path=prompt_paths["introduction"],
+                prompt_template=templates["introduction"],
                 llm_wrapper=llm_wrapper,
                 model=models_cfg.get("pair_llm"),
+                display_names=display_names,
             )
 
     shortlist = []
@@ -528,7 +575,9 @@ def run_query_match_json(
           "pool": {<EmbeddingsBundle.to_dict()>},         # ...or inline (b)
           "pool_sections": {user_id: {section: text}},    # optional with (b)
           "top_k": 5, "llm_rerank": true,                 # optional overrides
-          "recipe_override": {...}, "exclude_ids": [...]
+          "generate_intros": true | <int top-N>,
+          "recipe_override": {...}, "exclude_ids": [...],
+          "display_names": {user_id: "Name", "__query__": "Asker"}
         }
 
     With ``store_dir`` the pool bundle + sections are read via FileStore (the
@@ -568,6 +617,7 @@ def run_query_match_json(
             llm_rerank=payload.get("llm_rerank"),
             generate_intros=payload.get("generate_intros"),
             exclude_ids=set(payload.get("exclude_ids") or ()),
+            display_names=payload.get("display_names"),
             llm_wrapper=llm_wrapper,
         )
         return {"success": True, **result.to_dict()}

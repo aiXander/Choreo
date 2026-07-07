@@ -15,21 +15,66 @@ import asyncio
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-from .utils import save_jsonl, load_jsonl, ensure_dir, hash_text, parse_cross_key
+from .utils import save_jsonl, load_jsonl, ensure_dir, hash_text, is_absent, parse_cross_key
 from .llm import LLMWrapper
 from .schemas import ExtractedSections, HydeDescriptors  # noqa: F401 — HydeDescriptors re-exported
 
 __all__ = [
     "HydeDescriptors",
     "hyde_cache_key",
+    "hyde_context_fingerprint",
     "hyde_descriptors_for_sections",
     "generate_hyde_descriptors",
 ]
 
 
-def hyde_cache_key(source_text: str, n_descriptors: int, cross_key: str) -> str:
-    """Content-addressed cache key for one user's HyDE generation."""
-    return hash_text(f"{source_text}|{n_descriptors}|{cross_key}")
+def _section_guideline(sections_config: Optional[Dict[str, Any]], name: str) -> str:
+    sec = (sections_config or {}).get("sections", {}).get(name)
+    if isinstance(sec, dict):
+        return sec.get("guideline", "Not specified")
+    return "Not specified"
+
+
+def hyde_context_fingerprint(
+    prompt_template: str,
+    goal: str,
+    model: str,
+    cross_key: str,
+    sections_config: Optional[Dict[str, Any]] = None,
+    language: str = "",
+) -> str:
+    """Hash of everything that shapes a HyDE prompt *besides* the per-user
+    source text and n_descriptors (which live in :func:`hyde_cache_key`
+    directly): template, goal, model, output language and the two section
+    guidelines. Folding this into the cache key means editing the HyDE prompt,
+    the matching goal or the model regenerates descriptors instead of silently
+    replaying stale ones (the repo-wide "cache on the full prompt" invariant).
+    """
+    src_section, tgt_section = parse_cross_key(cross_key)
+    return hash_text("|".join([
+        prompt_template or "",
+        goal or "",
+        model or "",
+        language or "",
+        _section_guideline(sections_config, src_section),
+        _section_guideline(sections_config, tgt_section),
+    ]))
+
+
+def hyde_cache_key(
+    source_text: str,
+    n_descriptors: int,
+    cross_key: str,
+    context_fingerprint: str = "",
+) -> str:
+    """Content-addressed cache key for one user's HyDE generation.
+
+    ``context_fingerprint`` (see :func:`hyde_context_fingerprint`) covers the
+    prompt template / goal / model / language / guidelines; without it the key
+    is content-only (the pre-2026-07 legacy shape, kept as the default so the
+    signature stays backward-compatible for direct callers).
+    """
+    return hash_text(f"{source_text}|{n_descriptors}|{cross_key}|{context_fingerprint}")
 
 
 def hyde_descriptors_for_sections(
@@ -43,6 +88,7 @@ def hyde_descriptors_for_sections(
     sections_config: Optional[Dict[str, Any]] = None,
     existing: Optional[Dict[str, Dict[str, List[str]]]] = None,
     use_llm_cache: bool = True,
+    language: str = "",
 ) -> Dict[str, List[HydeDescriptors]]:
     """Pure HyDE transform: sections in, descriptors out. No disk IO.
 
@@ -56,9 +102,17 @@ def hyde_descriptors_for_sections(
         llm_wrapper / model: LLM plumbing.
         sections_config: Optional sections config used for guideline lookups.
         existing: Optional reuse map ``{cross_key: {cache_key: descriptors}}``
-            (cache keys from :func:`hyde_cache_key`). Users whose key is present
-            skip the LLM call. The caller decides where this came from.
+            (cache keys from :func:`hyde_cache_key`, including the context
+            fingerprint). Users whose key is present skip the LLM call. The
+            caller decides where this came from.
         use_llm_cache: Pass False to bypass the LLM wrapper's response cache.
+        language: Output language for the descriptors (config
+            ``instruction_prompt.language``; empty = match the source text).
+
+    Absent sources (empty / ``"Not specified"``) skip the LLM entirely and get
+    empty descriptors — they embed to zero vectors and the per-pair fusion
+    masks them out, instead of the LLM inventing an ideal match for a person
+    with no stated needs (phantom directional matches).
 
     Returns:
         Dict mapping cross_key to list of HydeDescriptors (one per user, in the
@@ -78,22 +132,33 @@ def hyde_descriptors_for_sections(
             if isinstance(sec, dict) and "guideline" in sec:
                 section_guidelines[name] = sec["guideline"]
 
+    output_language = language or "the same language as the source text"
+
     for cross_key in cross_section_weights:
         src_section, tgt_section = parse_cross_key(cross_key)
         print(f"Generating HyDE descriptors for {cross_key} (source={src_section}, target={tgt_section})")
 
         existing_for_key = existing.get(cross_key, {})
+        fingerprint = hyde_context_fingerprint(
+            prompt_template, goal, model, cross_key,
+            sections_config=sections_config, language=language,
+        )
 
-        # Separate cached and uncached
+        # Separate absent, cached and uncached
         prompts = []
         cache_keys_for_llm = []
         uncached_indices = []
         all_cache_keys = []
+        absent_indices = set()
 
         for idx, es in enumerate(extracted_sections):
             source_text = es.sections.get(src_section, "Not specified")
-            cache_key = hyde_cache_key(source_text, n_descriptors, cross_key)
+            cache_key = hyde_cache_key(source_text, n_descriptors, cross_key, fingerprint)
             all_cache_keys.append(cache_key)
+
+            if is_absent(source_text):
+                absent_indices.add(idx)
+                continue  # no LLM call; empty descriptors below
 
             if cache_key in existing_for_key:
                 continue  # will use cached
@@ -106,12 +171,15 @@ def hyde_descriptors_for_sections(
                 target_section=tgt_section,
                 source_section_guideline=section_guidelines.get(src_section, "Not specified"),
                 target_section_guideline=section_guidelines.get(tgt_section, "Not specified"),
+                output_language=output_language,
             )
             prompts.append(prompt)
             cache_keys_for_llm.append(f"hyde_{cross_key}_{cache_key}" if use_llm_cache else None)
             uncached_indices.append(idx)
 
-        print(f"  Cached: {len(extracted_sections) - len(uncached_indices)}, to generate: {len(uncached_indices)}")
+        n_cached = len(extracted_sections) - len(uncached_indices) - len(absent_indices)
+        print(f"  Cached: {n_cached}, to generate: {len(uncached_indices)}, "
+              f"absent source (skipped): {len(absent_indices)}")
 
         # Run LLM calls for uncached
         new_items: Dict[str, List[str]] = {}
@@ -175,7 +243,12 @@ def hyde_descriptors_for_sections(
 
         user_descriptors = []
         for idx, es in enumerate(extracted_sections):
-            descriptors = merged.get(all_cache_keys[idx])
+            if idx in absent_indices:
+                # Absent source -> empty descriptors -> zero vectors -> masked
+                # out of the fusion (neutral), never LLM-invented.
+                descriptors = [""] * n_descriptors
+            else:
+                descriptors = merged.get(all_cache_keys[idx])
             if descriptors is None:
                 # Should not happen, but fallback
                 descriptors = [es.sections.get(src_section, "Not specified")] * n_descriptors
@@ -204,6 +277,7 @@ def generate_hyde_descriptors(
     cache_dir: Optional[Path] = None,
     sections_config: Dict[str, Any] = None,
     force: bool = False,
+    language: str = "",
 ) -> Dict[str, List[HydeDescriptors]]:
     """Filesystem wrapper around ``hyde_descriptors_for_sections``.
 
@@ -248,16 +322,23 @@ def generate_hyde_descriptors(
         sections_config=sections_config,
         existing=existing,
         use_llm_cache=not force,
+        language=language,
     )
 
     # Persist the merged cache back to disk (existing + freshly generated).
     if hyde_dir:
         for cross_key, user_descriptors in result.items():
             src_section, _ = parse_cross_key(cross_key)
+            fingerprint = hyde_context_fingerprint(
+                prompt_template, goal, model, cross_key,
+                sections_config=sections_config, language=language,
+            )
             items = dict(existing.get(cross_key, {}))
             for es, hd in zip(extracted_sections, user_descriptors):
                 source_text = es.sections.get(src_section, "Not specified")
-                cache_key = hyde_cache_key(source_text, n_descriptors, cross_key)
+                if is_absent(source_text):
+                    continue  # absent sources never hit the LLM — nothing to cache
+                cache_key = hyde_cache_key(source_text, n_descriptors, cross_key, fingerprint)
                 items[cache_key] = hd.descriptors
             cache_file = hyde_dir / f"{cross_key}.jsonl"
             save_jsonl(

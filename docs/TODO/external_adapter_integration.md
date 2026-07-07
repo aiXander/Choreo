@@ -5,7 +5,7 @@
 validate is documented in
 [reference/stages_and_adapters.md](../reference/stages_and_adapters.md).
 The actual Neon adapter + Modal tool now being built lives in the motherbrain
-repo — see `motherbrain/docs/TODO/04_choreo_matchmaking_integration.md` (choreo
+repo — see `motherbrain/docs/TODO/01_choreo_matchmaking_integration.md` (choreo
 stays unopinionated; all Neon/Modal/world plumbing is motherbrain-side).
 
 - [ ] **Confirm the `Store` protocol surface against the real Neon wrapper.**
@@ -22,8 +22,7 @@ stays unopinionated; all Neon/Modal/world plumbing is motherbrain-side).
       mismatched bundle is ignored (full re-embed), but there is no managed
       bulk re-embed path or `model_version` guard for external stores yet.
 
-- [ ] **Query intro phrasing:** intros for query mode address the pseudo-user
-      as `__query__` in the generated prose ("For __query__: …"). Fine for
-      machine consumption; if these intros ever go user-facing verbatim, add a
-      display-name substitution at the product layer or a `query_label`
-      parameter to `run_query_match`.
+- [x] **Query intro phrasing** — RESOLVED (2026-07-07, improvement-sprint
+      F4): all three runners accept `display_names={user_id: name}`; a
+      `{"__query__": <asker name>}` entry makes query intros address the asker
+      by name. See [reference/matching_modes.md](../reference/matching_modes.md).

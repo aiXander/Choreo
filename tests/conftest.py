@@ -84,7 +84,8 @@ def default_responder(component: str, prompt: str):
         return {"descriptors": [f"{source} (variant {i})" for i in range(n)]}
 
     if component in ("batch_pair_scoring", "query_rerank"):
-        keys = re.findall(r"'([^']+)': 0\.\.1", prompt)
+        # Pair keys come from the json.dumps format hint: {"a_b": "0..1", ...}
+        keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
         # Deterministic per-pair score in [0.30, 0.90]
         return {
             k: 0.30 + (int(hashlib.sha256(k.encode()).hexdigest()[:4], 16) % 61) / 100.0
@@ -92,7 +93,9 @@ def default_responder(component: str, prompt: str):
         }
 
     if component == "introduction_generation":
-        m = re.findall(r"Profile of ([\w\-_]+):", prompt)
+        # Captures the display name (or id) from the profile headers — display
+        # names may contain spaces.
+        m = re.findall(r"Profile of ([^:\n]+):", prompt)
         a, b = (m + ["A", "B"])[:2]
         return {
             "intro_for_a": f"intro for {a} about {b}",
@@ -111,6 +114,7 @@ class FakeLLMWrapper:
         self.cache_dir = None
         self.call_count = 0
         self.calls = []          # (component, n_prompts) per batch call
+        self.prompts_seen = []   # (component, prompt) per individual prompt
         self.component = None
         self.reasoning_effort = "low"
 
@@ -123,6 +127,7 @@ class FakeLLMWrapper:
         out = []
         for prompt in prompts:
             self.call_count += 1
+            self.prompts_seen.append((self.component, prompt))
             out.append(self.responder(self.component, prompt))
         return out
 

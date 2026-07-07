@@ -58,7 +58,7 @@ def test_llm_rerank_on_by_default_and_reorders(fake_llm, fake_embed_fn, test_con
     def responder(component, prompt):
         if component == "query_rerank":
             import re
-            keys = re.findall(r"'([^']+)': 0\.\.1", prompt)
+            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
             return {k: (0.95 if "frank" in k else 0.05) for k in keys}
         return default_responder(component, prompt)
 
@@ -97,7 +97,7 @@ def test_rerank_retries_missing_scores(fake_llm, fake_embed_fn, test_config):
     def responder(component, prompt):
         if component == "query_rerank":
             import re
-            keys = re.findall(r"'([^']+)': 0\.\.1", prompt)
+            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
             rerank_calls["n"] += 1
             if rerank_calls["n"] == 1:
                 keys = keys[1:]   # first response omits one pair's score

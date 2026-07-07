@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
-from .utils import DEFAULT_PROMPT_PATHS, stable_pair_id
+from .utils import stable_pair_id
+from .config import resolve_prompt_templates
 from .llm import LLMWrapper
 from .schemas import Edge, EmbeddingsBundle, ExtractedSections, Introduction
 from .candidate import CandidatePair, generate_rectangular_similarity
@@ -151,6 +152,7 @@ def run_batch_match(
     excluded_pairs: Optional[Set[str]] = None,
     *,
     pool_sections: Dict[str, Dict[str, str]],
+    display_names: Optional[Dict[str, str]] = None,
     llm_wrapper: Optional[LLMWrapper] = None,
     prompt_paths: Optional[Dict[str, str]] = None,
 ) -> BatchMatchResult:
@@ -170,8 +172,12 @@ def run_batch_match(
             ``matching.novelty_window_months``).
         pool_sections: ``{user_id: sections}`` for everyone in the pool
             (needed for LLM scoring, intros and reports).
+        display_names: Optional {user_id: human name} map threaded into the
+            scoring + intro prompts (prose speaks names, score JSON stays
+            keyed by id) — required for readable intros when ids are uuids.
         llm_wrapper: Optional LLM wrapper (defaults to a cache-less one).
-        prompt_paths: Optional prompt-file overrides.
+        prompt_paths: Optional prompt-file overrides. Inline prompt text in
+            the config (``prompts.<name>_prompt_text``) takes precedence.
 
     Returns:
         BatchMatchResult: final edges, report data for the members only, and
@@ -179,7 +185,7 @@ def run_batch_match(
         history store).
     """
     excluded_pairs = set(excluded_pairs or ())
-    prompt_paths = {**DEFAULT_PROMPT_PATHS, **(prompt_paths or {})}
+    templates = resolve_prompt_templates(config=config, prompt_paths=prompt_paths)
 
     if not member_ids:
         raise ValueError("member_ids is empty — nothing to match")
@@ -250,7 +256,7 @@ def run_batch_match(
         sections_dict=pool_sections,
         instruction=config.get("recipe", {}).get("instruction", "find good matches"),
         goal=config.get("instruction_prompt", {}).get("goal", ""),
-        prompts_config_path=prompt_paths["scoring"],
+        prompt_template=templates["scoring"],
         llm_wrapper=llm_wrapper,
         model=models_cfg.get("pair_llm"),
         max_n_llm_evaluations_per_profile=budgets.get("max_n_llm_evaluations_per_profile"),
@@ -260,6 +266,7 @@ def run_batch_match(
         excluded_pairs=excluded_pairs,
         reasoning_effort=models_cfg.get("pair_reasoning_effort", "medium"),
         unscored_out=unscored_pairs,
+        display_names=display_names,
     )
 
     # ---- asymmetric b-matching ------------------------------------------------
@@ -288,9 +295,10 @@ def run_batch_match(
         sections_dict=pool_sections,
         instruction=config.get("recipe", {}).get("instruction", "find good matches"),
         goal=config.get("instruction_prompt", {}).get("goal", ""),
-        introduction_config_path=prompt_paths["introduction"],
+        prompt_template=templates["introduction"],
         llm_wrapper=llm_wrapper,
         model=models_cfg.get("pair_llm"),
+        display_names=display_names,
     )
     for edge in final_edges:
         intro = introductions.get(edge.pair_id)
@@ -298,7 +306,7 @@ def run_batch_match(
             edge.intro = intro.intro
             edge.starter_topics = intro.starter_topics
         else:
-            attach_fallback_intro(edge)
+            attach_fallback_intro(edge, display_names=display_names)
 
     # ---- reports (members only) + new-pair residue ------------------------------
     extracted = [

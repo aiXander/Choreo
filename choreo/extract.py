@@ -24,8 +24,19 @@ __all__ = [
 ]
 
 
-def build_extraction_prompt(profile_text: str, sections_config: Dict[str, Any], goal: str = "") -> str:
-    """Build prompt for section extraction."""
+def build_extraction_prompt(
+    profile_text: str,
+    sections_config: Dict[str, Any],
+    goal: str = "",
+    language: str = "",
+) -> str:
+    """Build prompt for section extraction.
+
+    ``language`` pins the output language of the extracted sections (config
+    ``instruction_prompt.language``); empty = match the profile's own
+    language. Templates without an ``{output_language}`` placeholder simply
+    ignore it.
+    """
 
     sections_desc = []
     for section_name, config in sections_config['sections'].items():
@@ -40,7 +51,8 @@ def build_extraction_prompt(profile_text: str, sections_config: Dict[str, Any], 
     prompt = prompt_template.format(
         goal=goal,
         profile_text=profile_text,
-        sections_list=sections_list
+        sections_list=sections_list,
+        output_language=language or "the same language as the profile text",
     )
 
     return prompt
@@ -56,6 +68,7 @@ def extract_sections(
     max_calls: Optional[int] = None,
     use_llm_cache: bool = True,
     failed_out: Optional[List[str]] = None,
+    language: str = "",
 ) -> List[ExtractedSections]:
     """Pure extraction transform: profiles in, ExtractedSections out. No disk IO.
 
@@ -79,6 +92,11 @@ def extract_sections(
             extraction failed (they are returned with "Not specified" sections
             so the pipeline keeps running, but adapters must NOT persist them —
             persisting would prevent the retry on the next run).
+        language: Output language for extracted sections (config
+            ``instruction_prompt.language``; empty = match the profile's own
+            language). NOTE: extraction reuse is keyed on the profile content
+            hash, so changing the language only affects new/changed profiles —
+            use ``force`` to re-extract an existing cohort in a new language.
 
     Returns:
         One ExtractedSections per profile (order: cached first, then fresh —
@@ -117,7 +135,7 @@ def extract_sections(
     schema_hints = []
 
     for profile in uncached_profiles:
-        prompts.append(build_extraction_prompt(profile.text, sections_config, goal))
+        prompts.append(build_extraction_prompt(profile.text, sections_config, goal, language=language))
         cache_keys.append(f"extract_{profile.hash}" if use_llm_cache else None)
         schema_hints.append(generate_schema_hint_from_sections(sections_config))
 
@@ -209,13 +227,15 @@ def extract_sections(
 
 def extract_sections_from_profiles(
     profiles: List[Profile],
-    sections_config_path: str,
-    model: str,
-    llm_wrapper: LLMWrapper,
-    processed_dir: str,
-    budgets: Dict[str, int],
+    sections_config_path: Optional[str] = None,
+    model: str = None,
+    llm_wrapper: LLMWrapper = None,
+    processed_dir: str = None,
+    budgets: Dict[str, int] = None,
     goal: str = "",
-    force: bool = False
+    force: bool = False,
+    sections_config: Optional[Dict[str, Any]] = None,
+    language: str = "",
 ) -> List[ExtractedSections]:
     """Filesystem wrapper around ``extract_sections``.
 
@@ -223,8 +243,14 @@ def extract_sections_from_profiles(
     (keyed by profile content hash) and appends newly extracted ones — the
     historical disk-cache behavior, now expressed as adapter logic around the
     pure transform.
+
+    Pass either ``sections_config_path`` (loaded from disk) or an
+    already-parsed ``sections_config`` dict (e.g. from
+    ``resolve_prompt_templates`` — supports inline per-call prompt overrides).
     """
-    sections_config = load_yaml(sections_config_path)
+    if sections_config is None:
+        sections_config = load_yaml(sections_config_path)
+    budgets = budgets or {}
     sections_config = filter_active_sections(sections_config)
     processed_path = ensure_dir(processed_dir)
     sections_file = processed_path / "sections.jsonl"
@@ -253,6 +279,7 @@ def extract_sections_from_profiles(
         max_calls=budgets.get('extraction_llm_calls', 300),  # matches defaults/config.yaml
         use_llm_cache=not force,
         failed_out=failed_ids,
+        language=language,
     )
 
     # Persist newly extracted sections (overwrite if force, append otherwise).

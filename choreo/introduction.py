@@ -1,22 +1,30 @@
 """Introduction and conversation starter generation for matched pairs."""
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from .llm import LLMWrapper, run_coro_blocking
-from .utils import load_yaml, hash_text
+from .utils import load_yaml, hash_text, is_absent
 from .schemas import Edge, Introduction  # noqa: F401 — Introduction re-exported
 
 
-def fallback_introduction(pair_id: str, user1: str, user2: str) -> Introduction:
+def fallback_introduction(
+    pair_id: str,
+    user1: str,
+    user2: str,
+    user1_name: Optional[str] = None,
+    user2_name: Optional[str] = None,
+) -> Introduction:
     """Generic fallback when intro generation failed/was skipped for a pair."""
+    name1 = user1_name or user1
+    name2 = user2_name or user2
     return Introduction(
         pair_id=pair_id,
         user1=user1,
         user2=user2,
         intro=(
-            f"For {user1}: You've been matched with {user2} — "
+            f"For {name1}: You've been matched with {name2} — "
             f"explore how their skills could support your project.\n\n"
-            f"For {user2}: You've been matched with {user1} — "
+            f"For {name2}: You've been matched with {name1} — "
             f"explore how their skills could support your project."
         ),
         starter_topics=(
@@ -26,9 +34,14 @@ def fallback_introduction(pair_id: str, user1: str, user2: str) -> Introduction:
     )
 
 
-def attach_fallback_intro(edge: Edge) -> None:
+def attach_fallback_intro(edge: Edge, display_names: Optional[Dict[str, str]] = None) -> None:
     """Attach the generic fallback intro text directly onto an edge."""
-    fallback = fallback_introduction(edge.pair_id, edge.user1, edge.user2)
+    display_names = display_names or {}
+    fallback = fallback_introduction(
+        edge.pair_id, edge.user1, edge.user2,
+        user1_name=display_names.get(edge.user1),
+        user2_name=display_names.get(edge.user2),
+    )
     edge.intro = fallback.intro
     edge.starter_topics = fallback.starter_topics
 
@@ -40,31 +53,41 @@ def build_introduction_prompt(
     user2_id: str,
     instruction: str,
     prompt_template: str,
-    goal: str
+    goal: str,
+    user1_name: Optional[str] = None,
+    user2_name: Optional[str] = None,
 ) -> str:
-    """Build prompt for introduction generation."""
-    
+    """Build prompt for introduction generation.
+
+    ``user1_name``/``user2_name`` are the human display names woven into the
+    prompt prose (defaults: the ids). Intros never need the model to output
+    ids, so with names present the ids don't appear in the prompt at all —
+    prose generated from uuids can't be repaired afterwards.
+    """
+    name1 = user1_name or user1_id
+    name2 = user2_name or user2_id
+
     # Format sections nicely
-    def format_sections(sections: Dict[str, str], user_id: str) -> str:
-        lines = [f"Profile of {user_id}:"]
+    def format_sections(sections: Dict[str, str], display_name: str) -> str:
+        lines = [f"Profile of {display_name}:"]
         for section_name, content in sections.items():
-            if content and content.strip() and content != "Not specified":
+            if not is_absent(content):
                 lines.append(f"  {section_name.title()}: {content}")
         return "\n".join(lines)
-    
-    user1_text = format_sections(user1_sections, user1_id)
-    user2_text = format_sections(user2_sections, user2_id)
-    
+
+    user1_text = format_sections(user1_sections, name1)
+    user2_text = format_sections(user2_sections, name2)
+
     # Build the complete prompt using template with all variables
     prompt = prompt_template.format(
         instruction=instruction,
         goal=goal,
-        user_a_name=user1_id,
-        user_b_name=user2_id,
+        user_a_name=name1,
+        user_b_name=name2,
         user1_text=user1_text,
         user2_text=user2_text
     )
-    
+
     return prompt
 
 
@@ -78,6 +101,7 @@ def generate_introductions_for_matches(
     model: str = None,
     force: bool = False,
     prompt_template: str = None,
+    display_names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Introduction]:
     """
     Generate introductions and conversation starters for final matched pairs.
@@ -94,10 +118,14 @@ def generate_introductions_for_matches(
         prompt_template: The introduction_generation template string itself
             (keeps the transform free of file IO; takes precedence over
             introduction_config_path)
+        display_names: Optional {user_id: human name} map — names are used in
+            the prompt AND in the assembled intro prose ("For <name>: …"), so
+            uuid-keyed adapters get human-readable intros.
 
     Returns:
         Dictionary mapping pair_id to Introduction
     """
+    display_names = display_names or {}
     # Load prompt template
     if prompt_template is None:
         introduction_config = load_yaml(introduction_config_path)
@@ -130,7 +158,9 @@ def generate_introductions_for_matches(
             user2_id=edge.user2,
             instruction=instruction,
             prompt_template=prompt_template,
-            goal=goal
+            goal=goal,
+            user1_name=display_names.get(edge.user1),
+            user2_name=display_names.get(edge.user2),
         )
         prompts.append(prompt)
         
@@ -166,7 +196,9 @@ def generate_introductions_for_matches(
                     intro_for_a = response.get('intro_for_a')
                     intro_for_b = response.get('intro_for_b')
                     if intro_for_a and intro_for_b:
-                        intro = f"For {edge.user1}: {intro_for_a}\n\nFor {edge.user2}: {intro_for_b}"
+                        name1 = display_names.get(edge.user1, edge.user1)
+                        name2 = display_names.get(edge.user2, edge.user2)
+                        intro = f"For {name1}: {intro_for_a}\n\nFor {name2}: {intro_for_b}"
                     else:
                         intro = str(response.get('intro', 'Great to meet you! Looking forward to our conversation.'))
                     starter_topics = str(response.get('starter_topics', '• Share your background • Discuss common interests'))
@@ -185,7 +217,9 @@ def generate_introductions_for_matches(
                 except Exception as e:
                     print(f"Error processing introduction response for edge {edge.pair_id}: {e}")
                     introductions[edge.pair_id] = fallback_introduction(
-                        edge.pair_id, edge.user1, edge.user2
+                        edge.pair_id, edge.user1, edge.user2,
+                        user1_name=display_names.get(edge.user1),
+                        user2_name=display_names.get(edge.user2),
                     )
                     continue
             

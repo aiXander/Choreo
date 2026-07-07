@@ -40,9 +40,28 @@ Key behaviors and why:
   compress the LLM signal to nothing and make the re-rank a no-op. Query
   scores rank within one shortlist; they are not comparable with cohort/batch
   `final_weight` values.
+- **The re-rank pool is over-fetched** (`query.rerank_pool_multiplier`,
+  default 3): the LLM scores `top_k * multiplier` embedding candidates and the
+  shortlist is the re-ranked top `top_k` — so a good match the embedding stage
+  ranked just below the cut can be *recovered*, not merely reordered. Set the
+  multiplier to 1 for the legacy reorder-only behavior. Intros are only
+  generated for the final `top_k` (or fewer — `generate_intros` also accepts
+  an int N to cap the intro wave at the rows an adapter will render).
+- **Mode-B novelty needs no `excluded_pairs` mechanism**: for a 1×M query the
+  asker is known, so "pairs recently surfaced for this asker" reduces to a set
+  of candidate user ids — build it from your match history and pass it as
+  `exclude_ids` (identical semantics: a novelty-excluded candidate is not
+  surfaced at all). Don't build a parallel pair-id mechanism for query mode.
+- **`display_names`** (`{user_id: name}`, optional on all three runners): maps
+  opaque ids (uuids) to human names inside the scoring/re-rank/intro prompts —
+  prose speaks names, score JSON stays keyed by id. Include a
+  `{"__query__": <asker name>}` entry so query intros address the asker by
+  name. Post-hoc string surgery on generated prose is a losing game; pass
+  names in.
 - Returns a `QueryMatchResult` (shortlist + intros) — **returned, never
   written**. JSON wrapper for agent tool-calls: `query.run_query_match_json`
-  (accepts `store_dir` for the FileStore path or an inline pool dict).
+  (accepts `store_dir` for the FileStore path or an inline pool dict, plus
+  `exclude_ids` / `display_names` / `generate_intros` payload keys).
 
 ## Mode C: subset batch with novelty
 
@@ -86,11 +105,13 @@ store. (An absolute/rubric-anchored LLM score is still an open lever — see
 ```yaml
 matching:
   pool_b_max: null            # Mode C pool-side degree cap
-  novelty_window_months: 6    # Mode C exclusion window (adapters apply it)
+  novelty_window_months: 6    # exclusion window (adapters apply it — Mode C
+                              # excluded_pairs, Mode B exclude_ids)
 query:
   top_k: 5
   llm_rerank: true            # false = pure-embedding, cheaper
-  generate_intros: true
+  rerank_pool_multiplier: 3   # over-fetch factor for the re-rank (1 = reorder-only)
+  generate_intros: true       # true | int top-N | false
   recipe: {…}                 # query-default recipe (cross-only)
 ```
 

@@ -1,12 +1,13 @@
 """LLM-based pair scoring for candidate pairs."""
 
+import json
 from typing import List, Dict, Set, Tuple, Optional
 import numpy as np
 from itertools import combinations
 
 from .candidate import CandidatePair
 from .llm import LLMWrapper, run_coro_blocking
-from .utils import load_yaml, hash_text
+from .utils import load_yaml, hash_text, is_absent
 from .schemas import ExtractedSections, PairScore  # noqa: F401 — PairScore re-exported
 
 
@@ -135,19 +136,31 @@ def build_batch_scoring_prompt(
     prompt_template: str,
     goal: str,
     pairs: Optional[List[Tuple[str, str]]] = None,
+    display_names: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, Dict[str, float]]:
     """Build prompt for batch LLM scoring of multiple profiles.
 
     By default every C(n,2) pair among ``user_profiles`` is requested. Pass
     ``pairs`` to request only a subset — query mode uses this to score
     query↔candidate pairs without asking for candidate↔candidate scores.
+
+    ``display_names`` maps user ids to human names for the prompt prose
+    (profiles render as ``<profile id="…" name="…">``); the returned score
+    JSON stays keyed by id either way. Without it (or for ids not in the map)
+    the prompt is byte-identical to the pre-display_names shape, so existing
+    caches stay warm.
     """
+    display_names = display_names or {}
 
     # Format all user profiles
     def format_sections(sections: Dict[str, str], user_id: str) -> str:
-        lines = [f"Profile of {user_id}:"]
+        name = display_names.get(user_id)
+        if name and name != user_id:
+            lines = [f"Profile of {name} (id: {user_id}):"]
+        else:
+            lines = [f"Profile of {user_id}:"]
         for section_name, content in sections.items():
-            if content and content.strip() and content != "Not specified":
+            if not is_absent(content):
                 lines.append(f"  {section_name.title()}: {content}")
         return "\n".join(lines)
 
@@ -156,22 +169,22 @@ def build_batch_scoring_prompt(
     for user_id in user_profiles:
         user_sections = sections_dict.get(user_id, {})
         profile_text = format_sections(user_sections, user_id)
-        profiles_xml += f"  <profile id=\"{user_id}\">\n    {profile_text.replace(chr(10), chr(10) + '    ')}\n  </profile>\n"
+        name = display_names.get(user_id)
+        tag_attrs = f"id=\"{user_id}\" name=\"{name}\"" if name and name != user_id else f"id=\"{user_id}\""
+        profiles_xml += f"  <profile {tag_attrs}>\n    {profile_text.replace(chr(10), chr(10) + '    ')}\n  </profile>\n"
     profiles_xml += "</profiles>"
 
     # Generate requested pairs and create JSON format hint
     if pairs is None:
         pairs = list(combinations(user_profiles, 2))
     pair_scores = {}
-    json_format = {}
 
     for user1, user2 in pairs:
         pair_key = f"{user1}_{user2}"
         pair_scores[pair_key] = 0.0  # placeholder
-        json_format[pair_key] = 0.0
 
-    json_format_hint = str(json_format).replace("0.0", "0..1")
-    
+    json_format_hint = json.dumps({pair_key: "0..1" for pair_key in pair_scores})
+
     # Build the complete prompt
     prompt = prompt_template.format(
         instruction=instruction,
@@ -179,7 +192,7 @@ def build_batch_scoring_prompt(
         user_profiles_xml_formatted=profiles_xml,
         json_format_hint=json_format_hint
     )
-    
+
     return prompt, pair_scores
 
 
@@ -363,6 +376,7 @@ def score_pairs_with_llm(
     selected_pairs: Optional[List[CandidatePair]] = None,
     reasoning_effort: str = "medium",
     unscored_out: Optional[List[CandidatePair]] = None,
+    display_names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, PairScore]:
     """
     Score pairs using LLM with batch scoring approach.
@@ -395,6 +409,9 @@ def score_pairs_with_llm(
             retries, or a failed batch). Callers append these to the matching
             candidates so they keep their embedding-only weight instead of
             being dropped entirely (mirrors ``extract_sections(failed_out=)``).
+        display_names: Optional {user_id: human name} map threaded into the
+            scoring prompts so the model reasons over names instead of opaque
+            ids (uuids); score JSON stays keyed by id.
 
     Returns:
         Dictionary mapping pair_id to PairScore
@@ -456,7 +473,8 @@ def score_pairs_with_llm(
             sections_dict=sections_dict,
             instruction=instruction,
             prompt_template=prompt_template,
-            goal=goal
+            goal=goal,
+            display_names=display_names,
         )
         
         # Cache key = hash of the full prompt: it embeds the roster, every
@@ -537,6 +555,7 @@ def score_pairs_with_llm(
                 prompt_template=prompt_template,
                 goal=goal,
                 pairs=[(p.user1, p.user2) for p in group_pairs],
+                display_names=display_names,
             )
             retry_prompts.append(prompt)
             # Prompt hash covers roster + content + requested pairs; the retry

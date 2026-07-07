@@ -60,6 +60,23 @@ def stable_pair_id(u: str, v: str) -> str:
     return f"{min(u, v)}_{max(u, v)}"
 
 
+def is_absent(text: Optional[str]) -> bool:
+    """Whether a section text carries no real content.
+
+    The canonical absence test for the whole pipeline: empty/whitespace-only
+    strings AND the literal ``"Not specified"`` placeholder that extraction
+    writes for missing sections (case-insensitive, trailing punctuation
+    tolerated). Absent sections must embed to zero vectors and skip HyDE so
+    the per-pair fusion masks them out as neutral — embedding the placeholder
+    as real text made every sparse profile spuriously similar to every other
+    sparse profile.
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    return not stripped or stripped.rstrip(".!").strip().lower() == "not specified"
+
+
 def hash_text(text: str) -> str:
     """Create a stable hash for text content."""
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
