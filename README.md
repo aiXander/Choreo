@@ -8,7 +8,7 @@ useful connections. All behavior is config-driven — switching matching modes
 requires no code edits.
 
 Every stage is a pure transform with a declared IO schema; all persistence
-lives in adapters (the CLI + `FileStore` in this repo, Modal, or an external
+lives in adapters (the CLI + `FileStore` in this repo, or an external
 app's own store).
 
 ## Three matching modes
@@ -79,8 +79,8 @@ Three layers — adapters own all IO, stages stay pure:
 ```
 Adapters (own ALL IO)              Orchestration (choreo/runners.py)    Core stages (pure transforms)
   main.py (CLI + FileStore)    →     run_full_match()            →     extract · hyde · embed ·
-  deploy_modal.py (Modal)            run_query_match()                 similarity (rectangular) ·
-  external app (own store)           run_batch_match()                 score · match · introduce · report
+  external app (own store)           run_query_match()                 similarity (rectangular) ·
+                                     run_batch_match()                 score · match · introduce · report
 ```
 
 - **Schemas** (`choreo/schemas.py`): every stage's IO is a dataclass with
@@ -131,9 +131,9 @@ OpenRouter slugs (`provider/model`):
 models:
   embedding: "google/gemini-embedding-2-preview"
   embedding_dimensions: 1536   # MRL truncation; null = full native size (3072)
-  extraction_llm: "google/gemini-3.1-flash-lite"
-  pair_llm: "google/gemini-3.1-flash-lite"
-  reasoning_effort: "low"      # global default; pair scoring overrides to "medium"
+  extraction_llm: "minimax/minimax-m3"
+  pair_llm: "minimax/minimax-m3"
+  reasoning_effort: "low"      # global default; pair_reasoning_effort overrides pair scoring
 
 hyde:
   n_descriptors: 1             # HyDE phrasings per source section
@@ -141,8 +141,8 @@ hyde:
 recipe:
   section_weights:             # same-section (symmetric); negative = dissimilarity preferred
     skills:  -0.10
-    vision:   0.30
-    project:  0.30
+    vision:   0.35
+    project:  0.25
     needs:   -0.10
   cross_section_weights:       # cross-section (DIRECTIONAL); "<source>_<target>"
     needs_skills: 0.80
@@ -162,9 +162,11 @@ query:                         # Mode B defaults
   llm_rerank: true             # false = pure-embedding, cheaper
 ```
 
-Prompt files in `config/`: `section_prompt.yaml` (section definitions with
-`active` flags), `hyde_prompt.yaml`, `scoring_prompt.yaml`,
-`introduction_prompt.yaml`.
+Prompt files (packaged in `choreo/defaults/`, overridable via a config dir or
+inline `prompts.<name>_prompt_text`): `section_prompt.yaml` (section
+definitions with `active` flags), `hyde_prompt.yaml`, `scoring_prompt.yaml`,
+`introduction_prompt.yaml`. The templates are use-case-neutral by design —
+deployment flavor belongs in `instruction_prompt.goal` + `recipe.instruction`.
 
 ### Switching matching modes (config only)
 
@@ -204,15 +206,10 @@ To move between need/skill matching and symmetric social-connectivity matching:
 - Python ≥ 3.11, managed with [uv](https://docs.astral.sh/uv/)
 - OpenRouter API key (in `.env` as `OPENROUTER_API_KEY`)
 
-## Deployment (Modal)
+## Embedding Choreo in your app
 
-```bash
-uv run modal deploy deploy_modal.py                              # deploy all functions
-uv run modal run deploy_modal.py --input-dir data/test4 --force  # legacy full run
-```
-
-Granular endpoints persist a `FileStore` per group on the `choreo-data` Volume:
-`upsert_profiles(user_profiles_json, group)` · `query_match(payload_json, group)` ·
-`batch_match(members_json, group)` — see the header of `deploy_modal.py` and
-[choreo_IO.md](choreo_IO.md) §1.4. Requires a `choreo-secrets` Modal secret
-holding `OPENROUTER_API_KEY` (add `AWS_*` keys to also push outputs to S3).
+Choreo is a library, not a service — deploy it inside your own app. Implement
+the `Store` protocol over your persistence (or reuse `FileStore`), layer your
+deployment's framing over the packaged defaults with
+`load_config(overrides=…)`, and call the runners. The full wrapping contract
+is [choreo_IO.md](choreo_IO.md) §1.4.

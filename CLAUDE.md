@@ -12,7 +12,7 @@ LLM pair scoring to produce mutually useful connections. Behavior is
 config-driven — switching matching modes requires no code edits.
 
 Every stage is a pure transform with a declared IO schema; all persistence
-lives in adapters (CLI/FileStore in this repo, Modal, or an external app's
+lives in adapters (CLI/FileStore in this repo, or an external app's
 own store). Three trigger shapes are supported: the classic full cohort run
 (N×N), **query match** (1×M hot path: "find me a CTO who…"), and **subset
 batch match** (M members × N pool, novel pairs only). Deep dives:
@@ -64,16 +64,7 @@ uv run python main.py --group test4 --config-dir my_overrides/ \
 uv run pytest
 RUN_LLM_TESTS=1 uv run pytest tests/test_e2e_regression.py   # live golden e2e (needs caches + key)
 
-# Modal deployment (serverless)
-uv run modal deploy deploy_modal.py                              # deploy all functions
-uv run modal run deploy_modal.py --input-dir data/test4 --force  # legacy full run; downloads outputs zip
-# Granular endpoints (persistent FileStore at groups/<group> on the Volume):
-#   upsert_profiles(user_profiles_json, group)  · query_match(payload_json, group)
-#   batch_match(members_json, group)            — see deploy_modal.py header
 ```
-
-Modal needs a `choreo-secrets` secret holding `OPENROUTER_API_KEY` (add `AWS_*`
-keys to it to also push the outputs zip to S3).
 
 `--force` re-runs every step, ignoring caches. Without it, unchanged profiles/sections/embeddings are reused.
 
@@ -84,8 +75,8 @@ Three layers (see [docs/reference/stages_and_adapters.md](docs/reference/stages_
 ```
 Adapters (own ALL IO)              Orchestration (choreo/runners.py)    Core stages (pure transforms)
   main.py (CLI + FileStore)    →     run_full_match()            →     extract · hyde · embed ·
-  deploy_modal.py (Modal)            run_query_match()                 similarity (rectangular) ·
-  Neon wrapper (external app)        run_batch_match()                 score · match · introduce · report
+  Neon wrapper (external app)        run_query_match()                 similarity (rectangular) ·
+                                     run_batch_match()                 score · match · introduce · report
 ```
 
 - **Schemas** (`choreo/schemas.py`): every stage's IO is a dataclass with
@@ -278,7 +269,7 @@ caller-supplied), `ExtractedSections`, and per-user on the bundle
 *internal* invalidation mechanism; timestamps are the **adapter-level**
 freshness signal (`utils.is_stale(artifact_ts, source_ts)`) so an external
 store (Neon `updated_at`) can pass its timestamps in
-(`sections_from_dict(..., last_updated_at=…)`, Modal `upsert_profiles` accepts
+(`sections_from_dict(..., last_updated_at=…)` accepts
 `{"text": …, "last_updated_at": …}` values) and compare them coming back out.
 
 **HyDE gating**: the HyDE step runs *only* when `recipe.cross_section_weights` is non-empty. Empty → fully symmetric mode (no HyDE), backward-compatible with social-connectivity matching.
@@ -329,5 +320,5 @@ at the repo root:
 OPENROUTER_API_KEY=sk-or-...
 ```
 Get a key at https://openrouter.ai/settings/keys. External apps importing
-choreo just set the env var (Modal: via the attached secret); `llm.py` reads
+choreo just set the env var (hosted wrappers: via their secret store); `llm.py` reads
 it lazily at first client construction, no other key plumbing exists.

@@ -389,7 +389,7 @@ def run_query_match(
         # Truncating + renormalizing the WHOLE pool is the dominant per-query
         # CPU cost and the pool is immutable between upserts — memoize the
         # working copy on the bundle object so warm adapters that reuse the
-        # same instance (e.g. deploy_modal's pool cache) pay it once.
+        # same instance (e.g. a host adapter's warm pool cache) pay it once.
         cached = getattr(pool, "_truncated_working_copy", None)
         if cached is not None and cached[0] == embedding_dimensions:
             pool_working = cached[1]
@@ -596,7 +596,7 @@ def run_query_match_json(
         if pool_val is not None:
             # Inline pool: either the serialized dict shape or an
             # already-constructed bundle (lets warm adapters skip the
-            # to_dict/from_dict round-trip — see deploy_modal's pool cache).
+            # to_dict/from_dict round-trip for warm pool caches).
             pool = (pool_val if isinstance(pool_val, EmbeddingsBundle)
                     else EmbeddingsBundle.from_dict(pool_val))
         elif payload.get("store_dir"):

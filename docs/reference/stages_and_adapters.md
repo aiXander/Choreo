@@ -16,8 +16,8 @@ arguments, and store whatever comes back.
 Adapters (own ALL IO)                 Orchestration               Core stages (pure)
 ─────────────────────                 ─────────────               ──────────────────
 CLI / FileStore   (main.py)     →     run_full_match()      →     extract · hyde · embed ·
-Modal             (deploy_modal.py)   run_query_match()           similarity (rectangular) ·
-Neon/Postgres     (external app)      run_batch_match()           score · match · introduce ·
+Neon/Postgres     (external app)      run_query_match()           similarity (rectangular) ·
+                                      run_batch_match()           score · match · introduce ·
                                       (choreo/runners.py)            report (build_report_data)
 ```
 
@@ -121,14 +121,13 @@ points is tested.
   (`apply_io_overrides`: folder mode vs group mode), plots and cost reporting
   around `run_full_match`. Three registered pipelines: `matching`,
   `query_match` (`--query`), `batch_match` (`--members`).
-- **Modal (`deploy_modal.py`)** — legacy full-run function unchanged
-  (throwaway `run_<uuid>` dirs), plus three granular endpoints backed by a
-  persistent `FileStore` at `groups/<group>` on the `choreo-data` Volume:
-  `upsert_profiles` (Mode A, incremental), `query_match` (Mode B),
-  `batch_match` (Mode C). Note `upsert_profiles` has true upsert semantics:
-  `force` re-extracts only the *given* profiles, it never wipes the roster
-  (which is why it uses the pure `extract_sections` + `store.put_sections`
-  instead of the appending disk wrapper).
+- **External/hosted adapters live outside this repo** (the repo used to ship
+  its own Modal app, `deploy_modal.py` — retired 2026-07, git history is the
+  archive; production deployments wrap the library per `choreo_IO.md` §1.4).
+  One upsert semantic worth preserving for any wrapper: scope `force` to the
+  *given* profiles only, never wipe the roster — use the pure
+  `extract_sections` + `store.put_sections` instead of the appending disk
+  wrapper.
 
 ## Non-obvious gotchas
 

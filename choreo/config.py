@@ -28,8 +28,8 @@ Typical usage::
 
     from choreo.config import load_config, resolve_prompt_paths
 
-    config = load_config(config_dir="worlds/wintercircus", overrides={"query": {"top_k": 3}})
-    prompt_paths = resolve_prompt_paths(config_dir="worlds/wintercircus", config=config)
+    config = load_config(config_dir="worlds/my_community", overrides={"query": {"top_k": 3}})
+    prompt_paths = resolve_prompt_paths(config_dir="worlds/my_community", config=config)
     run_query_match(query, pool, config, prompt_paths=prompt_paths, ...)
 """
 

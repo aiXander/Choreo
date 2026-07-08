@@ -95,31 +95,36 @@ spec = stages.get_stage("embed"); spec.run(...); spec.dump(out, path); spec.load
 `load`/`dump` define each stage's canonical disk format, so stages chain
 in-memory **or** via files — both supported.
 
-### 1.4 Modal (serverless, `deploy_modal.py`)
+### 1.4 Embedding Choreo in a host app (the wrapping contract)
 
-App `choreo-matching`, secret `choreo-secrets` (`OPENROUTER_API_KEY`, optional
-`AWS_*` for S3). Legacy full run (`run_matching_pipeline`, throwaway
-`run_<uuid>` dir, returns cohort summary + outputs zip) is unchanged. New
-granular endpoints persist a `FileStore` per group at `groups/<group>` on the
-`choreo-data` Volume:
+Choreo ships as a **library, not a service** — there is no Choreo-owned
+deployment. A host app (serverless function, web backend, cron job) wraps it
+by composing three things, all specified in this doc:
 
-| Function | Mode | Input | Notes |
-|----------|------|-------|-------|
-| `upsert_profiles(user_profiles_json, group)` | A | `{user_id: text}` or `{user_id: {"text": …, "last_updated_at": "<ISO>"}}` JSON | incremental: unchanged profiles/cells skip LLM + embedding; `force` only re-extracts the given profiles; timestamps propagate onto sections/bundle |
-| `query_match(payload_json, group)` | B | see §1.2 payload | pool read from the Volume (warm-container cached); an inline `pool` in the payload takes precedence |
-| `batch_match(members_json, group)` | C | JSON array of ids | novelty window from config; appends new pairs to the group's history |
+1. **Persistence** — implement the `Store` protocol (`choreo/store.py`)
+   against your own DB, or reuse `FileStore` (§4) on a disk/volume. The store
+   holds sections, the embeddings bundle, and match history.
+2. **Config** — `load_config(overrides=…)` (§2.2) deep-merges a plain dict
+   over the packaged defaults. Deployment flavor rides
+   `instruction_prompt.goal` + `recipe.instruction`; whole prompts can be
+   replaced inline via `prompts.<name>_prompt_text`.
+3. **The runners** (§1.2) — Mode-A stage calls for incremental profile
+   upkeep, `run_query_match` (Mode B), `run_batch_match` (Mode C), handing in
+   the pool/bundle loaded from your store.
 
-Every endpoint also accepts `config_overrides_json` — a JSON object
-deep-merged over the packaged default config (same semantics as
-`load_config(overrides=…)`).
+The host owns identity, authorization, scheduling, result delivery and any
+warm caching; Choreo owns the matching compute. Bake the `choreo` package
+directory into the host's image/venv — `defaults/` ships inside the package,
+so `load_config()` works from any cwd. Return-value schemas for tool-shaped
+wrappers are in §5; wrapping conventions in §6.
 
 ---
 
 ## 2. Required Inputs
 
 ### 2.1 Profiles
-One UTF-8 `.txt` per user, filename stem = user ID (or `{user_id: text}` JSON
-via Modal / `sections_from_dict` for pre-sectioned input). Minimum cohort size:
+One UTF-8 `.txt` per user, filename stem = user ID (or a `{user_id: text}`
+mapping / `sections_from_dict` for pre-sectioned input). Minimum cohort size:
 `matching.min_profiles_required` (config; full run only).
 
 ### 2.2 Config files
@@ -168,8 +173,8 @@ needs `force`; HyDE picks it up automatically.
 
 ### 2.3 Environment
 `OPENROUTER_API_KEY` as an environment variable (a `.env` in the calling
-process's cwd is auto-loaded via python-dotenv; on Modal it comes from the
-attached secret). There is no other key plumbing.
+process's cwd is auto-loaded via python-dotenv; hosted wrappers inject it via
+their own secret store). There is no other key plumbing.
 
 ---
 
@@ -222,8 +227,8 @@ data/<group>/
 
 ## 5. Return Value Schemas
 
-### Full run (`_execute_matching_pipeline` / Modal legacy)
-Unchanged from before the refactor: on success
+### Full run (`_execute_matching_pipeline`)
+On success
 `{success: True, matches: list[Edge], profiles_count, outputs_dir,
 cost_report_path, cohort_summary{overview, degree_distribution,
 score_statistics, users}, stats}`; on failure `{success: False, error, …}`.
@@ -275,8 +280,8 @@ scored `top_k * query.rerank_pool_multiplier` embedding candidates first
   as `existing` / `pool`; never embed externally. Bundles carry
   `embedding_model` + `dim` provenance; a model mismatch raises (query) or
   triggers a full re-embed (embed stage).
-- **`--force` / `force=True`** bypasses all caches. Modal `upsert_profiles`
-  scopes `force` to the given profiles only.
+- **`--force` / `force=True`** bypasses all caches. Upsert-style wrappers
+  should scope `force` to the given profiles only.
 - **Caching**: profile-hash for extraction, content-hash for HyDE and
   per-cell embeddings; LLM response caches (scoring/intros/rerank) key on a
   sha256 of the **full prompt**, so edited profile content invalidates them
@@ -287,7 +292,7 @@ scored `top_k * query.rerank_pool_multiplier` embedding candidates first
   caller), `ExtractedSections.last_updated_at`,
   `EmbeddingsBundle.user_timestamps` (persisted in `sections.jsonl` /
   `bundle_meta.json`). Inject your store's `updated_at` via
-  `sections_from_dict(..., last_updated_at=…)` or the Modal upsert dict shape;
+  `sections_from_dict(..., last_updated_at=…)`;
   read it back from the returned objects and use `choreo.is_stale(artifact_ts,
   source_ts)` to decide when a profile needs re-upserting. Content hashes
   remain the internal invalidation mechanism — timestamps never trigger

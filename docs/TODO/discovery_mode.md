@@ -428,9 +428,9 @@ cohered" ("art-student ↔ robotics 0.68, bridged to producer via sound 0.61").
 *Sketch:* take top groups, swap the weakest-marginal member for a hot-sampled
 alternative, re-score. Cheap matrix ops; polishes raw samples. *Cost:* 0 LLM.
 
-### 6.12 Modal entry point
+### 6.12 Runner entry point
 *Sketch:* a `run_discovery` entry mirroring the mode runners in
-`choreo/runners.py` + an endpoint on `deploy_modal.py` (and, motherbrain-side, a
+`choreo/runners.py` (and, host-side, a
 possible third tool_key — that decision belongs to
 `motherbrain/docs/TODO/01_choreo_matchmaking_integration.md`, not here).
 

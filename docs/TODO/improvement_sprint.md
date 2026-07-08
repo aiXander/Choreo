@@ -282,7 +282,7 @@ Items 1–3 **SHIPPED 2026-07-07** (residue below); item 4 stays deferred.
    `resolve_prompt_templates(config_dir=…, config=…, prompt_paths=…)` in
    `config.py` returns `{"sections": dict, "scoring"/"introduction"/"hyde":
    template str}`; inline `prompts.<name>_prompt_text` config keys beat paths
-   beat packaged defaults. All three runners + `deploy_modal.upsert_profiles`
+   beat packaged defaults. All three runners
    consume templates (no file IO downstream); `worlds.settings.choreo` can now
    carry prompt text directly. `section_prompt_text` accepts YAML text or a
    parsed dict.
@@ -385,8 +385,9 @@ phase ends with the standard docs pass: condense the completed section here,
 promote durable residue into
 [reference/matching_modes.md](../reference/matching_modes.md) /
 [reference/stages_and_adapters.md](../reference/stages_and_adapters.md), and
-keep [mvp_test_sequence.md](mvp_test_sequence.md) honest (F1/F4 change a few
-of its assertions: shortlist provenance, intro phrasing).
+(The former mvp_test_sequence.md acceptance plan targeted the retired
+`deploy_modal.py` app and moved to docs/finished/ — production acceptance now
+runs through the host app's own E2E, e.g. motherbrain plan 01 Task D.)
 
 **Shipping contract with motherbrain plan 01:** any phase that ships an
 IO-surface item (§5 summary table) MUST update `choreo_IO.md` in the **same

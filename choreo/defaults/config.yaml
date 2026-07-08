@@ -24,8 +24,14 @@ models:
   # query re-rank) — overrides reasoning_effort for that phase only.
   pair_reasoning_effort: "low"
 
+# The two deployment-flavor knobs. The prompt templates themselves are
+# use-case-neutral by design — ALL deployment/community flavor belongs in
+# `instruction_prompt.goal` (the context paragraph injected into every prompt)
+# and `recipe.instruction` (the match-scoring emphasis). Override them per
+# deployment via config layering; whole-prompt replacement
+# (`prompts.<name>_prompt_text`) is the escape hatch for deeper changes.
 instruction_prompt:
-  goal: "We are matching members of the Wintercircus Gent community at the fin-de-saison event, where this matchmaking tool is being demo'd to the whole community ahead of a networking session afterward. Most attendees are here for professional reasons: to make valuable, useful business and professional connections — people they should walk over and talk to during the networking event. We want to surface pairs who should connect — where one person's skills fill another's gap, and/or they share a project direction worth collaborating on. Focus on concrete, useful connections: career moves, co-founders, startups, clients, partnerships, and network opportunities."
+  goal: "We are matching people in a community whose skills, projects, and needs complement each other. We want to surface pairs who should connect — where one person's skills fill another's gap, and/or they share a project direction worth collaborating on. Focus on concrete, useful connections: a specific skill meeting a specific need, potential collaborations, and shared ambitions worth pursuing together."
   # Output language for the LLM-generated artifacts that get embedded
   # (extracted sections + HyDE descriptors). null = match each profile's own
   # language. For mixed-language communities pin ONE canonical language here
@@ -56,7 +62,7 @@ hyde:
   n_descriptors: 1
 
 recipe:
-  instruction: "Score this match on the value of connecting these two people at the networking event. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional signal is also valuable. Also reward a shared direction or overlapping ambition (two people excited about the same problem who should collaborate), and connections with real business potential (co-founder, startup, client, partnership, or network fit). Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
+  instruction: "Score this match on the value of connecting these two people. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional signal is also valuable. Also reward a shared direction or overlapping ambition (two people excited about the same problem who should collaborate). Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
   section_weights:
     skills:   -0.10
     vision:   0.35
