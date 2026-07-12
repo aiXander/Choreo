@@ -55,12 +55,17 @@ run_query_match({"needs": "a CTO great at agents"}, pool_bundle, config,
                 display_names={uid: "Name", "__query__": "Asker Name"},
                 generate_intros=True)                  # True | int top-N | False
 # -> QueryMatchResult{shortlist, query_sections, recipe, notes, …}
+# pool_sections may be LAZY: pass sections_provider=(ids)->{uid: sections}
+# instead — invoked once with the over-fetched re-rank candidate ids, so a
+# store-backed adapter only materializes text for the survivors.
 
 # Batch (Mode C) — members + history are caller-supplied:
 run_batch_match(member_ids, pool_bundle, config,
                 excluded_pairs=store.get_match_history(window_months=6),
                 pool_sections=…, display_names={uid: "Name"})
 # -> BatchMatchResult{edges, report_data (members only), new_pairs, …}
+# sections_provider works here too: invoked once after budgeted pair selection
+# with union(selected-pair users, member_ids). One of the two is required.
 ```
 
 `display_names` (all three runners, optional): `{user_id: human name}` —

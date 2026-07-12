@@ -114,6 +114,64 @@ def test_select_pairs_rectangular_exclusions_and_caps():
     assert len(ids) == 2             # per-profile cap on the member
 
 
+def test_batch_sections_provider_scoped_to_selected_pairs_and_members(
+    fake_llm, fake_embed_fn, test_config
+):
+    """Lazy pool_sections (P1): the provider runs once, with union(users in
+    selected pairs, member_ids) — a pool user whose only candidate pair is
+    history-excluded is never fetched, and a member with zero surviving pairs
+    still rides along so their report renders."""
+    from conftest import build_pool
+    pool_dict = {
+        "alice": {"skills": "AGENTS dev", "needs": "VISUALS for my show"},
+        "bob": {"skills": "VISUALS shader art", "needs": "AGENTS backend"},
+        "loner": {"skills": "MUSIC composition", "needs": "FOOD catering"},
+        "stranger": {"skills": "FOOD fermentation", "needs": "MUSIC dj"},
+    }
+    sections, _, pool = build_pool(pool_dict, fake_llm, fake_embed_fn,
+                                   cross_weights={"needs_skills": 0.8})
+    all_sections = {s.id: s.sections for s in sections}
+    config = {**test_config,
+              "recipe": {**test_config["recipe"], "section_weights": {}}}
+
+    provider_calls = []
+
+    def provider(ids):
+        provider_calls.append(list(ids))
+        return {i: all_sections[i] for i in ids}
+
+    result = run_batch_match(
+        member_ids=["alice", "loner"],
+        pool=pool,
+        config=config,
+        excluded_pairs={stable_pair_id("loner", "stranger")},  # loner's only pair
+        pool_sections=None,
+        sections_provider=provider,
+        llm_wrapper=fake_llm,
+    )
+
+    assert len(provider_calls) == 1
+    (ids,) = provider_calls
+    # selected-pair users (alice, bob) ∪ members (alice, loner); stranger's
+    # only candidate pair was history-excluded ⇒ never fetched
+    assert set(ids) == {"alice", "bob", "loner"}
+    # the zero-pair member still gets a rendered report
+    assert set(result.report_data["user_reports"]) == {"alice", "loner"}
+    assert {e.pair_id for e in result.edges} == {"alice_bob"}
+
+
+def test_batch_requires_sections_or_provider(synthetic_bundle, fake_llm, test_config):
+    pool, _ = _pool(synthetic_bundle)
+    try:
+        run_batch_match(
+            member_ids=["alice"], pool=pool, config=test_config,
+            excluded_pairs=set(), pool_sections=None, llm_wrapper=fake_llm,
+        )
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "sections_provider" in str(exc)
+
+
 def test_filestore_match_history_window(tmp_path):
     from choreo.schemas import Edge
 

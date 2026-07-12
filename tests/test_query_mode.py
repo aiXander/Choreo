@@ -227,6 +227,65 @@ def test_pool_model_mismatch_raises(synthetic_bundle, fake_llm, test_config):
         )
 
 
+def test_sections_provider_fetches_once_scoped_to_rerank_pool(fake_llm, fake_embed_fn, test_config):
+    """Lazy pool_sections (P1): with pool_sections=None + a sections_provider,
+    the provider runs exactly once, with only the over-fetched re-rank
+    candidate ids — never the whole roster — and the re-rank consumes it."""
+    from conftest import build_pool
+    pool_dict = {
+        f"agent{i}": {"skills": f"AGENTS engineering flavor {i}", "needs": "VISUALS"}
+        for i in range(5)
+    }
+    pool_dict["zed"] = {"skills": "MUSIC", "needs": "FOOD"}   # never a candidate
+    sections, _, pool = build_pool(pool_dict, fake_llm, fake_embed_fn)
+    all_sections = {s.id: s.sections for s in sections}
+
+    provider_calls = []
+
+    def provider(ids):
+        provider_calls.append(list(ids))
+        return {i: all_sections[i] for i in ids}
+
+    query_llm = FakeLLMWrapper()   # fresh wrapper: pool-build HyDE stays out of its ledger
+    result = run_query_match(
+        query={"skills": "AGENTS engineering"},
+        pool=pool,
+        config=test_config,
+        pool_sections=None,
+        sections_provider=provider,
+        # agent-leg style: same-section weights, empty cross ⇒ no HyDE call
+        recipe_override={"section_weights": {"skills": 1.0}, "cross_section_weights": {}},
+        top_k=1,
+        generate_intros=False,
+        llm_wrapper=query_llm,
+    )
+    assert len(provider_calls) == 1
+    (ids,) = provider_calls
+    # top_k(1) × rerank_pool_multiplier(3 default) = 3 of the 5 eligible —
+    # a strict subset of the 6-user roster, zed never fetched
+    assert len(ids) == 3
+    assert set(ids) <= {f"agent{i}" for i in range(5)}
+    assert result.llm_rerank_applied   # provider output fed the re-rank
+    # the leg-style query path makes NO LLM call before the re-rank
+    assert query_llm.components_called() == ["query_rerank"]
+
+
+def test_sections_provider_ignored_when_pool_sections_given(synthetic_bundle, fake_llm, test_config):
+    """Precedence: explicit pool_sections wins — the provider is never called."""
+    pool, pool_sections = _pool(synthetic_bundle)
+
+    def provider(ids):
+        raise AssertionError("provider must not be consulted")
+
+    result = run_query_match(
+        query={"needs": "AGENTS engineering"},
+        pool=pool, config=test_config,
+        pool_sections=pool_sections, sections_provider=provider,
+        generate_intros=False, llm_wrapper=fake_llm,
+    )
+    assert result.llm_rerank_applied
+
+
 def test_reference_scores_normalization(synthetic_bundle, fake_llm, test_config):
     pool, pool_sections = _pool(synthetic_bundle)
     result = run_query_match(

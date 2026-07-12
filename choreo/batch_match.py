@@ -14,7 +14,7 @@ external app applies the same window to its ``past_matches`` table).
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -151,7 +151,8 @@ def run_batch_match(
     config: Dict[str, Any],
     excluded_pairs: Optional[Set[str]] = None,
     *,
-    pool_sections: Dict[str, Dict[str, str]],
+    pool_sections: Optional[Dict[str, Dict[str, str]]] = None,
+    sections_provider: Optional[Callable[[List[str]], Dict[str, Dict[str, str]]]] = None,
     display_names: Optional[Dict[str, str]] = None,
     llm_wrapper: Optional[LLMWrapper] = None,
     prompt_paths: Optional[Dict[str, str]] = None,
@@ -171,7 +172,16 @@ def run_batch_match(
             input — built by the adapter from its match history, honoring
             ``matching.novelty_window_months``).
         pool_sections: ``{user_id: sections}`` for everyone in the pool
-            (needed for LLM scoring, intros and reports).
+            (needed for LLM scoring, intros and reports). Explicit
+            ``pool_sections`` wins over ``sections_provider``; one of the two
+            is required.
+        sections_provider: Lazy fallback for ``pool_sections``: a callable
+            ``(user_ids) -> {user_id: sections}`` invoked ONCE after budgeted
+            pair selection with union(users in selected pairs, member_ids) —
+            the only users whose section text the LLM scoring, intros and
+            member reports ever read (members ride along because
+            ``build_report_data`` renders a profile even for a member with
+            zero surviving pairs).
         display_names: Optional {user_id: human name} map threaded into the
             scoring + intro prompts (prose speaks names, score JSON stays
             keyed by id) — required for readable intros when ids are uuids.
@@ -247,6 +257,20 @@ def run_batch_match(
         global_cap=budgets.get("max_pair_llm_calls", 1200),
         excluded_pairs=excluded_pairs,
     )
+
+    # Lazy pool_sections: everything downstream (scoring, intros, reports)
+    # only reads sections for users in selected pairs plus the members
+    # themselves (reports render zero-pair members too) — fetch exactly that
+    # set. Explicit pool_sections always wins.
+    if pool_sections is None and sections_provider is not None:
+        needed = {u for p in selected_pairs for u in (p.user1, p.user2)}
+        needed.update(member_ids)
+        pool_sections = sections_provider(sorted(needed))
+    if pool_sections is None:
+        raise ValueError(
+            "run_batch_match needs pool_sections or a sections_provider — "
+            "LLM scoring, intros and reports all read section text."
+        )
 
     # ---- LLM pair scoring ----------------------------------------------------
     unscored_pairs: List[CandidatePair] = []

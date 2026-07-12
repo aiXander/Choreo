@@ -23,13 +23,23 @@ shapes:
   them literally).
 
 Key behaviors and why:
-- **The pool is an argument** (`EmbeddingsBundle`), never re-embedded. Only the
-  one-row query atom is HyDE'd + embedded per call → cheap hot path.
-- **Per-call recipe override**: a query has no vision/project to compare, so
-  `config.query.recipe` defaults to pure `cross_section_weights:
-  {needs_skills: 1.0}`; callers can override per call
-  (`recipe_override`). Cross keys whose source section the query didn't fill
-  are dropped for that call (noted in `result.notes`).
+- **The pool is an argument** (`EmbeddingsBundle`), never re-embedded. At most
+  the one-row query atom is embedded (and HyDE'd, when cross weights ask for
+  it) per call → cheap hot path.
+- **Per-call recipe override** (`recipe_override`): the recommended caller
+  shape is an explicit section mapping plus same-section weights with empty
+  cross weights — legs embed directly against the matching pool sections, so
+  the query path makes **zero** LLM calls before the re-rank. There is no
+  packaged `query.recipe` anymore; without an override, queries fall back to
+  the top-level `recipe` (whose cross terms exist for batch mode and DO
+  HyDE-expand the filled query sections). Cross keys whose source section the
+  query didn't fill are dropped for that call (noted in `result.notes`).
+- **`pool_sections` can be lazy** (`sections_provider`): instead of passing
+  section text for the whole pool up front, pass a callable
+  `(user_ids) -> {user_id: sections}` — it's invoked once with the
+  over-fetched re-rank candidate ids after the embedding cut, so a store-backed
+  adapter only materializes text for the ~`top_k × multiplier` survivors.
+  Explicit `pool_sections` wins; with neither, LLM hops skip with a note.
 - **LLM re-rank is ON by default** (`query.llm_rerank`), reusing the pair
   scoring prompt with only query↔candidate pairs requested (no set-cover, no
   b-matching). Requires `pool_sections`; silently skipped with a note
@@ -41,7 +51,7 @@ Key behaviors and why:
   scores rank within one shortlist; they are not comparable with cohort/batch
   `final_weight` values.
 - **The re-rank pool is over-fetched** (`query.rerank_pool_multiplier`,
-  default 3): the LLM scores `top_k * multiplier` embedding candidates and the
+  default 4): the LLM scores `top_k * multiplier` embedding candidates and the
   shortlist is the re-ranked top `top_k` — so a good match the embedding stage
   ranked just below the cut can be *recovered*, not merely reordered. Set the
   multiplier to 1 for the legacy reorder-only behavior. Intros are only
@@ -69,6 +79,11 @@ Key behaviors and why:
 
 - **Members are caller-supplied ids** (⊆ pool). Choreo never reads a `tier`
   flag or decides who's a member — that's app data.
+- **`pool_sections` can be lazy here too** (`sections_provider`): invoked once
+  after budgeted pair selection with union(users in selected pairs,
+  member_ids) — the only users whose text the LLM scoring, intros and member
+  reports read (members ride along because reports render zero-pair members).
+  One of `pool_sections` / `sections_provider` is required.
 - **Match history is an input, not a store this repo owns.** The adapter
   builds `excluded_pairs` from its history honoring
   `matching.novelty_window_months` (default 6): FileStore reads
@@ -108,11 +123,12 @@ matching:
   novelty_window_months: 6    # exclusion window (adapters apply it — Mode C
                               # excluded_pairs, Mode B exclude_ids)
 query:
-  top_k: 5
+  top_k: 4
   llm_rerank: true            # false = pure-embedding, cheaper
-  rerank_pool_multiplier: 3   # over-fetch factor for the re-rank (1 = reorder-only)
+  rerank_pool_multiplier: 4   # over-fetch factor for the re-rank (1 = reorder-only)
   generate_intros: true       # true | int top-N | false
-  recipe: {…}                 # query-default recipe (cross-only)
+  # no packaged query.recipe — pass recipe_override per call, or fall back
+  # to the top-level `recipe`
 ```
 
 CLI: `--pipeline query_match --query '…'` · `--pipeline batch_match --members a,b`.

@@ -218,13 +218,14 @@ matching:
   novelty_window_months: 6     # batch mode: exclusion window for past matches
 
 query:                         # Mode B defaults
-  top_k: 5
+  top_k: 4
   llm_rerank: true             # false = pure-embedding, cheaper
-  rerank_pool_multiplier: 3    # over-fetch: LLM re-ranks top_k*3 candidates,
+  rerank_pool_multiplier: 4    # over-fetch: LLM re-ranks top_k*4 candidates,
                                # returns top_k (1 = legacy reorder-only)
   generate_intros: true        # true | int top-N | false
-  recipe:                      # query-specific recipe (cross-only by default)
-    cross_section_weights: {needs_skills: 1.0}
+  # NO packaged query.recipe: explicit-mapping queries should pass a per-call
+  # recipe_override (same-section weights, empty cross = no query-path HyDE);
+  # without one, queries fall back to the top-level `recipe`.
 
 budgets:
   max_pair_llm_calls: 1600

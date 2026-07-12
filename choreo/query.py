@@ -1,20 +1,28 @@
 """Mode B: query match (1 × M) — the hot path.
 
-A natural-language query ("find me a CTO who's great at agentic engineering")
-is treated as a *partial profile*: a pseudo-user (``__query__``) with only some
-sections populated. It drops straight into the existing directional machinery
-— the per-pair fusion already treats an absent section as neutral, not as
-similarity 0 — so a query with only ``needs`` filled matches via the
-``needs_skills`` cross weight and ignores everything else.
+A query is treated as a *partial profile*: a pseudo-user (``__query__``) with
+only some sections populated. It drops straight into the existing directional
+machinery — the per-pair fusion already treats an absent section as neutral,
+not as similarity 0 — so a query with only some sections filled matches on
+exactly those and ignores everything else.
+
+The recommended query shape is an explicit section mapping authored by the
+caller (e.g. an agent decomposing the ask into per-section legs) combined with
+a ``recipe_override`` of same-section weights and empty cross weights — that
+path embeds the legs directly against the matching pool sections and never
+calls an LLM before the re-rank (no extraction, no HyDE). Raw-text queries
+(extract-LLM auto-expansion) and cross-term recipes (which HyDE-expand the
+filled source sections) remain supported for standalone use.
 
 The candidate pool always comes in as an argument (an EmbeddingsBundle pulled
-from whatever store the caller owns); the pool is NEVER re-embedded here. Only
-the one-row query atom is HyDE'd + embedded per call.
+from whatever store the caller owns); the pool is NEVER re-embedded here. At
+most the one-row query atom is embedded (and HyDE'd, if cross weights ask for
+it) per call.
 """
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 import numpy as np
 
@@ -243,6 +251,7 @@ def run_query_match(
     config: Dict[str, Any],
     *,
     pool_sections: Optional[Dict[str, Dict[str, str]]] = None,
+    sections_provider: Optional[Callable[[List[str]], Dict[str, Dict[str, str]]]] = None,
     recipe_override: Optional[Dict[str, Any]] = None,
     top_k: Optional[int] = None,
     llm_rerank: Optional[bool] = None,
@@ -265,7 +274,15 @@ def run_query_match(
             top_k / llm_rerank / generate_intros / recipe /
             rerank_pool_multiplier.
         pool_sections: ``{user_id: sections}`` for the pool — required for LLM
-            re-rank and intros (skipped with a note if absent).
+            re-rank and intros (skipped with a note if absent). Explicit
+            ``pool_sections`` wins over ``sections_provider``.
+        sections_provider: Lazy fallback for ``pool_sections``: a callable
+            ``(user_ids) -> {user_id: sections}`` invoked ONCE with the
+            over-fetched re-rank candidate ids after the embedding cut, so the
+            caller only materializes section text for the ~top_k×multiplier
+            survivors instead of the whole pool. Only consulted when
+            ``pool_sections`` is None and an LLM hop (re-rank or intros)
+            actually needs sections.
         recipe_override: Per-call recipe (section_weights/cross_section_weights).
             Precedence: argument > config["query"]["recipe"] > config["recipe"].
         top_k: Shortlist size (default config query.top_k, else 5).
@@ -444,6 +461,17 @@ def run_query_match(
         )
 
     candidate_ids = [u for u, _ in shortlist_pairs]
+
+    # Lazy pool_sections: fetch section text for ONLY the over-fetched
+    # candidates, and only when an LLM hop will actually read it. Explicit
+    # pool_sections always wins; absent both, the hops below skip with a note.
+    if (
+        pool_sections is None
+        and sections_provider is not None
+        and (llm_rerank or generate_intros)
+    ):
+        pool_sections = sections_provider(candidate_ids)
+
     embed_scores = {u: float(s) for u, s in shortlist_pairs}
     embed_norm = dict(zip(
         candidate_ids,

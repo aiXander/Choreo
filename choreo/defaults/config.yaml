@@ -90,22 +90,23 @@ matching:
   novelty_window_months: 6
 
 # Mode B: query match (1 transient query × M pool candidates).
+# Recipe note: there is deliberately NO packaged `query.recipe` — the
+# recommended caller shape is an explicit section mapping (per-section query
+# legs) plus a per-call `recipe_override` of same-section weights with empty
+# cross weights, which embeds the legs directly (no extract LLM, no HyDE on
+# the query path). Without an override, queries fall back to the top-level
+# `recipe` (whose cross terms exist for batch mode and DO HyDE-expand the
+# filled query sections) — fine for standalone use, not the hot path.
 query:
-  top_k: 5                     # shortlist size returned to the caller
+  top_k: 4                     # shortlist size returned to the caller
   llm_rerank: true             # LLM re-rank (ON by default; false = pure-embedding, cheaper)
   # Over-fetch factor for the re-rank: the LLM scores top_k * this many
   # embedding candidates and the shortlist is the re-ranked top_k — so a good
   # match the embedding stage ranked just below the cut can be RECOVERED, not
   # merely reordered. 1 = legacy behavior (re-rank only reorders the top_k).
-  rerank_pool_multiplier: 3
+  # Recall pool = top_k * this = 4 * 4 = 16.
+  rerank_pool_multiplier: 4
   generate_intros: true        # true = intro per shortlist row; an int N = only the top N; false = none
-  # Optional query-specific recipe override. A query is a partial profile
-  # (usually only `needs`), so same-section weights rarely make sense — match
-  # on the directional cross term only. Callers can still override per call.
-  recipe:
-    section_weights: {}
-    cross_section_weights:
-      needs_skills: 1.0
 
 io:
   raw_dir: "data/raw"
