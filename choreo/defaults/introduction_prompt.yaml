@@ -9,7 +9,7 @@ introduction_generation: |
   Create:
   1. A directional introduction for {user_a_name} explaining what {user_b_name} can specifically offer their project
   2. A directional introduction for {user_b_name} explaining what {user_a_name} can specifically offer their project
-  3. Specific, actionable starter topics — concrete things they could build or work on together (lead with what they could start on right away, but also note any longer-term collaboration worth exploring)
+  3. Specific, actionable starter topics — concrete things they could build or work on together (lead with what they could start on right away, but also note any longer-term collaboration worth exploring). Format these as a Markdown bulleted list: put each topic on its own line, prefixed with "- " (a hyphen and a space). Do NOT use the "•" character and do NOT run the topics together on a single line.
 
   Be specific about WHICH skills match WHICH needs. Vague "you have shared interests" is not useful.
 
@@ -27,5 +27,5 @@ introduction_generation: |
   {{
     "intro_for_a": "What {user_b_name} can offer {user_a_name}'s project (addressed to {user_a_name})",
     "intro_for_b": "What {user_a_name} can offer {user_b_name}'s project (addressed to {user_b_name})",
-    "starter_topics": "• topic1 • topic2 • topic3 ..."
+    "starter_topics": "- topic1\n- topic2\n- topic3"
   }}

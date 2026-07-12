@@ -28,8 +28,9 @@ def fallback_introduction(
             f"explore how their skills could support your project."
         ),
         starter_topics=(
-            "• Share what you're each building • Identify where your skills "
-            "meet the other's needs • Plan a concrete next step"
+            "- Share what you're each building\n"
+            "- Identify where your skills meet the other's needs\n"
+            "- Plan a concrete next step"
         ),
     )
 
@@ -201,7 +202,7 @@ def generate_introductions_for_matches(
                         intro = f"For {name1}: {intro_for_a}\n\nFor {name2}: {intro_for_b}"
                     else:
                         intro = str(response.get('intro', 'Great to meet you! Looking forward to our conversation.'))
-                    starter_topics = str(response.get('starter_topics', '• Share your background • Discuss common interests'))
+                    starter_topics = str(response.get('starter_topics', '- Share your background\n- Discuss common interests'))
                     
                     # Create Introduction
                     introduction = Introduction(
