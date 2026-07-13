@@ -59,7 +59,7 @@ concurrency:
   max_concurrent_llm_calls: 16
 
 hyde:
-  n_descriptors: 1
+  n_descriptors: 2
 
 recipe:
   instruction: "Score this match on the value of connecting these two people. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional signal is also valuable. Also reward a shared direction or overlapping ambition (two people excited about the same problem who should collaborate). Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
