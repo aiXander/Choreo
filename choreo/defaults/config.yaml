@@ -107,6 +107,25 @@ query:
   # Recall pool = top_k * this = 4 * 4 = 16.
   rerank_pool_multiplier: 4
   generate_intros: true        # true = intro per shortlist row; an int N = only the top N; false = none
+  # Serial re-ask rounds for candidates the model silently dropped from a chunk
+  # response. 0 (default) = never re-ask. By the time a score is known to be
+  # missing the whole wave has already been dispatched, so a retry is a fully
+  # SERIAL extra round-trip — measured at ~20% of query wall clock to rescue a
+  # single candidate out of top_k * rerank_pool_multiplier. Unscored candidates
+  # instead drop out of the shortlist, and the over-fetch pool covers the gap.
+  # Raise only for pools so small that every candidate must be scored.
+  rerank_max_retries: 0
+  # Wall-clock budget for the re-rank wave, in seconds. null (default) = wait
+  # for every call. When set, calls still in flight at the deadline are
+  # cancelled, their candidates go unscored, and the shortlist is built from
+  # whatever landed in time — trading a little recall for bounded, predictable
+  # tool latency. Two rules when sizing it: take it from the pair model's
+  # p50/p75, NOT its p100 (not waiting for the tail is the whole point), and
+  # leave enough headroom that comfortably more than top_k candidates land in
+  # time — otherwise the re-rank stops being selective, and below top_k it
+  # silently falls back to embedding-only ranking. Note that cancelled calls
+  # still bill the tokens the provider already generated.
+  rerank_deadline_s: null
 
 io:
   raw_dir: "data/raw"

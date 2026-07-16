@@ -255,6 +255,12 @@ embed_score_normalized, llm_score_normalized, intro, starter_topics}`.
 The shortlist is always at most `top_k` rows; with `llm_rerank` on, the LLM
 scored `top_k * query.rerank_pool_multiplier` embedding candidates first
 (over-fetch — recovery, not just reorder) and this is the re-ranked top slice.
+Candidates the LLM never scored (silently dropped from a chunk response, or
+cancelled at `query.rerank_deadline_s`) are **excluded** from the shortlist
+rather than ranked on embeddings alone — so `llm_score` is non-null on every
+row, and `notes` reports how many were dropped. One exception: if fewer than
+`top_k` came back scored, the shortlist fills with embed-only rows
+(`llm_score: null`) instead of coming back short, and `notes` says so.
 
 ### Batch match (`BatchMatchResult.to_dict()`)
 ```python

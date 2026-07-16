@@ -81,9 +81,72 @@ def test_llm_rerank_on_by_default_and_reorders(fake_llm, fake_embed_fn, test_con
     assert result.shortlist[0]["llm_score"] == 0.95
 
 
-def test_rerank_retries_missing_scores(fake_llm, fake_embed_fn, test_config):
-    """A parsed-but-incomplete rerank response triggers a re-ask for ONLY the
-    unscored candidates (transport retries don't cover this failure mode)."""
+def _omit_one_score_pool(fake_llm, fake_embed_fn):
+    """A 3-candidate pool + a responder whose FIRST round omits one pair's
+    score (the failure mode a re-ask exists to cover)."""
+    from conftest import build_pool
+    sections, _, pool = build_pool({
+        "alice": {"skills": "AGENTS engineering", "needs": "VISUALS"},
+        "frank": {"skills": "AGENTS automation", "needs": "MUSIC"},
+        "gina": {"skills": "AGENTS research", "needs": "FOOD"},
+    }, fake_llm, fake_embed_fn)
+    calls = {"n": 0}
+
+    def responder(component, prompt):
+        if component == "query_rerank":
+            import re
+            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                keys = keys[1:]   # first response omits one pair's score
+            return {k: 0.8 for k in keys}
+        return default_responder(component, prompt)
+
+    return pool, {s.id: s.sections for s in sections}, calls, responder
+
+
+def test_rerank_does_not_retry_by_default(fake_llm, fake_embed_fn, test_config):
+    """A dropped score costs NO serial re-ask round by default: the retry is a
+    whole extra round-trip after the wave is already dispatched, so
+    `query.rerank_max_retries` defaults to 0 and the unscored candidate simply
+    drops out (test_config carries no override — it mirrors config.yaml)."""
+    pool, pool_sections, calls, responder = _omit_one_score_pool(fake_llm, fake_embed_fn)
+
+    result = run_query_match(
+        query={"needs": "AGENTS engineering"},
+        pool=pool, config=test_config, pool_sections=pool_sections,
+        generate_intros=False, llm_wrapper=FakeLLMWrapper(responder),
+        top_k=2,
+    )
+    assert calls["n"] == 1                 # one round, no re-ask
+    assert result.llm_rerank_applied
+    # The unscored candidate is DROPPED, never embed-ranked into the shortlist.
+    assert all(e["llm_score"] is not None for e in result.shortlist)
+    assert len(result.shortlist) == 2
+
+
+def test_rerank_retries_missing_scores_when_configured(fake_llm, fake_embed_fn, test_config):
+    """`query.rerank_max_retries` > 0 re-asks for ONLY the unscored candidates
+    (transport retries don't cover a parsed-but-incomplete response)."""
+    pool, pool_sections, calls, responder = _omit_one_score_pool(fake_llm, fake_embed_fn)
+    config = {**test_config, "query": {**test_config.get("query", {}), "rerank_max_retries": 1}}
+
+    result = run_query_match(
+        query={"needs": "AGENTS engineering"},
+        pool=pool, config=config, pool_sections=pool_sections,
+        generate_intros=False, llm_wrapper=FakeLLMWrapper(responder),
+    )
+    assert calls["n"] == 2                 # initial round + exactly one retry
+    assert result.llm_rerank_applied
+    # every shortlisted candidate ended up LLM-scored despite the dropped key
+    assert all(e["llm_score"] is not None for e in result.shortlist)
+
+
+def test_unscored_candidate_cannot_outrank_a_scored_one(fake_llm, fake_embed_fn, test_config):
+    """The drop-unscored invariant. An unscored candidate must never ride its
+    raw embed_norm into the shortlist: that scores it as though the LLM fully
+    endorsed its embedding rank, so it would beat candidates the LLM actually
+    saw and judged poor — inverting the re-rank's whole purpose."""
     from conftest import build_pool
     sections, _, pool = build_pool({
         "alice": {"skills": "AGENTS engineering", "needs": "VISUALS"},
@@ -92,28 +155,53 @@ def test_rerank_retries_missing_scores(fake_llm, fake_embed_fn, test_config):
     }, fake_llm, fake_embed_fn)
     pool_sections = {s.id: s.sections for s in sections}
 
-    rerank_calls = {"n": 0}
+    def responder(component, prompt):
+        if component == "query_rerank":
+            import re
+            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
+            # Score everyone POORLY except the top embed candidate, which is
+            # omitted entirely — the embed-only fallback would rank it first.
+            return {k: 0.05 for k in keys[1:]}
+        return default_responder(component, prompt)
+
+    result = run_query_match(
+        query={"needs": "AGENTS engineering"},
+        pool=pool, config=test_config, pool_sections=pool_sections,
+        generate_intros=False, llm_wrapper=FakeLLMWrapper(responder),
+        top_k=2,
+    )
+    assert len(result.shortlist) == 2
+    assert all(e["llm_score"] is not None for e in result.shortlist)
+    assert any("Dropped 1 unscored candidate" in n for n in result.notes)
+
+
+def test_falls_back_to_embed_ranking_when_too_few_scored(fake_llm, fake_embed_fn, test_config):
+    """Drop-unscored must not starve the shortlist: when fewer than top_k
+    candidates came back scored, unscored ones keep embedding-only ranking
+    rather than returning a short list."""
+    from conftest import build_pool
+    sections, _, pool = build_pool({
+        "alice": {"skills": "AGENTS engineering", "needs": "VISUALS"},
+        "frank": {"skills": "AGENTS automation", "needs": "MUSIC"},
+        "gina": {"skills": "AGENTS research", "needs": "FOOD"},
+    }, fake_llm, fake_embed_fn)
+    pool_sections = {s.id: s.sections for s in sections}
 
     def responder(component, prompt):
         if component == "query_rerank":
             import re
             keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
-            rerank_calls["n"] += 1
-            if rerank_calls["n"] == 1:
-                keys = keys[1:]   # first response omits one pair's score
-            return {k: 0.8 for k in keys}
+            return {keys[0]: 0.8}          # only ONE candidate ever scored
         return default_responder(component, prompt)
 
-    llm = FakeLLMWrapper(responder)
     result = run_query_match(
         query={"needs": "AGENTS engineering"},
         pool=pool, config=test_config, pool_sections=pool_sections,
-        generate_intros=False, llm_wrapper=llm,
+        generate_intros=False, llm_wrapper=FakeLLMWrapper(responder),
+        top_k=3,
     )
-    assert rerank_calls["n"] == 2          # initial round + exactly one retry
-    assert result.llm_rerank_applied
-    # every shortlisted candidate ended up LLM-scored despite the dropped key
-    assert all(e["llm_score"] is not None for e in result.shortlist)
+    assert len(result.shortlist) == 3      # filled, not starved
+    assert any("keep embedding-only ranking" in n for n in result.notes)
 
 
 def test_recipe_override_changes_results(synthetic_bundle, fake_llm, test_config):

@@ -407,6 +407,7 @@ class LLMWrapper:
         max_tokens: Optional[int] = None,
         progress_label: Optional[str] = None,
         progress_interval: float = 10.0,
+        deadline_s: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Process multiple prompts concurrently with rate-limit retry handling.
@@ -425,9 +426,18 @@ class LLMWrapper:
                 wrapper's ``max_concurrent_llm_calls`` (config `concurrency:`).
             max_retries: Maximum retries for rate limit errors (default: 3)
             retry_delay_base: Base delay for exponential backoff (default: 1.0s)
+            deadline_s: Optional wall-clock budget for the whole batch. None
+                (default) waits for every call. When set, calls still in flight
+                at the deadline are cancelled and their slots stay ``None``, so
+                the caller sees "no answer" for those prompts and decides what
+                that means. Use it when the model's TAIL latency costs more than
+                the last few answers are worth — but note cancelled calls still
+                burn the tokens the provider already generated.
 
         Returns:
-            List of parsed JSON responses in same order as input prompts
+            List of parsed JSON responses in same order as input prompts. A slot
+            is ``None`` if its call was cancelled at ``deadline_s``, and holds an
+            Exception if the call failed.
         """
         if not prompts:
             return []
@@ -533,8 +543,23 @@ class LLMWrapper:
             tasks = [asyncio.create_task(_run_one(i)) for i in uncached_indices]
             ticker = asyncio.create_task(_progress_ticker())
             try:
-                for i, result in await asyncio.gather(*tasks):
+                # timeout=None waits for every task (plain-gather semantics).
+                # With a deadline, whatever has landed by then is kept and the
+                # stragglers are cancelled — their slots stay None.
+                done, pending = await asyncio.wait(tasks, timeout=deadline_s)
+                for task in done:
+                    i, result = task.result()
                     results[i] = result  # exceptions kept in-place for caller to handle
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    # Let the cancellations settle before the client closes.
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    print(
+                        f"{label}Deadline {deadline_s:g}s reached at "
+                        f"{completed}/{total} complete — cancelled {len(pending)} "
+                        f"in-flight call(s); their slots stay unanswered"
+                    )
             finally:
                 ticker.cancel()
         finally:

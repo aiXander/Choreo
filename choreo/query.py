@@ -41,7 +41,7 @@ from .extract import extract_sections
 from .hyde import hyde_descriptors_for_sections
 from .embed import embed_sections, supports_mrl, truncate_embeddings
 from .candidate import generate_rectangular_similarity
-from .score import MAX_SCORE_RETRIES, build_batch_scoring_prompt
+from .score import build_batch_scoring_prompt
 from .introduction import generate_introductions_for_matches
 
 
@@ -162,13 +162,24 @@ def _llm_rerank_query_candidates(
 
     Reuses the batch scoring prompt framing: each call presents the query
     profile plus a chunk of candidates and asks ONLY for the query↔candidate
-    scores. Candidates whose score comes back missing/unparsable are re-asked
-    for up to MAX_SCORE_RETRIES extra rounds (the transport layer already
-    retries failed calls; this covers parsed-but-incomplete responses).
-    Returns {candidate_id: score 0..1} for every candidate the LLM answered.
+    scores. Returns {candidate_id: score 0..1} for every candidate the LLM
+    answered — candidates absent from the result went unscored, and
+    `run_query_match` drops them rather than ranking them on embeddings alone.
+
+    Two latency knobs, both under `query:` and both defaulting to the fast
+    setting, because this runs inside a live agent tool call:
+
+    - `rerank_max_retries` (default 0): serial re-ask rounds for candidates the
+      model silently dropped from a chunk response. The wave is already
+      dispatched by then, so each round is a whole extra round-trip — measured
+      at ~20% of query wall clock to rescue a single candidate out of
+      top_k*multiplier. The over-fetch pool already covers that gap.
+    - `rerank_deadline_s` (default None): wall-clock budget for the wave.
+      Cancels stragglers instead of waiting out the model's tail.
     """
     instruction = config.get("recipe", {}).get("instruction", "find good matches")
     goal = config.get("instruction_prompt", {}).get("goal", "")
+    query_cfg = config.get("query", {}) or {}
 
     sections_dict = {**pool_sections, QUERY_ID: query_atom.sections}
 
@@ -176,17 +187,19 @@ def _llm_rerank_query_candidates(
     # (query + chunk = one prompt). Floor the CHUNK at 2 — flooring before the
     # -1 would degrade n_profiles_to_score_together=2 to one-candidate calls.
     chunk_size = max(2, config.get("budgets", {}).get("n_profiles_to_score_together", 5) - 1)
+    max_retry_rounds = max(0, int(query_cfg.get("rerank_max_retries", 0) or 0))
+    deadline_s = query_cfg.get("rerank_deadline_s")
 
     llm_wrapper.set_component("query_rerank")
     llm_scores: Dict[str, float] = {}
     remaining = list(candidate_ids)
 
-    for round_idx in range(MAX_SCORE_RETRIES + 1):
+    for round_idx in range(max_retry_rounds + 1):
         if not remaining:
             break
         if round_idx:
             print(f"Retrying query re-rank for {len(remaining)} unscored "
-                  f"candidate(s) (retry {round_idx}/{MAX_SCORE_RETRIES})")
+                  f"candidate(s) (retry {round_idx}/{max_retry_rounds})")
 
         chunks = [remaining[i:i + chunk_size] for i in range(0, len(remaining), chunk_size)]
         prompts, cache_keys = [], []
@@ -216,12 +229,17 @@ def _llm_rerank_query_candidates(
                 cache_keys=cache_keys,
                 reasoning_effort=config.get("models", {}).get("pair_reasoning_effort", "medium"),
                 progress_label="query_rerank",
+                deadline_s=deadline_s,
             ))
         except Exception as e:  # pylint: disable=broad-except
             print(f"Warning: query re-rank round failed entirely ({e})")
             continue  # the same remaining candidates go into the next round
 
         for chunk, response in zip(chunks, responses):
+            if response is None:
+                # Cancelled at the deadline (or never dispatched) — an expected
+                # outcome, not a failure. The chunk's candidates stay unscored.
+                continue
             if isinstance(response, Exception):
                 print(f"Warning: query re-rank chunk failed: {response}")
                 continue
@@ -240,8 +258,9 @@ def _llm_rerank_query_candidates(
         remaining = [c for c in candidate_ids if c not in llm_scores]
 
     if remaining:
-        print(f"Warning: no re-rank score for {len(remaining)} candidate(s) after "
-              f"{MAX_SCORE_RETRIES} retries: {remaining} — they keep embedding-only ranking")
+        print(f"No re-rank score for {len(remaining)}/{len(candidate_ids)} candidate(s) "
+              f"after {max_retry_rounds} retry round(s) — they drop out of the "
+              f"shortlist (the over-fetch pool covers the gap)")
     return llm_scores
 
 
@@ -521,8 +540,40 @@ def run_query_match(
             return embed_w * embed_norm[user_id] + llm_w * llm_scores[user_id]
         return embed_norm[user_id]
 
+    # Drop-unscored. An unscored candidate is NOT neutral: falling back to
+    # embed_norm scores it as though the LLM had fully endorsed its embedding
+    # rank, so it outranks candidates the LLM saw and judged mediocre (embed
+    # 0.85 unscored = 0.85, vs 0.35*0.85 + 0.65*0.5 = 0.62 scored). That
+    # inverts the re-rank's entire purpose — demoting embedding-plausible but
+    # actually-bad matches — and it biases hardest toward exactly the
+    # candidates we skipped. So once the re-rank has run, rank ONLY scored
+    # candidates; the over-fetch pool is the buffer that makes dropping the
+    # rest affordable, and it's what lets `rerank_deadline_s` cancel
+    # stragglers without corrupting the ranking.
+    #
+    # The embed-only fallback still governs when the re-rank was skipped
+    # entirely, or when too few candidates came back scored to fill top_k — a
+    # short shortlist is worse than an embedding-ranked one.
+    scored_ids = [u for u in candidate_ids if u in llm_scores]
+    unscored_n = len(candidate_ids) - len(scored_ids)
+    if rerank_applied and len(scored_ids) >= top_k:
+        rank_pool = scored_ids
+        if unscored_n:
+            notes.append(
+                f"Dropped {unscored_n} unscored candidate(s); the {len(scored_ids)} "
+                f"scored candidates cover top {top_k}."
+            )
+    else:
+        rank_pool = candidate_ids
+        if rerank_applied and unscored_n:
+            notes.append(
+                f"Only {len(scored_ids)} of {len(candidate_ids)} candidates were "
+                f"re-rank scored — fewer than top_k={top_k}, so unscored candidates "
+                "keep embedding-only ranking to fill the shortlist."
+            )
+
     # Truncate the (possibly over-fetched) re-ranked pool to the final top_k.
-    ranked = sorted(candidate_ids, key=final_score, reverse=True)[:top_k]
+    ranked = sorted(rank_pool, key=final_score, reverse=True)[:top_k]
 
     # ---- 6. Intros for the final shortlist ----------------------------------
     # generate_intros: True = all shortlist rows; int N = only the top N

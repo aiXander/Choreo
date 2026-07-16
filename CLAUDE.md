@@ -223,9 +223,27 @@ query:                         # Mode B defaults
   rerank_pool_multiplier: 4    # over-fetch: LLM re-ranks top_k*4 candidates,
                                # returns top_k (1 = legacy reorder-only)
   generate_intros: true        # true | int top-N | false
+  rerank_max_retries: 0        # serial re-ask rounds for scores the model
+                               # silently dropped from a chunk response. 0 =
+                               # never: the wave is already dispatched, so each
+                               # round is a whole extra round-trip to rescue ~1
+                               # candidate; unscored ones drop out instead.
+  rerank_deadline_s: null      # wall-clock budget for the re-rank wave; null =
+                               # wait for every call. Set it to stop paying the
+                               # pair model's tail — stragglers are cancelled
+                               # (their tokens are still billed) and their
+                               # candidates go unscored. Size from p50/p75, and
+                               # leave room for >> top_k to land or the re-rank
+                               # stops being selective.
   # NO packaged query.recipe: explicit-mapping queries should pass a per-call
   # recipe_override (same-section weights, empty cross = no query-path HyDE);
   # without one, queries fall back to the top-level `recipe`.
+  # Prompt count == top_k exactly (ceil(top_k*multiplier / (chunk width)), and
+  # chunk width == n_profiles_to_score_together - 1 == multiplier by default),
+  # so concurrency.max_concurrent_llm_calls binds only above top_k. An unscored
+  # candidate is DROPPED from the shortlist, never embed-ranked into it — the
+  # over-fetch pool is the buffer that makes that safe (below top_k scored, it
+  # falls back to embed-only rather than returning a short list).
 
 budgets:
   max_pair_llm_calls: 1600
