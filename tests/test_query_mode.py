@@ -436,3 +436,22 @@ def test_query_scoring_resolution_precedence():
         "query_scoring_prompt_text": "QUERYONLY {user_profiles_xml_formatted} {json_format_hint}",
     }})
     assert templates["query_scoring"].startswith("QUERYONLY")
+
+
+def test_query_instruction_overrides_recipe_instruction(synthetic_bundle, fake_llm, test_config):
+    """`query.instruction` replaces the (usually pair-framed) recipe
+    instruction inside the re-rank prompt; without it the recipe string is
+    still quoted."""
+    pool, pool_sections = _pool(synthetic_bundle)
+
+    config = {**test_config, "query": {**test_config.get("query", {}),
+                                       "instruction": "SERVE-THE-NEED-ONLY"}}
+    llm = FakeLLMWrapper()
+    run_query_match(
+        query={"needs": "AGENTS engineering"},
+        pool=pool, config=config, pool_sections=pool_sections,
+        generate_intros=False, llm_wrapper=llm,
+    )
+    rerank_prompts = [p for c, p in llm.prompts_seen if c == "query_rerank"]
+    assert rerank_prompts and "SERVE-THE-NEED-ONLY" in rerank_prompts[0]
+    assert test_config["recipe"]["instruction"] not in rerank_prompts[0]

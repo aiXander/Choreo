@@ -205,6 +205,13 @@ def test_scoring_prompt_query_pseudo_user_gets_q_alias():
     assert QUERY_ID not in prompt
     assert '"Q_P1": <score 0.0-1.0>' in prompt
     assert '"Q_P2": <score 0.0-1.0>' in prompt
+    # Query-mode disambiguation: the query pseudo-user's sections are search
+    # TARGETS, rendered "Looking for (<Section>): …" so the model can't read
+    # them as attributes the asker possesses. Candidate sections stay bare.
+    assert "Looking for (Needs): AGENTS" in prompt
+    assert "  Skills: AGENTS" in prompt  # alice (candidate) — unchanged
+    assert "  Skills: VISUALS" in prompt  # bob (candidate) — unchanged
+    assert "Looking for (Skills)" not in prompt  # never applied to candidates
 
 
 def test_pair_scores_parse_back_through_aliases():

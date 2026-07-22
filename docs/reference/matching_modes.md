@@ -45,7 +45,9 @@ Key behaviors and why:
   no b-matching) and the **`query_scoring` template** — a directional variant
   (candidate → query need, reciprocity explicitly off) that lives as a second
   key in `scoring_prompt.yaml`; custom scoring prompts without that key fall
-  back to their pair template (`config.resolve_prompt_templates`). Requires `pool_sections`; silently skipped with a note
+  back to their pair template (`config.resolve_prompt_templates`). The
+  `{instruction}` it quotes prefers `query.instruction` over the shared
+  `recipe.instruction` (the recipe string is usually pair-framed prose). Requires `pool_sections`; silently skipped with a note
   otherwise. Final score = `embed_weight * embed_norm + llm_weight *
   llm_score` — deliberately blending the **raw** LLM score, unlike the
   cohort/batch remap (`normalize_scores_with_reference_distribution`): a

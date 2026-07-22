@@ -181,9 +181,19 @@ def build_batch_scoring_prompt(
         label = label_of(user_id)
         alias = alias_of[user_id]
         lines = [f"Profile of {label} ({alias}):" if label else f"Profile of {alias}:"]
+        # The query pseudo-user's sections are SEARCH TARGETS aimed at each
+        # candidate's matching section, not attributes the asker possesses —
+        # render them as "Looking for (<Section>): …" so the model can never
+        # misread the query as a profile of skills the asker already has.
+        # `QUERY_ID` only ever appears in query mode, so candidate-side and
+        # default/pair-mode rendering (bare "<Section>: …") stays untouched.
+        is_query = user_id == QUERY_ID
         for section_name, content in sections.items():
             if not is_absent(content):
-                lines.append(f"  {section_name.title()}: {content}")
+                if is_query:
+                    lines.append(f"  Looking for ({section_name.title()}): {content}")
+                else:
+                    lines.append(f"  {section_name.title()}: {content}")
         return "\n".join(lines)
 
     # Create XML formatted profiles
