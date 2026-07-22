@@ -65,6 +65,25 @@ def _repo_root_cwd(monkeypatch):
 
 SECTION_NAMES = ["skills", "vision", "project", "needs"]
 
+# Scoring prompts key pairs by short per-prompt aliases (Q / P1 / P2 / …) and
+# the hint renders as {"P1_P2": <score 0.0-1.0>, …}; profile tags carry the
+# human label (display name, or the raw user id as fallback). Every scoring
+# responder should fabricate its response through these two helpers.
+SCORE_HINT_KEY_RE = re.compile(r'"([^"]+)": <score')
+PROFILE_TAG_RE = re.compile(r'<profile id="([^"]+)"(?: name="([^"]+)")?>')
+
+
+def scoring_hint_keys(prompt: str) -> list:
+    """The alias pair keys a scoring prompt's json_format_hint requests."""
+    return SCORE_HINT_KEY_RE.findall(prompt)
+
+
+def profile_labels(prompt: str) -> dict:
+    """{alias: human label} from the prompt's profile tags (alias-only tags
+    map to themselves)."""
+    return {m.group(1): m.group(2) or m.group(1)
+            for m in PROFILE_TAG_RE.finditer(prompt)}
+
 
 def default_responder(component: str, prompt: str):
     """Canned, prompt-derived JSON per pipeline component."""
@@ -84,13 +103,18 @@ def default_responder(component: str, prompt: str):
         return {"descriptors": [f"{source} (variant {i})" for i in range(n)]}
 
     if component in ("batch_pair_scoring", "query_rerank"):
-        # Pair keys come from the json.dumps format hint: {"a_b": "0..1", ...}
-        keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
-        # Deterministic per-pair score in [0.30, 0.90]
-        return {
-            k: 0.30 + (int(hashlib.sha256(k.encode()).hexdigest()[:4], 16) % 61) / 100.0
-            for k in keys
-        }
+        # Deterministic per-pair score in [0.30, 0.90], derived from the pair's
+        # LABELS (not its per-prompt aliases) so the same two users score
+        # identically regardless of prompt grouping/ordering — matching the
+        # pre-alias behavior, where the key hashed the sorted user ids.
+        labels = profile_labels(prompt)
+
+        def stable_score(key: str) -> float:
+            content_key = "_".join(sorted(labels.get(p, p) for p in key.split("_")))
+            digest = hashlib.sha256(content_key.encode()).hexdigest()
+            return 0.30 + (int(digest[:4], 16) % 61) / 100.0
+
+        return {k: stable_score(k) for k in scoring_hint_keys(prompt)}
 
     if component == "introduction_generation":
         # Captures the display name (or id) from the profile headers — display

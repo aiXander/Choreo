@@ -9,6 +9,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 
+# The query pseudo-user id (Mode B treats a query as a partial profile).
+# Lives here (not query.py) so score.py can special-case it without a
+# circular import; choreo.query re-exports it for backward compatibility.
+QUERY_ID = "__query__"
+
 # Default config + prompt files shipped INSIDE the package (choreo/defaults/),
 # so they resolve regardless of the caller's working directory — CLI, pytest,
 # a Modal container or an external app importing choreo all see the same

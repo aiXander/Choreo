@@ -166,8 +166,8 @@ def test_hyde_cache_key_invalidates_on_context_change(fake_llm):
 # F4 — display_names threading
 # ---------------------------------------------------------------------------
 
-def test_scoring_prompt_renders_names_but_keys_stay_ids():
-    prompt, pair_scores = build_batch_scoring_prompt(
+def test_scoring_prompt_uses_aliases_and_renders_names():
+    prompt, alias_of = build_batch_scoring_prompt(
         user_profiles=["uuid-a", "uuid-b"],
         sections_dict={"uuid-a": {"skills": "AGENTS"}, "uuid-b": {"skills": "VISUALS"}},
         instruction="score",
@@ -175,23 +175,51 @@ def test_scoring_prompt_renders_names_but_keys_stay_ids():
         goal="g",
         display_names={"uuid-a": "Alice Anderson"},
     )
-    assert '<profile id="uuid-a" name="Alice Anderson">' in prompt
-    assert "Profile of Alice Anderson (id: uuid-a):" in prompt
-    assert '<profile id="uuid-b">' in prompt          # unnamed id unchanged
-    assert '"uuid-a_uuid-b": "0..1"' in prompt        # JSON hint keyed by id
-    assert set(pair_scores) == {"uuid-a_uuid-b"}
+    assert alias_of == {"uuid-a": "P1", "uuid-b": "P2"}
+    assert '<profile id="P1" name="Alice Anderson">' in prompt
+    assert "Profile of Alice Anderson (P1):" in prompt
+    # No display name -> the raw id doubles as the profile's name label
+    assert '<profile id="P2" name="uuid-b">' in prompt
+    # The JSON hint is keyed by aliases with an explicit numeric range —
+    # raw ids never appear in the requested keys.
+    assert '"P1_P2": <score 0.0-1.0>' in prompt
+    assert "uuid-a_uuid-b" not in prompt
 
 
-def test_scoring_prompt_without_names_has_no_name_attr():
-    prompt, _ = build_batch_scoring_prompt(
-        user_profiles=["alice", "bob"],
-        sections_dict={"alice": {"skills": "AGENTS"}, "bob": {"skills": "VISUALS"}},
+def test_scoring_prompt_query_pseudo_user_gets_q_alias():
+    from choreo.utils import QUERY_ID
+    prompt, alias_of = build_batch_scoring_prompt(
+        user_profiles=[QUERY_ID, "alice", "bob"],
+        sections_dict={QUERY_ID: {"needs": "AGENTS"},
+                       "alice": {"skills": "AGENTS"}, "bob": {"skills": "VISUALS"}},
         instruction="score",
         prompt_template="{user_profiles_xml_formatted}\n{json_format_hint}",
         goal="g",
+        pairs=[(QUERY_ID, "alice"), (QUERY_ID, "bob")],
     )
-    assert "name=" not in prompt
-    assert "Profile of alice:" in prompt
+    assert alias_of == {QUERY_ID: "Q", "alice": "P1", "bob": "P2"}
+    # The unnamed query renders alias-only (never the __query__ sentinel);
+    # candidates fall back to their raw id as name.
+    assert '<profile id="Q">' in prompt
+    assert "Profile of Q:" in prompt
+    assert QUERY_ID not in prompt
+    assert '"Q_P1": <score 0.0-1.0>' in prompt
+    assert '"Q_P2": <score 0.0-1.0>' in prompt
+
+
+def test_pair_scores_parse_back_through_aliases():
+    """The fake model answers in alias keys; score_pairs_with_llm must hand
+    back PairScores keyed by REAL ids/pair_ids."""
+    from choreo.score import get_pair_score
+
+    response = {"Q_P1": 0.7, "P2_P1": "0.4"}
+    alias_of = {"__query__": "Q", "uuid-a": "P1", "uuid-b": "P2"}
+    assert get_pair_score(response, "__query__", "uuid-a", alias_of) == 0.7
+    # reversed alias order still resolves
+    assert get_pair_score(response, "uuid-a", "uuid-b", alias_of) == "0.4"
+    # raw-id fallback (model echoed ids instead of aliases)
+    assert get_pair_score({"uuid-a_uuid-b": 0.2}, "uuid-a", "uuid-b", alias_of) == 0.2
+    assert get_pair_score(response, "uuid-b", "nobody", alias_of) is None
 
 
 def test_query_match_display_names_flow_into_intros(synthetic_bundle, test_config):
@@ -231,7 +259,7 @@ def test_batch_match_display_names_flow_into_intros(synthetic_bundle, test_confi
     intros = " ".join(e.intro for e in result.edges)
     assert "Alice Anderson" in intros
     scoring_prompts = [p for c, p in llm.prompts_seen if c == "batch_pair_scoring"]
-    assert scoring_prompts and "(id: alice)" in scoring_prompts[0]
+    assert scoring_prompts and 'name="Alice Anderson"' in scoring_prompts[0]
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +279,12 @@ def _agents_pool(fake_llm, fake_embed_fn):
 
 def _gina_responder(component, prompt):
     if component == "query_rerank":
-        import re
-        keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
-        return {k: (0.95 if "gina" in k else 0.05) for k in keys}
+        from conftest import profile_labels, scoring_hint_keys
+        labels = profile_labels(prompt)
+        return {
+            k: (0.95 if "gina" in [labels.get(p, p) for p in k.split("_")] else 0.05)
+            for k in scoring_hint_keys(prompt)
+        }
     return default_responder(component, prompt)
 
 

@@ -257,7 +257,11 @@ concurrency:
 Prompts in `choreo/defaults/`:
 - `section_prompt.yaml` — section definitions; each has an `active` flag (only active sections are extracted) and a `guideline`
 - `hyde_prompt.yaml` — HyDE descriptor generation
-- `scoring_prompt.yaml` — LLM pair scoring
+- `scoring_prompt.yaml` — LLM pair scoring: `pair_scoring` (mutual, cohort/batch)
+  plus the optional `query_scoring` key (directional Mode-B re-rank: candidate →
+  query need, reciprocity off). Custom scoring prompts without `query_scoring`
+  govern both paths (query mode falls back to the pair template); inline
+  override key: `prompts.query_scoring_prompt_text`.
 - `introduction_prompt.yaml` — directional introduction generation
 
 ## Key Patterns
@@ -310,11 +314,17 @@ Score normalization takes the reference distribution as an explicit input
 (`utils.prepare_normalized_scores(reference_scores=…)`); only the legacy square
 path derives it from the current matrix.
 
-**Display names**: all three runners accept `display_names={user_id: name}` —
-names go into scoring/intro prompt prose (and query mode's `"__query__"`
-pseudo-user can be named), score JSON and returned fields stay keyed by id.
-Required for readable intros when ids are uuids; without it prompts are
-byte-identical to before, so caches stay warm.
+**Display names + scoring aliases**: all three runners accept
+`display_names={user_id: name}` — names go into scoring/intro prompt prose
+(and query mode's `"__query__"` pseudo-user can be named); every returned
+field stays keyed by real id. Inside SCORING prompts, profiles and the pair
+keys the model must echo are per-prompt aliases (`Q` for the query, `P1`/`P2`/…
+in roster order — `build_batch_scoring_prompt` returns the `alias_of` map,
+`get_pair_score` parses responses through it, with raw-id keys as fallback):
+raw uuids in pair keys were attention noise and one transcription slip
+silently dropped the candidate. Ids without a display name fall back to the
+raw id as the profile's `name=` label, so pass display_names whenever ids are
+opaque. Raw ids never appear in scoring pair keys or the JSON hint.
 
 ## Switching matching modes
 

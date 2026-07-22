@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Union
 import numpy as np
 
 from .utils import (
+    QUERY_ID,
     filter_active_sections,
     hash_text,
     is_absent,
@@ -41,11 +42,15 @@ from .extract import extract_sections
 from .hyde import hyde_descriptors_for_sections
 from .embed import embed_sections, supports_mrl, truncate_embeddings
 from .candidate import generate_rectangular_similarity
-from .score import build_batch_scoring_prompt
+from .score import build_batch_scoring_prompt, get_pair_score
 from .introduction import generate_introductions_for_matches
 
 
-QUERY_ID = "__query__"
+# Re-exported from utils for backward compatibility (`from choreo.query
+# import QUERY_ID` keeps working); the constant lives in utils so score.py
+# can alias the query pseudo-user without a circular import.
+__all__ = ["QUERY_ID", "QueryMatchResult", "build_query_atom",
+           "run_query_match", "run_query_match_json"]
 
 
 @dataclass
@@ -202,9 +207,9 @@ def _llm_rerank_query_candidates(
                   f"candidate(s) (retry {round_idx}/{max_retry_rounds})")
 
         chunks = [remaining[i:i + chunk_size] for i in range(0, len(remaining), chunk_size)]
-        prompts, cache_keys = [], []
+        prompts, cache_keys, chunk_alias_maps = [], [], []
         for chunk in chunks:
-            prompt, _ = build_batch_scoring_prompt(
+            prompt, alias_of = build_batch_scoring_prompt(
                 user_profiles=[QUERY_ID] + chunk,
                 sections_dict=sections_dict,
                 instruction=instruction,
@@ -221,6 +226,7 @@ def _llm_rerank_query_candidates(
             # its own retry.
             suffix = f"_retry{round_idx}" if round_idx else ""
             cache_keys.append(f"query_score_{hash_text(prompt)}{suffix}")
+            chunk_alias_maps.append(alias_of)
 
         try:
             responses = run_coro_blocking(llm_wrapper.batch_json_complete(
@@ -235,7 +241,7 @@ def _llm_rerank_query_candidates(
             print(f"Warning: query re-rank round failed entirely ({e})")
             continue  # the same remaining candidates go into the next round
 
-        for chunk, response in zip(chunks, responses):
+        for chunk, alias_of, response in zip(chunks, chunk_alias_maps, responses):
             if response is None:
                 # Cancelled at the deadline (or never dispatched) — an expected
                 # outcome, not a failure. The chunk's candidates stay unscored.
@@ -248,7 +254,7 @@ def _llm_rerank_query_candidates(
                       f"({type(response).__name__}); skipping")
                 continue
             for cand in chunk:
-                score = response.get(f"{QUERY_ID}_{cand}", response.get(f"{cand}_{QUERY_ID}"))
+                score = get_pair_score(response, QUERY_ID, cand, alias_of)
                 if score is None:
                     continue
                 try:
@@ -512,7 +518,12 @@ def run_query_match(
                 pool_sections=pool_sections,
                 config=config,
                 llm_wrapper=llm_wrapper,
-                prompt_template=templates["scoring"],
+                # Query re-rank gets the DIRECTIONAL template (candidate →
+                # query need; no reciprocity) — the pair template's mutual
+                # framing fights a query that has no skills section. Falls
+                # back to the pair template for custom scoring prompts that
+                # don't define a query variant (config.py resolves this).
+                prompt_template=templates.get("query_scoring") or templates["scoring"],
                 display_names=display_names,
             )
             rerank_applied = bool(llm_scores)

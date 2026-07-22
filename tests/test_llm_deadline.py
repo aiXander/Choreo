@@ -136,9 +136,8 @@ def test_deadline_stragglers_drop_out_of_the_shortlist(monkeypatch, fake_llm, fa
         seen["chunks"] += 1
         if seen["chunks"] > 1:
             await asyncio.sleep(5.0)
-        import re
-        keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
-        return {k: 0.9 for k in keys}
+        from conftest import scoring_hint_keys
+        return {k: 0.9 for k in scoring_hint_keys(prompt)}
 
     monkeypatch.setattr(wrapper, "_async_json_complete_with_retry", _fake_call)
 

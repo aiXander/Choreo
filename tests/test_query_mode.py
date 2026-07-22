@@ -5,7 +5,18 @@ import pytest
 
 from choreo import embed as embed_mod
 from choreo.query import build_query_atom, run_query_match, QUERY_ID
-from conftest import FakeLLMWrapper, default_responder, keyword_embed
+from conftest import (
+    FakeLLMWrapper,
+    default_responder,
+    keyword_embed,
+    profile_labels,
+    scoring_hint_keys,
+)
+
+
+def _key_labels(key: str, labels: dict) -> list:
+    """The human labels on either side of an alias pair key like 'Q_P2'."""
+    return [labels.get(part, part) for part in key.split("_")]
 
 
 @pytest.fixture(autouse=True)
@@ -57,9 +68,9 @@ def test_llm_rerank_on_by_default_and_reorders(fake_llm, fake_embed_fn, test_con
 
     def responder(component, prompt):
         if component == "query_rerank":
-            import re
-            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
-            return {k: (0.95 if "frank" in k else 0.05) for k in keys}
+            labels = profile_labels(prompt)
+            return {k: (0.95 if "frank" in _key_labels(k, labels) else 0.05)
+                    for k in scoring_hint_keys(prompt)}
         return default_responder(component, prompt)
 
     llm = FakeLLMWrapper(responder)
@@ -94,8 +105,7 @@ def _omit_one_score_pool(fake_llm, fake_embed_fn):
 
     def responder(component, prompt):
         if component == "query_rerank":
-            import re
-            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
+            keys = scoring_hint_keys(prompt)
             calls["n"] += 1
             if calls["n"] == 1:
                 keys = keys[1:]   # first response omits one pair's score
@@ -157,8 +167,7 @@ def test_unscored_candidate_cannot_outrank_a_scored_one(fake_llm, fake_embed_fn,
 
     def responder(component, prompt):
         if component == "query_rerank":
-            import re
-            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
+            keys = scoring_hint_keys(prompt)
             # Score everyone POORLY except the top embed candidate, which is
             # omitted entirely — the embed-only fallback would rank it first.
             return {k: 0.05 for k in keys[1:]}
@@ -189,8 +198,7 @@ def test_falls_back_to_embed_ranking_when_too_few_scored(fake_llm, fake_embed_fn
 
     def responder(component, prompt):
         if component == "query_rerank":
-            import re
-            keys = re.findall(r'"([^"]+)": "0\.\.1"', prompt)
+            keys = scoring_hint_keys(prompt)
             return {keys[0]: 0.8}          # only ONE candidate ever scored
         return default_responder(component, prompt)
 
@@ -384,3 +392,47 @@ def test_reference_scores_normalization(synthetic_bundle, fake_llm, test_config)
     )
     top = result.shortlist[0]
     assert abs(top["embed_score_normalized"] - top["embed_score"]) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# query_scoring template — the directional Mode-B re-rank prompt
+# ---------------------------------------------------------------------------
+
+def test_query_rerank_uses_query_scoring_template(synthetic_bundle, fake_llm, test_config):
+    """The re-rank renders the packaged `query_scoring` template (directional,
+    no-reciprocity), not the mutual pair_scoring one."""
+    pool, pool_sections = _pool(synthetic_bundle)
+    llm = FakeLLMWrapper()
+    run_query_match(
+        query={"needs": "AGENTS engineering"},
+        pool=pool, config=test_config, pool_sections=pool_sections,
+        generate_intros=False, llm_wrapper=llm,
+    )
+    rerank_prompts = [p for c, p in llm.prompts_seen if c == "query_rerank"]
+    assert rerank_prompts
+    assert 'is a QUERY' in rerank_prompts[0]
+    assert "Can person A's skills help person B" not in rerank_prompts[0]
+
+
+def test_query_scoring_resolution_precedence():
+    """Inline query text > scoring file's query_scoring key > pair template."""
+    from choreo.config import resolve_prompt_templates
+
+    # Packaged defaults: distinct query template resolves
+    templates = resolve_prompt_templates()
+    assert templates["query_scoring"] != templates["scoring"]
+    assert "is a QUERY" in templates["query_scoring"]
+
+    # A custom inline scoring prompt WITHOUT a query variant governs both
+    # paths (pre-query_scoring behavior preserved for adopters)
+    inline = "CUSTOM {user_profiles_xml_formatted} {json_format_hint}"
+    templates = resolve_prompt_templates(config={"prompts": {"scoring_prompt_text": inline}})
+    assert templates["scoring"] == inline
+    assert templates["query_scoring"] == inline
+
+    # An explicit inline query variant wins over everything
+    templates = resolve_prompt_templates(config={"prompts": {
+        "scoring_prompt_text": inline,
+        "query_scoring_prompt_text": "QUERYONLY {user_profiles_xml_formatted} {json_format_hint}",
+    }})
+    assert templates["query_scoring"].startswith("QUERYONLY")

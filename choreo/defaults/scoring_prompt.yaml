@@ -19,5 +19,31 @@ pair_scoring: |
 
   {user_profiles_xml_formatted}
 
-  Return compact JSON with scores for all pairs:
+  Score every requested pair with a number between 0.0 and 1.0. Return compact JSON:
+  {json_format_hint}
+
+# Mode-B re-rank variant: a query is a search request (often only a `needs`
+# section), not a person — so the mutual "can B also help A?" framing of
+# pair_scoring would make the model hunt for reciprocity that cannot exist.
+# This template judges ONE direction: candidate → query need.
+query_scoring: |
+  Context: {goal}
+
+  The profile with id "Q" below is a QUERY — an active need someone in the community is searching on, not a full person profile. Every other profile is a candidate. Your task is to score how well each candidate can serve that specific need.
+  Community matching guidance, for context: "{instruction}"
+
+  For each candidate, evaluate:
+  1. How directly do the candidate's skills, projects and experience address what the query is asking for?
+  2. How specific and actionable would the resulting connection be? A concrete capability meeting the concrete need beats a vague thematic overlap.
+
+  Judge one direction only (candidate → query need). The query side offers no profile of its own — never penalize a candidate because the query "brings nothing back".
+
+  Score 0.8-1.0: candidate directly and specifically serves the need
+  Score 0.5-0.7: relevant capability that could partially serve it
+  Score 0.2-0.4: weak or indirect relevance
+  Score 0.0-0.1: no meaningful alignment
+
+  {user_profiles_xml_formatted}
+
+  Score every requested pair with a number between 0.0 and 1.0. Return compact JSON:
   {json_format_hint}

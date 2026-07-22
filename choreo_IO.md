@@ -70,7 +70,10 @@ run_batch_match(member_ids, pool_bundle, config,
 
 `display_names` (all three runners, optional): `{user_id: human name}` —
 names are woven into the scoring/re-rank/intro prompts and the intro prose
-("For <name>: …") while score JSON and every returned field stay keyed by id.
+("For <name>: …") while every returned field stays keyed by id. Inside
+scoring prompts the model sees and echoes short per-prompt aliases
+(`Q`/`P1`/`P2`…) instead of raw ids — translated back internally — and an id
+without a display name falls back to the raw id as the profile's name label.
 Pass it whenever ids are opaque (uuids); prose generated from raw ids cannot
 be repaired afterwards. In query mode a `"__query__"` entry names the asker.
 
@@ -157,6 +160,8 @@ carry prompt *content* directly — no files at request time — under
 ```python
 config = load_config(overrides={"prompts": {
     "scoring_prompt_text": "…{user_profiles_xml_formatted}…{json_format_hint}",
+    "query_scoring_prompt_text": "…",   # optional Mode-B re-rank variant; without
+                                        # it a custom scoring prompt governs both
     "introduction_prompt_text": "…", "hyde_prompt_text": "…",
     "section_prompt_text": "<full section-config YAML text or parsed dict>",
 }})

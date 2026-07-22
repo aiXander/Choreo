@@ -1,13 +1,12 @@
 """LLM-based pair scoring for candidate pairs."""
 
-import json
-from typing import List, Dict, Set, Tuple, Optional
+from typing import Any, List, Dict, Set, Tuple, Optional
 import numpy as np
 from itertools import combinations
 
 from .candidate import CandidatePair
 from .llm import LLMWrapper, run_coro_blocking
-from .utils import load_yaml, hash_text, is_absent
+from .utils import QUERY_ID, load_yaml, hash_text, is_absent
 from .schemas import ExtractedSections, PairScore  # noqa: F401 — PairScore re-exported
 
 
@@ -137,28 +136,51 @@ def build_batch_scoring_prompt(
     goal: str,
     pairs: Optional[List[Tuple[str, str]]] = None,
     display_names: Optional[Dict[str, str]] = None,
-) -> Tuple[str, Dict[str, float]]:
+) -> Tuple[str, Dict[str, str]]:
     """Build prompt for batch LLM scoring of multiple profiles.
 
     By default every C(n,2) pair among ``user_profiles`` is requested. Pass
     ``pairs`` to request only a subset — query mode uses this to score
     query↔candidate pairs without asking for candidate↔candidate scores.
 
-    ``display_names`` maps user ids to human names for the prompt prose
-    (profiles render as ``<profile id="…" name="…">``); the returned score
-    JSON stays keyed by id either way. Without it (or for ids not in the map)
-    the prompt is byte-identical to the pre-display_names shape, so existing
-    caches stay warm.
+    The prompt — and the JSON the model returns — is keyed by short
+    per-prompt ALIASES (``Q`` for the query pseudo-user, ``P1``/``P2``/… in
+    ``user_profiles`` order), never by raw user ids: long ids (uuids) in the
+    pair keys are attention noise for the model, and a single transcription
+    slip makes a score unparsable (which in query mode silently drops the
+    candidate). Returns ``(prompt, alias_of)`` where ``alias_of`` maps real
+    user id → alias; parse responses through :func:`get_pair_score` with that
+    map. Everything outside the prompt stays keyed by real ids.
+
+    ``display_names`` maps user ids to the human names woven into the prompt
+    (``<profile id="P1" name="…">``). Ids without an entry fall back to the
+    raw id as the name — readable for file-derived ids, noisy for uuids, so
+    pass display_names whenever ids are opaque. The query pseudo-user without
+    a name renders alias-only.
     """
     display_names = display_names or {}
 
+    # Deterministic per-prompt aliases in user_profiles order (callers pass
+    # sorted/deterministic rosters, so prompt bytes — and LLM cache keys —
+    # are stable across runs).
+    alias_of: Dict[str, str] = {}
+    for user_id in user_profiles:
+        if user_id == QUERY_ID:
+            alias_of[user_id] = "Q"
+        else:
+            alias_of[user_id] = f"P{len(alias_of) + (0 if QUERY_ID in alias_of else 1)}"
+
+    def label_of(user_id: str) -> Optional[str]:
+        name = display_names.get(user_id)
+        if name:
+            return name
+        return None if user_id == QUERY_ID else user_id
+
     # Format all user profiles
     def format_sections(sections: Dict[str, str], user_id: str) -> str:
-        name = display_names.get(user_id)
-        if name and name != user_id:
-            lines = [f"Profile of {name} (id: {user_id}):"]
-        else:
-            lines = [f"Profile of {user_id}:"]
+        label = label_of(user_id)
+        alias = alias_of[user_id]
+        lines = [f"Profile of {label} ({alias}):" if label else f"Profile of {alias}:"]
         for section_name, content in sections.items():
             if not is_absent(content):
                 lines.append(f"  {section_name.title()}: {content}")
@@ -169,21 +191,19 @@ def build_batch_scoring_prompt(
     for user_id in user_profiles:
         user_sections = sections_dict.get(user_id, {})
         profile_text = format_sections(user_sections, user_id)
-        name = display_names.get(user_id)
-        tag_attrs = f"id=\"{user_id}\" name=\"{name}\"" if name and name != user_id else f"id=\"{user_id}\""
+        label = label_of(user_id)
+        alias = alias_of[user_id]
+        tag_attrs = f"id=\"{alias}\" name=\"{label}\"" if label else f"id=\"{alias}\""
         profiles_xml += f"  <profile {tag_attrs}>\n    {profile_text.replace(chr(10), chr(10) + '    ')}\n  </profile>\n"
     profiles_xml += "</profiles>"
 
-    # Generate requested pairs and create JSON format hint
+    # Generate requested pairs and create the JSON format hint — alias-keyed,
+    # with an explicit numeric-range placeholder so the model knows the viable
+    # range regardless of the surrounding template text.
     if pairs is None:
         pairs = list(combinations(user_profiles, 2))
-    pair_scores = {}
-
-    for user1, user2 in pairs:
-        pair_key = f"{user1}_{user2}"
-        pair_scores[pair_key] = 0.0  # placeholder
-
-    json_format_hint = json.dumps({pair_key: "0..1" for pair_key in pair_scores})
+    hint_keys = [f"{alias_of[u1]}_{alias_of[u2]}" for u1, u2 in pairs]
+    json_format_hint = "{" + ", ".join(f'"{key}": <score 0.0-1.0>' for key in hint_keys) + "}"
 
     # Build the complete prompt
     prompt = prompt_template.format(
@@ -193,7 +213,29 @@ def build_batch_scoring_prompt(
         json_format_hint=json_format_hint
     )
 
-    return prompt, pair_scores
+    return prompt, alias_of
+
+
+def get_pair_score(
+    response: Dict[str, Any],
+    user1: str,
+    user2: str,
+    alias_of: Optional[Dict[str, str]] = None,
+):
+    """Look up one pair's score in a scoring response: alias keys first (the
+    format the prompt requested), raw-id keys as fallback (cheap insurance
+    against a model echoing profile ids or a caller-supplied template that
+    still renders ids) — both orders each. Returns None when absent."""
+    alias_of = alias_of or {}
+    alias1, alias2 = alias_of.get(user1), alias_of.get(user2)
+    keys = []
+    if alias1 and alias2:
+        keys += [f"{alias1}_{alias2}", f"{alias2}_{alias1}"]
+    keys += [f"{user1}_{user2}", f"{user2}_{user1}"]
+    for key in keys:
+        if key in response:
+            return response[key]
+    return None
 
 
 def _run_scoring_batch(
@@ -219,9 +261,11 @@ def _merge_scores_from_response(
     response,
     pairs: List[CandidatePair],
     pair_scores: Dict[str, PairScore],
+    alias_of: Optional[Dict[str, str]] = None,
 ) -> List[CandidatePair]:
     """Parse one batch response into ``pair_scores``; return the pairs whose
-    score came back missing or unparsable (the retry input)."""
+    score came back missing or unparsable (the retry input). ``alias_of`` is
+    the prompt's real-id → alias map (see ``build_batch_scoring_prompt``)."""
     if isinstance(response, Exception) or not isinstance(response, dict):
         print(f"Warning: unusable scoring response "
               f"({response if isinstance(response, Exception) else type(response).__name__})")
@@ -229,8 +273,7 @@ def _merge_scores_from_response(
 
     missing: List[CandidatePair] = []
     for pair in pairs:
-        score = response.get(f"{pair.user1}_{pair.user2}",
-                             response.get(f"{pair.user2}_{pair.user1}"))
+        score = get_pair_score(response, pair.user1, pair.user2, alias_of)
         if score is None:
             missing.append(pair)
             continue
@@ -451,7 +494,7 @@ def score_pairs_with_llm(
     # Prepare all group prompts for parallel processing
     group_prompts = []
     group_cache_keys = []
-    group_metadata = []  # Store (group_idx, profile_group, pairs_to_score)
+    group_metadata = []  # Store (group_idx, pairs_to_score, alias_of)
     
     for group_idx, profile_group in enumerate(profile_groups):
         user_profiles = sorted(list(profile_group))
@@ -468,7 +511,7 @@ def score_pairs_with_llm(
         print(f"Preparing group {group_idx + 1}/{len(profile_groups)}: {len(user_profiles)} profiles, {len(pairs_to_score)} pairs")
         
         # Build batch scoring prompt
-        prompt, pair_template = build_batch_scoring_prompt(
+        prompt, alias_of = build_batch_scoring_prompt(
             user_profiles=user_profiles,
             sections_dict=sections_dict,
             instruction=instruction,
@@ -487,7 +530,7 @@ def score_pairs_with_llm(
         
         group_prompts.append(prompt)
         group_cache_keys.append(cache_key)
-        group_metadata.append((group_idx, profile_group, pairs_to_score))
+        group_metadata.append((group_idx, pairs_to_score, alias_of))
     
     if not group_prompts:
         print("No groups to process")
@@ -510,8 +553,8 @@ def score_pairs_with_llm(
         return {}
 
     missing: List[CandidatePair] = []
-    for (group_idx, profile_group, pairs_to_score), response in zip(group_metadata, responses):
-        still_missing = _merge_scores_from_response(response, pairs_to_score, pair_scores)
+    for (group_idx, pairs_to_score, alias_of), response in zip(group_metadata, responses):
+        still_missing = _merge_scores_from_response(response, pairs_to_score, pair_scores, alias_of)
         if still_missing:
             print(f"Warning: group {group_idx + 1} response missing "
                   f"{len(still_missing)}/{len(pairs_to_score)} pair score(s)")
@@ -545,10 +588,10 @@ def score_pairs_with_llm(
         if current:
             retry_groups.append(current)
 
-        retry_prompts, retry_keys, retry_pair_lists = [], [], []
+        retry_prompts, retry_keys, retry_pair_lists, retry_alias_maps = [], [], [], []
         for group_pairs in retry_groups:
             users = sorted({u for p in group_pairs for u in (p.user1, p.user2)})
-            prompt, _ = build_batch_scoring_prompt(
+            prompt, retry_alias_of = build_batch_scoring_prompt(
                 user_profiles=users,
                 sections_dict=sections_dict,
                 instruction=instruction,
@@ -566,6 +609,7 @@ def score_pairs_with_llm(
                 f"batch_score_retry{retry_round}_{hash_text(prompt)}"
             )
             retry_pair_lists.append(group_pairs)
+            retry_alias_maps.append(retry_alias_of)
 
         try:
             retry_responses = _run_scoring_batch(
@@ -576,8 +620,12 @@ def score_pairs_with_llm(
             continue  # the same missing set goes into the next round
 
         next_missing: List[CandidatePair] = []
-        for group_pairs, response in zip(retry_pair_lists, retry_responses):
-            next_missing.extend(_merge_scores_from_response(response, group_pairs, pair_scores))
+        for group_pairs, retry_alias_of, response in zip(
+            retry_pair_lists, retry_alias_maps, retry_responses
+        ):
+            next_missing.extend(
+                _merge_scores_from_response(response, group_pairs, pair_scores, retry_alias_of)
+            )
         missing = next_missing
 
     missing = [p for p in {p.pair_id: p for p in missing}.values()

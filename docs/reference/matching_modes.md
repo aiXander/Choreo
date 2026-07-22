@@ -40,9 +40,12 @@ Key behaviors and why:
   over-fetched re-rank candidate ids after the embedding cut, so a store-backed
   adapter only materializes text for the ~`top_k × multiplier` survivors.
   Explicit `pool_sections` wins; with neither, LLM hops skip with a note.
-- **LLM re-rank is ON by default** (`query.llm_rerank`), reusing the pair
-  scoring prompt with only query↔candidate pairs requested (no set-cover, no
-  b-matching). Requires `pool_sections`; silently skipped with a note
+- **LLM re-rank is ON by default** (`query.llm_rerank`), reusing the batch
+  scoring machinery with only query↔candidate pairs requested (no set-cover,
+  no b-matching) and the **`query_scoring` template** — a directional variant
+  (candidate → query need, reciprocity explicitly off) that lives as a second
+  key in `scoring_prompt.yaml`; custom scoring prompts without that key fall
+  back to their pair template (`config.resolve_prompt_templates`). Requires `pool_sections`; silently skipped with a note
   otherwise. Final score = `embed_weight * embed_norm + llm_weight *
   llm_score` — deliberately blending the **raw** LLM score, unlike the
   cohort/batch remap (`normalize_scores_with_reference_distribution`): a
@@ -64,10 +67,13 @@ Key behaviors and why:
   surfaced at all). Don't build a parallel pair-id mechanism for query mode.
 - **`display_names`** (`{user_id: name}`, optional on all three runners): maps
   opaque ids (uuids) to human names inside the scoring/re-rank/intro prompts —
-  prose speaks names, score JSON stays keyed by id. Include a
-  `{"__query__": <asker name>}` entry so query intros address the asker by
-  name. Post-hoc string surgery on generated prose is a losing game; pass
-  names in.
+  prose speaks names; the score JSON the model RETURNS is keyed by short
+  per-prompt aliases (`Q`/`P1`/`P2`…, see `build_batch_scoring_prompt`) and
+  translated back, so returned fields stay keyed by real id. Ids without a
+  display name fall back to the raw id as the profile's name label — pass
+  names whenever ids are opaque. Include a `{"__query__": <asker name>}` entry
+  so query intros address the asker by name. Post-hoc string surgery on
+  generated prose is a losing game; pass names in.
 - Returns a `QueryMatchResult` (shortlist + intros) — **returned, never
   written**. JSON wrapper for agent tool-calls: `query.run_query_match_json`
   (accepts `store_dir` for the FileStore path or an inline pool dict, plus

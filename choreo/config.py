@@ -151,6 +151,7 @@ _PROMPT_TEMPLATE_KEYS = {
 _INLINE_TEXT_KEYS = {
     "sections": "section_prompt_text",
     "scoring": "scoring_prompt_text",
+    "query_scoring": "query_scoring_prompt_text",
     "introduction": "introduction_prompt_text",
     "hyde": "hyde_prompt_text",
 }
@@ -165,7 +166,8 @@ def resolve_prompt_templates(
     downstream) — what the mode runners consume.
 
     Returns ``{"sections": <section-config dict>, "scoring": <template str>,
-    "introduction": <template str>, "hyde": <template str>}``.
+    "query_scoring": <template str>, "introduction": <template str>,
+    "hyde": <template str>}``.
 
     Per prompt, precedence (highest first):
       1. **Inline text** in the config dict: ``prompts.<name>_prompt_text``
@@ -209,4 +211,22 @@ def resolve_prompt_templates(
                 resolved[name] = inline_value
             else:
                 resolved[name] = load_yaml(paths[name])[_PROMPT_TEMPLATE_KEYS[name]]
+
+    # `query_scoring` (the Mode-B re-rank template) is an OPTIONAL second key
+    # in the scoring prompt file — deliberately not a fifth file, to keep the
+    # set a user must author minimal. Precedence: inline
+    # ``prompts.query_scoring_prompt_text`` > the resolved scoring FILE's
+    # ``query_scoring`` key > the pair template itself. The last fallback
+    # keeps a custom scoring prompt (inline text or a config-dir file without
+    # the key) fully in charge of BOTH paths until its author writes a
+    # query-specific variant — exactly the pre-query_scoring behavior.
+    inline_query = inline.get(_INLINE_TEXT_KEYS["query_scoring"])
+    if isinstance(inline_query, str) and inline_query.strip():
+        resolved["query_scoring"] = inline_query
+    else:
+        query_template = None
+        inline_scoring = inline.get(_INLINE_TEXT_KEYS["scoring"])
+        if not (isinstance(inline_scoring, str) and inline_scoring.strip()):
+            query_template = load_yaml(paths["scoring"]).get("query_scoring")
+        resolved["query_scoring"] = query_template or resolved["scoring"]
     return resolved
