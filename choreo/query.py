@@ -182,17 +182,13 @@ def _llm_rerank_query_candidates(
     - `rerank_deadline_s` (default None): wall-clock budget for the wave.
       Cancels stragglers instead of waiting out the model's tail.
     """
+    # Note: the packaged query_scoring template deliberately does NOT render
+    # `{instruction}` — recipe.instruction is pair-framed flavor for the
+    # cohort/batch paths, and community context reaches the query prompt via
+    # `{goal}`. The kwarg is still passed for custom templates that want it.
+    instruction = config.get("recipe", {}).get("instruction", "find good matches")
     goal = config.get("instruction_prompt", {}).get("goal", "")
     query_cfg = config.get("query", {}) or {}
-    # Query-mode instruction: `query.instruction` wins over the shared
-    # `recipe.instruction`. The recipe string is typically PAIR-framed prose
-    # ("the value of connecting these two people…") that fights the
-    # directional query template; this knob lets a deployment author a
-    # search-framed instruction without forking the whole template.
-    instruction = (
-        query_cfg.get("instruction")
-        or config.get("recipe", {}).get("instruction", "find good matches")
-    )
 
     sections_dict = {**pool_sections, QUERY_ID: query_atom.sections}
 

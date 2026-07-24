@@ -438,14 +438,15 @@ def test_query_scoring_resolution_precedence():
     assert templates["query_scoring"].startswith("QUERYONLY")
 
 
-def test_query_instruction_overrides_recipe_instruction(synthetic_bundle, fake_llm, test_config):
-    """`query.instruction` replaces the (usually pair-framed) recipe
-    instruction inside the re-rank prompt; without it the recipe string is
-    still quoted."""
+def test_pair_instruction_stays_out_of_query_prompts(synthetic_bundle, test_config):
+    """The packaged query template renders {goal} only: recipe.instruction is
+    pair-framed flavor and must not leak into the directional re-rank prompt.
+    Different query framing = override the template wholesale
+    (query_scoring_prompt_text)."""
     pool, pool_sections = _pool(synthetic_bundle)
-
-    config = {**test_config, "query": {**test_config.get("query", {}),
-                                       "instruction": "SERVE-THE-NEED-ONLY"}}
+    config = {**test_config,
+              "recipe": {**test_config["recipe"], "instruction": "PAIR-ONLY-PROSE"},
+              "instruction_prompt": {"goal": "COMMUNITY-GOAL"}}
     llm = FakeLLMWrapper()
     run_query_match(
         query={"needs": "AGENTS engineering"},
@@ -453,5 +454,6 @@ def test_query_instruction_overrides_recipe_instruction(synthetic_bundle, fake_l
         generate_intros=False, llm_wrapper=llm,
     )
     rerank_prompts = [p for c, p in llm.prompts_seen if c == "query_rerank"]
-    assert rerank_prompts and "SERVE-THE-NEED-ONLY" in rerank_prompts[0]
-    assert test_config["recipe"]["instruction"] not in rerank_prompts[0]
+    assert rerank_prompts
+    assert "COMMUNITY-GOAL" in rerank_prompts[0]
+    assert "PAIR-ONLY-PROSE" not in rerank_prompts[0]

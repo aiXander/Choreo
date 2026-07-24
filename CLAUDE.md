@@ -220,11 +220,6 @@ matching:
 query:                         # Mode B defaults
   top_k: 4
   llm_rerank: true             # false = pure-embedding, cheaper
-  # instruction: "…"           # query-mode override of recipe.instruction for
-                               # the re-rank prompt (recipe.instruction is
-                               # usually pair-framed prose that fights the
-                               # directional query_scoring template); unset =
-                               # fall back to recipe.instruction
   rerank_pool_multiplier: 4    # over-fetch: LLM re-ranks top_k*4 candidates,
                                # returns top_k (1 = legacy reorder-only)
   generate_intros: true        # true | int top-N | false
