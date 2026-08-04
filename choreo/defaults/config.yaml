@@ -10,8 +10,8 @@ models:
   # always stored on disk, so this is re-tunable without re-embedding. Set to an
   # int (e.g. 1536, 768); leave null/omit to use the full native size (3072).
   embedding_dimensions: 1536
-  extraction_llm: "minimax/minimax-m3"
-  pair_llm: "minimax/minimax-m3"
+  extraction_llm: "deepseek/deepseek-v4-flash-0731"
+  pair_llm: "deepseek/deepseek-v4-flash-0731"
   # Reasoning effort forwarded to OpenRouter via `reasoning: {effort}`. This is
   # the global default for every phase. OpenRouter ignores the param on
   # non-reasoning models, and reasoning models that can't be turned off would

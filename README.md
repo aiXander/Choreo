@@ -131,8 +131,8 @@ OpenRouter slugs (`provider/model`):
 models:
   embedding: "google/gemini-embedding-2-preview"
   embedding_dimensions: 1536   # MRL truncation; null = full native size (3072)
-  extraction_llm: "minimax/minimax-m3"
-  pair_llm: "minimax/minimax-m3"
+  extraction_llm: "deepseek/deepseek-v4-flash-0731"
+  pair_llm: "deepseek/deepseek-v4-flash-0731"
   reasoning_effort: "low"      # global default; pair_reasoning_effort overrides pair scoring
 
 hyde:
