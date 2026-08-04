@@ -64,9 +64,14 @@ and doc/IO-spec updates in the same change. What a future agent needs:
   priority now that every consumer gates on `is_absent`.
 - **F3 HyDE cache key (shipped):** `hyde_cache_key(source_text, n, cross_key,
   context_fingerprint)` where `hyde_context_fingerprint()` hashes template +
-  goal + model + language + section guidelines. Editing the HyDE prompt/goal/
-  model now regenerates descriptors (one-time disk-cache invalidation on
-  deploy was accepted). NOTE: extraction's LLM cache is still keyed on
+  goal + language + section guidelines. Editing the HyDE prompt/goal now
+  regenerates descriptors (one-time disk-cache invalidation on deploy was
+  accepted). **Amended 2026-08-04: the model came back OUT of the
+  fingerprint** — it's the prompt's executor, not part of it, and keeping it
+  meant every `models.*_llm` swap re-spent the whole HyDE + hyde-embed layer
+  for zero correctness gain. Cache-key policy is now uniform across
+  extraction/intro/scoring/HyDE (all model-agnostic), with embeddings the one
+  deliberate exception. NOTE: extraction's LLM cache is still keyed on
   `extract_{profile.hash}` only — same bug class, unfixed; extraction prompt
   edits need `--force` (documented in config.yaml).
 - **F4 `display_names` (shipped):** optional `{user_id: name}` on all three

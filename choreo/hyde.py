@@ -38,23 +38,35 @@ def _section_guideline(sections_config: Optional[Dict[str, Any]], name: str) -> 
 def hyde_context_fingerprint(
     prompt_template: str,
     goal: str,
-    model: str,
     cross_key: str,
     sections_config: Optional[Dict[str, Any]] = None,
     language: str = "",
 ) -> str:
     """Hash of everything that shapes a HyDE prompt *besides* the per-user
     source text and n_descriptors (which live in :func:`hyde_cache_key`
-    directly): template, goal, model, output language and the two section
-    guidelines. Folding this into the cache key means editing the HyDE prompt,
-    the matching goal or the model regenerates descriptors instead of silently
-    replaying stale ones (the repo-wide "cache on the full prompt" invariant).
+    directly): template, goal, output language and the two section guidelines.
+    Folding this into the cache key means editing the HyDE prompt or the
+    matching goal regenerates descriptors instead of silently replaying stale
+    ones (the repo-wide "cache on the full prompt" invariant).
+
+    The *model* is deliberately NOT in this hash. It is the executor of the
+    prompt, not part of it: descriptors written by one LLM stay valid HyDE
+    text for the same source under another. Including it made a one-line
+    `models.extraction_llm` swap re-spend the whole HyDE + hyde-embed layer
+    for every member of every deployment — a real cost for no correctness
+    gain, and inconsistent with every other cache in the package
+    (`extract_{profile.hash}`, `intro_{pair_id}_{prompt_hash}` are both
+    model-agnostic). Pass `force=True` (or delete `hyde/<cross_key>.jsonl`)
+    to deliberately regenerate on a model change.
+
+    NOTE the deliberate asymmetry with EMBEDDINGS: `embed_sections` *does*
+    discard a bundle from a different `embedding_model`, and must — vectors
+    from two embedders are not comparable. Text is portable; vectors are not.
     """
     src_section, tgt_section = parse_cross_key(cross_key)
     return hash_text("|".join([
         prompt_template or "",
         goal or "",
-        model or "",
         language or "",
         _section_guideline(sections_config, src_section),
         _section_guideline(sections_config, tgt_section),
@@ -70,9 +82,9 @@ def hyde_cache_key(
     """Content-addressed cache key for one user's HyDE generation.
 
     ``context_fingerprint`` (see :func:`hyde_context_fingerprint`) covers the
-    prompt template / goal / model / language / guidelines; without it the key
-    is content-only (the pre-2026-07 legacy shape, kept as the default so the
-    signature stays backward-compatible for direct callers).
+    prompt template / goal / language / guidelines — NOT the model; without it
+    the key is content-only (the pre-2026-07 legacy shape, kept as the default
+    so the signature stays backward-compatible for direct callers).
     """
     return hash_text(f"{source_text}|{n_descriptors}|{cross_key}|{context_fingerprint}")
 
@@ -140,7 +152,7 @@ def hyde_descriptors_for_sections(
 
         existing_for_key = existing.get(cross_key, {})
         fingerprint = hyde_context_fingerprint(
-            prompt_template, goal, model, cross_key,
+            prompt_template, goal, cross_key,
             sections_config=sections_config, language=language,
         )
 
@@ -330,7 +342,7 @@ def generate_hyde_descriptors(
         for cross_key, user_descriptors in result.items():
             src_section, _ = parse_cross_key(cross_key)
             fingerprint = hyde_context_fingerprint(
-                prompt_template, goal, model, cross_key,
+                prompt_template, goal, cross_key,
                 sections_config=sections_config, language=language,
             )
             items = dict(existing.get(cross_key, {}))

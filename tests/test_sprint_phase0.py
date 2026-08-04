@@ -111,7 +111,7 @@ def test_hyde_skips_absent_sources(fake_llm):
 
 
 # ---------------------------------------------------------------------------
-# F3 — HyDE cache key covers prompt template / goal / model / language
+# F3 — HyDE cache key covers prompt template / goal / language, NOT the model
 # ---------------------------------------------------------------------------
 
 def test_hyde_cache_key_invalidates_on_context_change(fake_llm):
@@ -131,7 +131,7 @@ def test_hyde_cache_key_invalidates_on_context_change(fake_llm):
         )
 
     first = run()
-    fingerprint = hyde_context_fingerprint(HYDE_TEMPLATE, "goal A", "fake/llm", "needs_skills")
+    fingerprint = hyde_context_fingerprint(HYDE_TEMPLATE, "goal A", "needs_skills")
     key = hyde_cache_key("AGENTS help", 1, "needs_skills", fingerprint)
     existing = {"needs_skills": {key: first["needs_skills"][0].descriptors}}
 
@@ -153,13 +153,46 @@ def test_hyde_cache_key_invalidates_on_context_change(fake_llm):
     )
     assert fake_llm.calls  # regenerated
 
-    # Fingerprint differs on template, model and language too
-    assert hyde_context_fingerprint(HYDE_TEMPLATE, "g", "m1", "needs_skills") != \
-           hyde_context_fingerprint(HYDE_TEMPLATE, "g", "m2", "needs_skills")
-    assert hyde_context_fingerprint(HYDE_TEMPLATE, "g", "m", "needs_skills") != \
-           hyde_context_fingerprint(HYDE_TEMPLATE + "x", "g", "m", "needs_skills")
-    assert hyde_context_fingerprint(HYDE_TEMPLATE, "g", "m", "needs_skills") != \
-           hyde_context_fingerprint(HYDE_TEMPLATE, "g", "m", "needs_skills", language="Dutch")
+    # Fingerprint differs on template and language too
+    assert hyde_context_fingerprint(HYDE_TEMPLATE, "g", "needs_skills") != \
+           hyde_context_fingerprint(HYDE_TEMPLATE + "x", "g", "needs_skills")
+    assert hyde_context_fingerprint(HYDE_TEMPLATE, "g", "needs_skills") != \
+           hyde_context_fingerprint(HYDE_TEMPLATE, "g", "needs_skills", language="Dutch")
+
+
+def test_hyde_cache_survives_a_model_swap(fake_llm):
+    """A `models.extraction_llm` bump must NOT re-spend the HyDE layer.
+
+    The model executes the prompt, it isn't part of it — descriptors written
+    by one LLM stay valid for the same source text under another. Pinned
+    because the inverse (model in the fingerprint) silently re-billed HyDE +
+    hyde-embed for every member of every deployment on a one-line config edit.
+    """
+    sections = sections_from_dict({"u1": {"skills": "MUSIC", "needs": "AGENTS help"}})
+
+    def run(model, existing=None):
+        fake_llm.calls.clear()
+        return hyde_descriptors_for_sections(
+            extracted_sections=sections,
+            cross_section_weights={"needs_skills": 0.8},
+            hyde_config={"n_descriptors": 1},
+            prompt_template=HYDE_TEMPLATE,
+            goal="goal A",
+            llm_wrapper=fake_llm,
+            model=model,
+            existing=existing,
+        )
+
+    first = run("minimax/minimax-m3")
+    fingerprint = hyde_context_fingerprint(HYDE_TEMPLATE, "goal A", "needs_skills")
+    existing = {"needs_skills": {
+        hyde_cache_key("AGENTS help", 1, "needs_skills", fingerprint):
+            first["needs_skills"][0].descriptors
+    }}
+
+    second = run("deepseek/deepseek-v4-flash-0731", existing=existing)
+    assert not fake_llm.calls  # cache hit across the model swap — zero LLM spend
+    assert second["needs_skills"][0].descriptors == first["needs_skills"][0].descriptors
 
 
 # ---------------------------------------------------------------------------

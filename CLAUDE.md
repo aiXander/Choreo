@@ -276,9 +276,16 @@ LLM response caches (scoring, intros, query rerank) key on a **hash of the
 full prompt**, so edited profile content invalidates automatically — never key
 on roster/pair-id alone (a past bug: edited profiles silently replayed stale
 scores). HyDE cache keys fold in a **prompt-context fingerprint**
-(`hyde.hyde_context_fingerprint`: template + goal + model + language +
-guidelines), so editing `hyde_prompt.yaml` or the goal regenerates descriptors
-instead of replaying stale ones. Cache keys must use `utils.hash_text` (sha256), never the builtin
+(`hyde.hyde_context_fingerprint`: template + goal + language + guidelines), so
+editing `hyde_prompt.yaml` or the goal regenerates descriptors instead of
+replaying stale ones. **No LLM cache key folds in the model** — the model
+executes the prompt, it isn't part of it, and including it made a one-line
+`models.*_llm` swap re-spend a whole cached layer for zero correctness gain
+(`test_hyde_cache_survives_a_model_swap`); pass `force=True` to regenerate on
+a model change deliberately. **Embeddings are the deliberate exception**:
+`embed_sections` discards a bundle from a different `embedding_model`, and
+must — vectors from two embedders aren't comparable. Text is portable across
+models; vectors are not. Cache keys must use `utils.hash_text` (sha256), never the builtin
 `hash()` (salted per process — entries would never hit across runs). Same trap with
 `set` iteration order: anything that feeds an LLM prompt or cache key (scoring
 group composition, b-matching backfill order) must iterate `sorted(...)`, or

@@ -106,7 +106,7 @@ def test_hyde_stage_single_and_multi_descriptor(synthetic_sections_dict, fake_ll
     # -> zero LLM calls
     from choreo.hyde import hyde_cache_key, hyde_context_fingerprint
     template = load_yaml(DEFAULT_PROMPT_PATHS["hyde"])["hyde_generation"]
-    fingerprint = hyde_context_fingerprint(template, "test", "fake/llm", "needs_skills")
+    fingerprint = hyde_context_fingerprint(template, "test", "needs_skills")
     existing = {"needs_skills": {
         hyde_cache_key(s.sections["needs"], 3, "needs_skills", fingerprint):
             hyde3["needs_skills"][i].descriptors
