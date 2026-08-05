@@ -51,6 +51,12 @@ def _client_kwargs() -> Dict[str, Any]:
         "base_url": OPENROUTER_BASE_URL,
         "api_key": api_key,
         "default_headers": _DEFAULT_HEADERS,
+        # Bounded per-request time + no hidden SDK retries: one hung call must
+        # fail fast into our own retry loop (max_retries/backoff above) instead
+        # of pinning a batch at N-1/N for the SDK's 600s default × retries.
+        # Same fix as the 2026-07-16 memory-engine sweep-timeout incident.
+        "timeout": 120.0,
+        "max_retries": 0,
     }
 
 
