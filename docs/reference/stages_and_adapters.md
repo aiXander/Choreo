@@ -131,6 +131,10 @@ points is tested.
 
 ## Non-obvious gotchas
 
+- **Every OpenRouter LLM request carries `provider.data_collection="deny"`.**
+  `_build_extra_body` owns this policy and must preserve it when adding optional
+  reasoning parameters. This restricts provider data collection; it is not an
+  assertion of zero data retention or EU residency.
 - **LLM cache keys must be `utils.hash_text`, never builtin `hash()`** — the
   builtin is salted per process, so such cache entries can never hit across
   runs (this was a real pre-refactor bug in scoring/intro caching, fixed in

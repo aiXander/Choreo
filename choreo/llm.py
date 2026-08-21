@@ -140,7 +140,12 @@ def _build_extra_body(reasoning_effort: Optional[str]) -> Dict[str, Any]:
     Note: OpenRouter usage accounting (cost + token details) is always on, so no
     ``usage: {include: true}`` flag is needed — it returns automatically.
     """
-    extra_body: Dict[str, Any] = {}
+    # Member profile material reaches every Choreo LLM phase. Require an
+    # OpenRouter route whose provider policy denies data collection; this is
+    # distinct from OpenRouter's separate zero-data-retention control.
+    extra_body: Dict[str, Any] = {
+        "provider": {"data_collection": "deny"},
+    }
     # Forward the reasoning effort whenever one is set (including "none" to turn
     # reasoning off). OpenRouter silently ignores this for non-reasoning models,
     # so it's safe to always send; reasoning models that can't be disabled would
