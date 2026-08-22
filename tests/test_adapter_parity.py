@@ -22,7 +22,7 @@ def _edge_map(edges):
 def test_filestore_vs_inmemory_parity(synthetic_sections_dict, test_config,
                                       tmp_path, monkeypatch):
     monkeypatch.setattr(embed_mod, "get_embeddings",
-                        lambda texts, model: np.vstack([keyword_embed(t) for t in texts]))
+                        lambda texts, model, **_: np.vstack([keyword_embed(t) for t in texts]))
     sections = sections_from_dict(synthetic_sections_dict)
 
     # (a) pure in-memory: no store at all
@@ -48,7 +48,7 @@ def test_filestore_vs_inmemory_parity(synthetic_sections_dict, test_config,
     # rerunning store-backed is fully cached: zero embedding API calls
     calls = []
 
-    def counting_embed(texts, model):
+    def counting_embed(texts, model, **_):
         calls.append(texts)
         return np.vstack([keyword_embed(t) for t in texts])
 
@@ -63,7 +63,7 @@ def test_entry_at_any_stage_equivalence(synthetic_sections_dict, test_config, mo
     """Raw profiles, pre-extracted sections and a pre-built bundle must all
     converge to the same matching outcome."""
     monkeypatch.setattr(embed_mod, "get_embeddings",
-                        lambda texts, model: np.vstack([keyword_embed(t) for t in texts]))
+                        lambda texts, model, **_: np.vstack([keyword_embed(t) for t in texts]))
 
     # Entry 1: pre-extracted sections
     sections = sections_from_dict(synthetic_sections_dict)
@@ -104,7 +104,7 @@ def test_bundle_entry_requires_sections(synthetic_bundle, test_config):
 def test_excluded_pairs_thread_through_full_match(synthetic_sections_dict,
                                                   test_config, monkeypatch):
     monkeypatch.setattr(embed_mod, "get_embeddings",
-                        lambda texts, model: np.vstack([keyword_embed(t) for t in texts]))
+                        lambda texts, model, **_: np.vstack([keyword_embed(t) for t in texts]))
     sections = sections_from_dict(synthetic_sections_dict)
     run = run_full_match(sections, test_config, llm_wrapper=FakeLLMWrapper(),
                          excluded_pairs={"alice_bob"})

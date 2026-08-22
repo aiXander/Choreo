@@ -108,7 +108,7 @@ def test_hyde_incremental_reuse(fake_embed_fn, fake_llm):
 def test_filestore_wrapper_roundtrip(tmp_path, monkeypatch, fake_embed_fn):
     """create_section_embeddings_bundle: persist, then rerun with zero API calls."""
     monkeypatch.setattr(embed_mod, "get_embeddings",
-                        lambda texts, model: fake_embed_fn(texts))
+                        lambda texts, model, **_: fake_embed_fn(texts))
 
     sections = _sections(BASE)
     embeds_dir = tmp_path / "embeds"
@@ -128,7 +128,7 @@ def test_legacy_dir_adoption(tmp_path, monkeypatch, fake_embed_fn):
     """A pre-refactor embeds dir (no bundle_meta.json) is adopted for an
     unchanged roster instead of re-embedding everyone."""
     monkeypatch.setattr(embed_mod, "get_embeddings",
-                        lambda texts, model: fake_embed_fn(texts))
+                        lambda texts, model, **_: fake_embed_fn(texts))
     sections = _sections(BASE)
     embeds_dir = tmp_path / "embeds"
     bundle1 = create_section_embeddings_bundle(sections, "fake/model", str(embeds_dir))

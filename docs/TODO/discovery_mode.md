@@ -281,7 +281,7 @@ yamls (overridable per deployment via the standard `--config-dir` overlay):
 
 ```yaml
 models:
-  embedding:      "google/gemini-embedding-2-preview"
+  embedding:      "qwen/qwen3-embedding-8b"
   embedding_dimensions: 768
   extraction_llm: "<models.extraction_llm default>"   # atomization
   analysis_llm:   "<models.pair_llm default>"          # proposals

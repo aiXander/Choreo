@@ -25,7 +25,7 @@ def _fake_query_embedding(monkeypatch):
     through the deterministic keyword embedder instead of the real API."""
     monkeypatch.setattr(
         embed_mod, "get_embeddings",
-        lambda texts, model: np.vstack([keyword_embed(t) for t in texts]),
+        lambda texts, model, **_: np.vstack([keyword_embed(t) for t in texts]),
     )
 
 

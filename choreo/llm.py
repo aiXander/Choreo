@@ -28,7 +28,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Default models. These are overridden per-phase from config.yaml (`models:`),
 # but act as fallbacks when a model is not specified.
 DEFAULT_MODEL = "google/gemini-3.1-flash-lite"
-DEFAULT_EMBEDDING_MODEL = "google/gemini-embedding-2-preview"
+DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 
 # Optional attribution headers shown on OpenRouter dashboards (harmless to keep).
 _DEFAULT_HEADERS = {

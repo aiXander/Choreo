@@ -196,12 +196,14 @@ def run_full_match(
                 embeds_dir=str(store.embeds_dir),
                 hyde_descriptors=hyde_descriptors if hyde_descriptors else None,
                 force=force,
+                embed_provider=models_cfg.get("embedding_provider"),
             )
         else:
             bundle = embed_sections(
                 extracted_sections=extracted_sections,
                 embedding_model=models_cfg.get("embedding"),
                 hyde_descriptors=hyde_descriptors if hyde_descriptors else None,
+                embed_provider=models_cfg.get("embedding_provider"),
             )
         print(f"✅ Created embeddings: {bundle.embeddings.shape}")
 

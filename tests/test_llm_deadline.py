@@ -117,7 +117,7 @@ def test_deadline_stragglers_drop_out_of_the_shortlist(monkeypatch, fake_llm, fa
 
     monkeypatch.setattr(
         embed_mod, "get_embeddings",
-        lambda texts, model: np.vstack([keyword_embed(t) for t in texts]),
+        lambda texts, model, **_: np.vstack([keyword_embed(t) for t in texts]),
     )
     sections, _, pool = build_pool({
         "alice": {"skills": "AGENTS engineering", "needs": "VISUALS"},

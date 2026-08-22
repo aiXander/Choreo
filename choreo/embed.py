@@ -53,6 +53,9 @@ def _is_transient_embedding_error(error: Exception) -> bool:
 # MRL truncation (embedding_dimensions in config) is skipped unless the active
 # model is listed here. Add slugs as you verify support.
 MRL_CAPABLE_MODELS = {
+    "qwen/qwen3-embedding-8b",         # 4096 native; client-side @1536 vs the
+                                       # API's own dimensions=1536: cosine 0.99992
+    "google/gemini-embedding-2",       # 3072 native
     "google/gemini-embedding-2-preview",
 }
 
@@ -62,11 +65,34 @@ def supports_mrl(model: str) -> bool:
     return model in MRL_CAPABLE_MODELS
 
 
+# OpenRouter `provider` routing sent with every embed request.
+#
+# `data_collection: "deny"` is the floor: it must match the account's privacy
+# posture, and it is why an embedding slug is chosen by its SURVIVING PROVIDER
+# SET rather than by its name. A model whose only eligible endpoint collects
+# data is not a model you can run — it is a 404 waiting for its first call
+# ("No endpoints available matching your guardrail restrictions and data
+# policy"), and since the query path embeds too, that 404 fails the WHOLE match
+# run, not some optional leg.
+#
+# `order` is a PREFERENCE, not a pin, and `allow_fallbacks` stays true. The
+# providers serving one model return vectors that agree to cosine ≥0.9999, so
+# failover cannot corrupt similarity — it only moves latency. Ordering by
+# yesterday's latency measurement and pinning it is how you rebuild the
+# single-endpoint failure above: measured p50 for the same model on the same
+# account moved by >10x, in the opposite direction, over eight days.
+DEFAULT_EMBEDDING_PROVIDER = {
+    "order": ["nebius", "deepinfra", "siliconflow"],
+    "allow_fallbacks": True,
+}
+
+
 def get_embeddings(
     texts: List[str],
     model: str,
     max_retries: int = 4,
     retry_delay_base: float = 1.0,
+    provider: Optional[Dict] = None,
 ) -> np.ndarray:
     """
     Get embeddings for a list of texts via OpenRouter's embeddings endpoint.
@@ -83,9 +109,12 @@ def get_embeddings(
 
     Args:
         texts: List of text strings to embed
-        model: Embedding model name (e.g. "google/gemini-embedding-2-preview")
+        model: Embedding model name (e.g. "qwen/qwen3-embedding-8b")
         max_retries: Max retries on transient errors (default: 4)
         retry_delay_base: Base delay (s) for exponential backoff (default: 1.0)
+        provider: OpenRouter provider routing override (`models.embedding_provider`
+            in config). Merged OVER DEFAULT_EMBEDDING_PROVIDER; `data_collection`
+            is forced to "deny" and is not overridable.
 
     Returns:
         numpy array of shape (len(texts), embedding_dim)
@@ -98,6 +127,11 @@ def get_embeddings(
     """
     model = model or DEFAULT_EMBEDDING_MODEL
     client = get_openrouter_client()
+    provider_block = {
+        **DEFAULT_EMBEDDING_PROVIDER,
+        **(provider or {}),
+        "data_collection": "deny",
+    }
 
     # Split out empty inputs so the API only ever sees non-empty Parts.
     nonempty_idx = [i for i, t in enumerate(texts) if t and t.strip()]
@@ -115,7 +149,8 @@ def get_embeddings(
             # Google AI Studio embedding provider rejects (400 → empty data → the SDK
             # raises "No embedding data received"). Force "float" to stay compatible.
             response = client.embeddings.create(
-                model=model, input=api_texts, encoding_format="float"
+                model=model, input=api_texts, encoding_format="float",
+                extra_body={"provider": provider_block},
             )
 
             # OpenRouter passes provider-side errors (e.g. a 400) back as a 200
@@ -181,11 +216,12 @@ def truncate_embeddings(arr: np.ndarray, dimensions: int) -> np.ndarray:
     Matryoshka (MRL) truncation of stored full-size embeddings, applied at
     computation time.
 
-    gemini-embedding-2 is MRL-trained: the most important information is packed
-    into the leading dimensions, so keeping the first `dimensions` components and
-    L2-renormalizing reproduces what the API returns for an equivalent
-    output_dimensionality request (verified to ~1e-7). This lets us store full
-    3072-dim vectors once and re-tune the working size for free.
+    An MRL-trained model (see MRL_CAPABLE_MODELS) packs the most important
+    information into the leading dimensions, so keeping the first `dimensions`
+    components and L2-renormalizing reproduces what the API returns for an
+    equivalent output_dimensionality request (verified to cosine ≥0.9999 for
+    both gemini-embedding-2 @3072 and qwen3-embedding-8b @4096). This lets us
+    store full-size vectors once and re-tune the working size for free.
 
     Truncates along the last axis, so it works for both the section embeddings
     (users × sections × dims) and HyDE embeddings (users × descriptors × dims).
@@ -231,6 +267,7 @@ def embed_sections(
     hyde_descriptors: Optional[Dict[str, List[HydeDescriptors]]] = None,
     existing: Optional[EmbeddingsBundle] = None,
     embed_fn: Optional[Callable[[List[str]], np.ndarray]] = None,
+    embed_provider: Optional[Dict] = None,
 ) -> EmbeddingsBundle:
     """Pure embed transform: sections (+ HyDE) in, EmbeddingsBundle out.
 
@@ -249,6 +286,9 @@ def embed_sections(
             warning) if it was produced by a different embedding model.
         embed_fn: Embedding callable ``texts -> (n, dim)`` (defaults to the
             OpenRouter ``get_embeddings``; injectable for tests).
+        embed_provider: OpenRouter provider routing for the default ``embed_fn``
+            (``models.embedding_provider``). Ignored when ``embed_fn`` is given —
+            a caller supplying its own embed function owns its own routing.
 
     Returns:
         EmbeddingsBundle with full-size vectors, provenance and content hashes.
@@ -257,7 +297,9 @@ def embed_sections(
         raise ValueError("No extracted sections provided")
 
     if embed_fn is None:
-        embed_fn = lambda texts: get_embeddings(texts, embedding_model)  # noqa: E731
+        embed_fn = lambda texts: get_embeddings(  # noqa: E731
+            texts, embedding_model, provider=embed_provider
+        )
 
     section_names = list(extracted_sections[0].sections.keys())
     user_ids = [profile.id for profile in extracted_sections]
@@ -451,7 +493,8 @@ def create_section_embeddings_bundle(
     embedding_model: str,
     embeds_dir: str,
     hyde_descriptors: Dict[str, List[HydeDescriptors]] = None,
-    force: bool = False
+    force: bool = False,
+    embed_provider: Optional[Dict] = None,
 ) -> EmbeddingsBundle:
     """Filesystem wrapper around ``embed_sections``.
 
@@ -485,6 +528,7 @@ def create_section_embeddings_bundle(
         embedding_model=embedding_model,
         hyde_descriptors=hyde_descriptors,
         existing=existing,
+        embed_provider=embed_provider,
     )
 
     bundle.dump(embeds_path)

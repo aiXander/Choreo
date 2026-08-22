@@ -182,8 +182,11 @@ All LLM and embedding calls route through **OpenRouter** (OpenAI-compatible endp
 
 ```yaml
 models:
-  embedding: "google/gemini-embedding-2-preview"
-  embedding_dimensions: 1536  # MRL truncation; null = full native size (3072)
+  embedding: "qwen/qwen3-embedding-8b"   # ⚠️ chosen by surviving PROVIDER SET, not by name
+  embedding_provider:                     # ordered PREFERENCE + fallbacks, never a pin
+    order: ["nebius", "deepinfra", "siliconflow"]
+    allow_fallbacks: true
+  embedding_dimensions: 1536  # MRL truncation; null = full native size (4096)
   extraction_llm: "deepseek/deepseek-v4-flash-0731"
   pair_llm: "deepseek/deepseek-v4-flash-0731"
   reasoning_effort: "low"           # global default for every phase

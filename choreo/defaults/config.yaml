@@ -2,13 +2,34 @@
 # Use OpenRouter model slugs (provider/model). Swap providers or run different
 # phases on different models just by editing the strings below.
 models:
-  embedding: "google/gemini-embedding-2-preview"
-  # Matryoshka (MRL) truncation, applied at computation time. gemini-embedding-2
-  # is MRL-trained: the most important information is packed into the leading
-  # dimensions, so the working vectors can be truncated to a shorter length with
-  # minimal quality loss — cheaper similarity math. Full 3072-dim vectors are
-  # always stored on disk, so this is re-tunable without re-embedding. Set to an
-  # int (e.g. 1536, 768); leave null/omit to use the full native size (3072).
+  # ⚠️ Pick an embedding slug whose PROVIDER SET survives your OpenRouter
+  # privacy settings — every embed request is sent `data_collection: "deny"`.
+  # A model with one eligible endpoint is not a model you can run: it is a 404
+  # ("No endpoints available matching your guardrail restrictions and data
+  # policy") waiting for its first call, and since the QUERY path embeds too,
+  # that 404 fails a whole match run rather than some optional leg. The
+  # gemini-embedding-2 family failed this test in Aug 2026 — its `-preview`
+  # slug was Google-AI-Studio-only, and even the plain slug had AI Studio as
+  # its ONLY multi-input endpoint, so every batched embed 404'd. This model has
+  # three interchangeable providers, all policy-clean, whose vectors agree to
+  # cosine ≥0.9999.
+  embedding: "qwen/qwen3-embedding-8b"
+  # OpenRouter provider routing for embed calls: an ORDERED PREFERENCE with
+  # fallbacks left on — never a hard `only` pin, which is how you rebuild the
+  # single-endpoint failure above. Ordering is pure latency; same-model vectors
+  # agree across providers, so failover cannot corrupt similarity. Omit to let
+  # OpenRouter route (embed.py's DEFAULT_EMBEDDING_PROVIDER applies either way,
+  # including the non-overridable `data_collection: deny`).
+  embedding_provider:
+    order: ["nebius", "deepinfra", "siliconflow"]
+    allow_fallbacks: true
+  # Matryoshka (MRL) truncation, applied at computation time. The models in
+  # embed.py's MRL_CAPABLE_MODELS pack the most important information into the
+  # leading dimensions, so working vectors can be truncated to a shorter length
+  # with minimal quality loss — cheaper similarity math. Full native-size
+  # vectors are always stored on disk, so this is re-tunable without
+  # re-embedding. Set to an int (e.g. 1536, 768); leave null/omit to use the
+  # full native size (4096 for qwen3-embedding-8b).
   embedding_dimensions: 1536
   extraction_llm: "deepseek/deepseek-v4-flash-0731"
   pair_llm: "deepseek/deepseek-v4-flash-0731"

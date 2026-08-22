@@ -129,8 +129,11 @@ OpenRouter slugs (`provider/model`):
 
 ```yaml
 models:
-  embedding: "google/gemini-embedding-2-preview"
-  embedding_dimensions: 1536   # MRL truncation; null = full native size (3072)
+  embedding: "qwen/qwen3-embedding-8b"
+  embedding_provider:          # ordered provider PREFERENCE (never a hard pin)
+    order: ["nebius", "deepinfra", "siliconflow"]
+    allow_fallbacks: true
+  embedding_dimensions: 1536   # MRL truncation; null = full native size (4096)
   extraction_llm: "deepseek/deepseek-v4-flash-0731"
   pair_llm: "deepseek/deepseek-v4-flash-0731"
   reasoning_effort: "low"      # global default; pair_reasoning_effort overrides pair scoring

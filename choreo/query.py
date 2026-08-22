@@ -422,6 +422,7 @@ def run_query_match(
         extracted_sections=[query_atom],
         embedding_model=embedding_model,
         hyde_descriptors=hyde_descriptors or None,
+        embed_provider=models_cfg.get("embedding_provider"),
     )
 
     # MRL truncation: mirror the cohort pipeline so query and pool vectors live
