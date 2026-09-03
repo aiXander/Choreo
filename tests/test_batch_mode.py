@@ -3,7 +3,7 @@
 import numpy as np
 
 from choreo.utils import stable_pair_id
-from choreo.batch_match import run_batch_match, select_pairs_rectangular
+from choreo.batch_match import blend_directional, run_batch_match, select_pairs_rectangular
 from choreo.store import FileStore
 
 
@@ -93,8 +93,8 @@ def test_select_pairs_rectangular_dedup_and_self_skip():
     by_id = {p.pair_id: p for p in pairs}
     # self pairs (9.0 entries) never appear
     assert all("_" in pid and pid.split("_")[0] != pid.split("_")[1] for pid in by_id)
-    # a_b appears ONCE with the two directions averaged: (0.8 + 0.4) / 2
-    assert abs(by_id["a_b"].similarity_score - 0.6) < 1e-9
+    # a_b appears ONCE, blended max-leaning: 0.7 * max(0.8, 0.4) + 0.3 * mean(0.8, 0.4)
+    assert abs(by_id["a_b"].similarity_score - (0.7 * 0.8 + 0.3 * 0.6)) < 1e-9
     # member->pool-only pairs keep their single directional value
     assert abs(by_id["a_c"].similarity_score - 0.6) < 1e-9
     assert abs(by_id["b_c"].similarity_score - 0.5) < 1e-9
@@ -207,3 +207,16 @@ def test_batch_then_history_roundtrip(synthetic_bundle, fake_llm, test_config, t
     first_ids = {e.pair_id for e in first.edges}
     second_ids = {e.pair_id for e in second.edges}
     assert not first_ids & second_ids   # strictly novel matches
+
+
+def test_blend_directional_keeps_strong_one_way_pairs_alive():
+    """The shortlist must not average a strong one-directional pair down to a
+    weak mutual one (the LLM prompt rewards one-directional help; the
+    shortlist runs first and used to erase it)."""
+    strong_one_way = blend_directional([0.8, 0.3])
+    medium_mutual = blend_directional([0.55, 0.55])
+    strong_mutual = blend_directional([0.8, 0.8])
+    assert strong_one_way > medium_mutual          # was a tie under the plain mean
+    assert strong_mutual > strong_one_way          # mutual still wins when both are strong
+    assert blend_directional([0.8, 0.1]) < strong_mutual  # plain max would tie these
+    assert blend_directional([0.42]) == 0.42       # single direction passes through

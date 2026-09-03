@@ -49,6 +49,21 @@ class BatchMatchResult:
         }
 
 
+DIRECTIONAL_MAX_SHARE = 0.7
+
+
+def blend_directional(values: List[float]) -> float:
+    """ONE shortlist score for an unordered pair from its directional values.
+
+    ``0.7 * max + 0.3 * mean`` — see ``select_pairs_rectangular``. A single
+    value (member→pool-only pair) passes through unchanged.
+    """
+    if len(values) == 1:
+        return values[0]
+    mean = sum(values) / len(values)
+    return DIRECTIONAL_MAX_SHARE * max(values) + (1.0 - DIRECTIONAL_MAX_SHARE) * mean
+
+
 def select_pairs_rectangular(
     dir_matrix: np.ndarray,
     member_ids: List[str],
@@ -62,8 +77,18 @@ def select_pairs_rectangular(
     The rectangular counterpart of ``select_pairs_for_llm_scoring_optimal``:
     candidate pairs are restricted to (member × pool), self-pairs and
     history-excluded pairs are skipped, and each pair gets ONE score — when
-    both users are members the two directional entries are averaged, otherwise
-    the single member→pool direction is used.
+    both users are members the two directional entries are blended as
+    ``0.7 * max + 0.3 * mean``, otherwise the single member→pool direction is
+    used.
+
+    Why a max-leaning blend and not the mean: the fused matrix is DIRECTIONAL
+    on purpose (``cross[i][j]`` = "j can help i"), and the pair-scoring prompt
+    tells the LLM that strong one-directional help is very valuable — but this
+    shortlist runs first and used to average the two directions, so "A can
+    solve B's problem, B is useless to A" scored the same as "both vaguely
+    help each other" and often never reached the LLM at all. ``max`` alone
+    over-rewards (0.8/0.1 would tie with 0.8/0.8); the 0.3 mean share keeps a
+    strongly mutual pair ahead of a strongly one-directional one.
 
     Selection round-robins over members so every member gets its best
     available pairs before anyone exhausts the budget; per-profile caps apply
@@ -89,7 +114,7 @@ def select_pairs_rectangular(
 
     all_pairs: List[CandidatePair] = []
     for pair_id, values in pair_values.items():
-        score = sum(values) / len(values)
+        score = blend_directional(values)
         if score > 0:  # only positive similarities (consistent with square mode)
             user1, user2 = pair_users[pair_id]
             all_pairs.append(CandidatePair(
