@@ -84,10 +84,15 @@ hyde:
 
 recipe:
   instruction: "Score this match on the value of connecting these two people. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional signal is also valuable. Also reward a shared direction or overlapping ambition (two people excited about the same problem who should collaborate). Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
+  # Same-section similarity. NEGATIVE is deliberate and load-bearing: two
+  # people with the SAME skills (or the same needs) are not a match to make —
+  # complementarity is, and that is what the cross term below buys. Fusion is a
+  # masked weighted mean normalized by the |weight| mass actually present for
+  # the pair, so these are relative, not absolute (full mass = 1.65).
   section_weights:
-    skills:   -0.10
+    skills:   -0.20
     vision:   0.35
-    project:  0.25
+    project:  0.20
     needs:    -0.10
   cross_section_weights:
     needs_skills: 0.80
