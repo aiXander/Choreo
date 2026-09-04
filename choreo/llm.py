@@ -11,7 +11,7 @@ import os
 import json
 import asyncio
 import concurrent.futures
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Sequence
 
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
@@ -211,6 +211,104 @@ class JSONExtractionError(ValueError):
     """
 
 
+# ---------------------------------------------------------------------------
+# Response-shape validation
+#
+# `response_format={"type":"json_object"}` (json_mode) guarantees SYNTAX, never
+# SCHEMA: the provider promises *an* object, not *your* keys. A phase that reads
+# its fields with `dict.get(key, <default>)` therefore cannot tell a wrong-shaped
+# answer from a real one — it silently ships the default. That is exactly how a
+# 2026-09-02 wintercircus match run published two cards carrying placeholder
+# prose: one response came back as `{"": "{\"intro_for_a\": …}"}` (the real
+# answer, stringified inside an empty-key wrapper) and one as `{": ": ", "}`
+# (degenerate). Both parsed fine, both were cached, neither was retried.
+#
+# A phase opts in by declaring `required_key_sets`; every phase that declares
+# nothing keeps the previous behavior byte-for-byte.
+# ---------------------------------------------------------------------------
+
+# Alternative key groups a response may satisfy. `None`/empty = no requirement.
+KeySets = Optional[Sequence[Sequence[str]]]
+
+# How deep / how many nodes the envelope unwrap will look through. Real
+# responses are a handful of keys, so these only bound a pathological payload.
+_MAX_ENVELOPE_DEPTH = 3
+_MAX_ENVELOPE_NODES = 16
+
+
+def _is_filled(value: Any) -> bool:
+    """Whether a decoded JSON value counts as present (not null/blank/empty)."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True  # numbers/bools are legitimate answers, including 0 and False
+
+
+def satisfies_key_sets(value: Any, key_sets: KeySets) -> bool:
+    """Whether ``value`` is a JSON object carrying one COMPLETE required key set.
+
+    ``key_sets`` lists ALTERNATIVE groups (e.g. a directional format and a legacy
+    one): the value passes if every key of any ONE group is present and filled.
+    With no key sets declared everything passes — the opt-out that keeps
+    undeclared phases unchanged.
+    """
+    if not key_sets:
+        return True
+    if not isinstance(value, dict):
+        return False
+    return any(
+        keys and all(_is_filled(value.get(key)) for key in keys)
+        for keys in key_sets
+    )
+
+
+def unwrap_json_envelope(value: Any, key_sets: KeySets) -> Any:
+    """Recover an answer a model stringified inside a wrapper object.
+
+    Deliberately conservative: it returns something other than ``value`` ONLY
+    when ``value`` fails ``key_sets`` and a decoded inner object fully satisfies
+    them. So it can never rewrite a well-formed response, never turns a scalar
+    string value into the answer, and is a no-op when no key sets are declared.
+    """
+    if not key_sets or satisfies_key_sets(value, key_sets):
+        return value
+    frontier = [value]
+    budget = _MAX_ENVELOPE_NODES
+    for _ in range(_MAX_ENVELOPE_DEPTH):
+        next_frontier: List[Any] = []
+        for node in frontier:
+            if not isinstance(node, dict):
+                continue
+            for raw in node.values():
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                if budget <= 0:
+                    return value
+                budget -= 1
+                try:
+                    decoded = json.loads(raw, strict=False)
+                except (ValueError, TypeError):
+                    continue
+                if satisfies_key_sets(decoded, key_sets):
+                    return decoded
+                if isinstance(decoded, dict):
+                    next_frontier.append(decoded)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return value
+
+
+def _describe_shape(value: Any) -> str:
+    """Short, log-safe description of a response's shape (never its content)."""
+    if isinstance(value, dict):
+        return f"object with keys {sorted(map(str, value))[:8]}"
+    return type(value).__name__
+
+
 def run_coro_blocking(coro):
     """Run an async coroutine to completion from synchronous code.
 
@@ -307,6 +405,40 @@ class LLMWrapper:
         except (AttributeError, KeyError, TypeError) as e:
             print(f"⚠️  WARNING: Could not track cost for {call_type} call with model {model}: {e}")
     
+    def _load_cached(self, cache_key: Optional[str], required_key_sets: KeySets = None) -> Any:
+        """Return a usable cached response, or ``None`` for "regenerate".
+
+        Three misses, all silent-safe:
+
+        * no key / no cache dir / no file — an ordinary miss;
+        * an unreadable file — warned, then regenerated (pre-existing behavior);
+        * a file that does not satisfy ``required_key_sets`` — **the poisoned
+          entry**. Responses are cached before the caller ever looks at their
+          shape, so one bad generation used to pin itself into the cache under a
+          content-addressed key and replay on every later run (the prompt hash
+          only changes when the profile text does). Treating it as a miss makes
+          the cache self-healing instead. The envelope unwrap runs first, so a
+          stringified-but-complete cached answer is recovered without re-spending.
+        """
+        if not (cache_key and self.cache_dir):
+            return None
+        cache_path = get_cache_path(self.cache_dir, cache_key)
+        if not cache_path.exists():
+            return None
+        try:
+            cached = load_json(cache_path)
+        except Exception as e:
+            print(f"Warning: Failed to load cache {cache_path}: {e}")
+            return None
+        cached = unwrap_json_envelope(cached, required_key_sets)
+        if not satisfies_key_sets(cached, required_key_sets):
+            print(
+                f"⚠️  Ignoring unusable cached response {cache_path.name} "
+                f"({_describe_shape(cached)}); regenerating"
+            )
+            return None
+        return cached
+
     def _prepare_json_prompt(self, prompt: str, schema_hint: Optional[str]) -> str:
         """Prepare prompt for JSON output."""
         json_instruction = "Respond with valid JSON only. No additional text or explanations."
@@ -419,6 +551,7 @@ class LLMWrapper:
         progress_label: Optional[str] = None,
         progress_interval: float = 10.0,
         deadline_s: Optional[float] = None,
+        required_key_sets: KeySets = None,
     ) -> List[Dict[str, Any]]:
         """
         Process multiple prompts concurrently with rate-limit retry handling.
@@ -444,6 +577,11 @@ class LLMWrapper:
                 that means. Use it when the model's TAIL latency costs more than
                 the last few answers are worth — but note cancelled calls still
                 burn the tokens the provider already generated.
+            required_key_sets: Alternative key groups a response must satisfy
+                (see ``satisfies_key_sets``). A response matching none of them
+                is a retryable ``JSONExtractionError`` and is never cached, and
+                an already-cached response that no longer matches is treated as
+                a cache miss. ``None`` (default) imposes no requirement.
 
         Returns:
             List of parsed JSON responses in same order as input prompts. A slot
@@ -474,14 +612,10 @@ class LLMWrapper:
         uncached_indices = []
         
         for i, (prompt, cache_key, schema_hint) in enumerate(zip(prompts, cache_keys, schema_hints)):
-            if cache_key and self.cache_dir:
-                cache_path = get_cache_path(self.cache_dir, cache_key)
-                if cache_path.exists():
-                    try:
-                        results[i] = load_json(cache_path)
-                        continue
-                    except Exception as e:
-                        print(f"Warning: Failed to load cache {cache_path}: {e}")
+            cached = self._load_cached(cache_key, required_key_sets)
+            if cached is not None:
+                results[i] = cached
+                continue
             uncached_indices.append(i)
         
         cached_count = n_prompts - len(uncached_indices)
@@ -521,6 +655,7 @@ class LLMWrapper:
                             verbosity=verbosity,
                             print_reasoning_summary=print_reasoning_summary,
                             max_tokens=max_tokens,
+                            required_key_sets=required_key_sets,
                         )
                     except Exception as e:  # keep going; caller inspects per-item
                         result = e
@@ -593,17 +728,14 @@ class LLMWrapper:
         verbosity: int = 0,
         print_reasoning_summary: bool = False,
         max_tokens: Optional[int] = None,
+        required_key_sets: KeySets = None,
     ) -> Dict[str, Any]:
         """Single async JSON completion with retry logic."""
         # Check cache first
-        if cache_key and self.cache_dir:
-            cache_path = get_cache_path(self.cache_dir, cache_key)
-            if cache_path.exists():
-                try:
-                    return load_json(cache_path)
-                except Exception as e:
-                    print(f"Warning: Failed to load cache {cache_path}: {e}")
-        
+        cached = self._load_cached(cache_key, required_key_sets)
+        if cached is not None:
+            return cached
+
         json_prompt = self._prepare_json_prompt(prompt, schema_hint)
         
         for attempt in range(max_retries + 1):
@@ -644,7 +776,20 @@ class LLMWrapper:
 
                 # Parse JSON
                 result = self._extract_json(content.strip())
-                
+
+                # Shape gate. json_mode buys syntax, not schema — so a phase
+                # that declared what it needs gets a retryable failure here
+                # rather than a plausible-looking object its `.get()` calls
+                # quietly paper over. Runs BEFORE the cache write on purpose:
+                # a rejected response must not be persisted.
+                result = unwrap_json_envelope(result, required_key_sets)
+                if not satisfies_key_sets(result, required_key_sets):
+                    raise JSONExtractionError(
+                        "Model returned JSON missing every required key set "
+                        f"{[list(keys) for keys in (required_key_sets or [])]}; "
+                        f"got {_describe_shape(result)}"
+                    )
+
                 # Cache result
                 if cache_key and self.cache_dir:
                     try:

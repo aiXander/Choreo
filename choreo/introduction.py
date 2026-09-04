@@ -7,6 +7,32 @@ from .utils import load_yaml, hash_text, is_absent
 from .schemas import Edge, Introduction  # noqa: F401 — Introduction re-exported
 
 
+# The response shapes an introduction call may legitimately return: the
+# directional format the packaged prompt asks for, and the legacy single-`intro`
+# format a custom `introduction_prompt_text` may still use. Declared to the LLM
+# layer so a response matching NEITHER is a retryable failure that is never
+# cached — instead of silently becoming placeholder prose on a published card.
+INTRODUCTION_KEY_SETS = (
+    ("intro_for_a", "intro_for_b", "starter_topics"),
+    ("intro", "starter_topics"),
+)
+
+
+def _as_text(value) -> str:
+    """Coerce one response field to trimmed text; '' for anything empty.
+
+    Models occasionally answer with a list of bullets where a string was asked
+    for, so lists are joined rather than str()'d into Python repr.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_as_text(item) for item in value if _as_text(item)).strip()
+    return str(value).strip()
+
+
 def fallback_introduction(
     pair_id: str,
     user1: str,
@@ -185,25 +211,45 @@ def generate_introductions_for_matches(
                 model=model,
                 cache_keys=cache_keys,
                 progress_label="introduce",
+                required_key_sets=INTRODUCTION_KEY_SETS,
             ))
-            
+
             # Process batch responses
             for edge, response in zip(valid_edges, responses):
                 try:
                     if isinstance(response, Exception):
                         raise response
-                    
-                    # Validate response — supports both directional and legacy formats
-                    intro_for_a = response.get('intro_for_a')
-                    intro_for_b = response.get('intro_for_b')
+                    if not isinstance(response, dict):
+                        # None = cancelled at a batch deadline; anything else =
+                        # the model answered with a non-object.
+                        raise ValueError(
+                            f"introduction response was {type(response).__name__}, "
+                            "not a JSON object"
+                        )
+
+                    # Read the response — supports both directional and legacy
+                    # formats. NO invented defaults: a missing field must reach
+                    # `fallback_introduction` below, which says plainly that the
+                    # pair was matched. Substituting cheerful filler here ("Great
+                    # to meet you!") shipped two wintercircus cards on 2026-09-02
+                    # that looked authored and said nothing — with the real,
+                    # correctly generated intro sitting one JSON envelope away.
+                    intro_for_a = _as_text(response.get('intro_for_a'))
+                    intro_for_b = _as_text(response.get('intro_for_b'))
+                    starter_topics = _as_text(response.get('starter_topics'))
                     if intro_for_a and intro_for_b:
                         name1 = display_names.get(edge.user1, edge.user1)
                         name2 = display_names.get(edge.user2, edge.user2)
                         intro = f"For {name1}: {intro_for_a}\n\nFor {name2}: {intro_for_b}"
                     else:
-                        intro = str(response.get('intro', 'Great to meet you! Looking forward to our conversation.'))
-                    starter_topics = str(response.get('starter_topics', '- Share your background\n- Discuss common interests'))
-                    
+                        intro = _as_text(response.get('intro'))
+                    if not intro or not starter_topics:
+                        raise ValueError(
+                            "introduction response is missing "
+                            f"{'intro' if not intro else 'starter_topics'} "
+                            f"(keys: {sorted(map(str, response))[:8]})"
+                        )
+
                     # Create Introduction
                     introduction = Introduction(
                         pair_id=edge.pair_id,
