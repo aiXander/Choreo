@@ -319,6 +319,21 @@ by `concurrency.max_concurrent_llm_calls` (default 16) — exactly that many cal
 are in flight at once and the next fires the instant one returns (continuous
 dispatch, not fire-a-window-then-await). One global knob; no per-stage batch sizes.
 
+**Response shape (`required_key_sets`)**: `json_mode` buys SYNTAX, not SCHEMA —
+`response_format={"type":"json_object"}` promises *an* object, not *your* keys.
+A phase can declare the alternative key groups it accepts (`introduction.py`'s
+`INTRODUCTION_KEY_SETS` is the only caller today); a response satisfying none is
+a **retryable** `JSONExtractionError` that is never cached, and a *cached*
+response that fails the gate is re-fetched rather than replayed.
+`unwrap_json_envelope` first salvages an answer the model stringified inside a
+wrapper object — but only ever returns an object that passes the gate, so it
+cannot rewrite a well-formed response. Declaring nothing keeps a phase's
+behavior byte-for-byte identical. This exists because a JSON-mode call came back
+as `{"": "{\"intro_for_a\": …}"}` and `dict.get(k, <default>)` turned the loss
+into published placeholder prose that looked authored — hence the companion
+rule in `introduction.py`: **member-visible prose gets an honest fallback, never
+an invented default.** Pinned in `tests/test_response_shape_gate.py`.
+
 **Blending**: `final = embed_weight * embed_score + llm_weight * llm_score`.
 Score normalization takes the reference distribution as an explicit input
 (`utils.prepare_normalized_scores(reference_scores=…)`); only the legacy square
