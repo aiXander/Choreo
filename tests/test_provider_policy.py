@@ -1,15 +1,25 @@
-"""Every Choreo LLM call carries the OpenRouter no-data-collection policy."""
+"""Every Choreo LLM call routes through exactly ONE mechanism.
+
+A bare slug (standalone Choreo, no host OpenRouter account) carries the
+`data_collection: deny` provider floor, as it always has. A slug carrying an
+`@preset/<name>` suffix carries NO provider block at all: the preset already
+names a complete routing policy on the account, and a request-level `provider`
+object replaces it wholesale — every request would keep returning 200 while the
+provider order, quantization floor and retention posture silently vanished.
+"""
+
+import pytest
 
 from choreo.llm import _build_chat_params, _build_extra_body
 
 
-def test_provider_data_collection_is_denied_without_reasoning() -> None:
-    assert _build_extra_body(None) == {
+def test_a_bare_slug_keeps_the_data_collection_floor() -> None:
+    assert _build_extra_body(None, "provider/model") == {
         "provider": {"data_collection": "deny"},
     }
 
 
-def test_provider_block_survives_reasoning_configuration() -> None:
+def test_the_floor_survives_reasoning_configuration() -> None:
     params = _build_chat_params(
         [{"role": "user", "content": "member profile"}],
         "provider/model",
@@ -19,6 +29,42 @@ def test_provider_block_survives_reasoning_configuration() -> None:
         "provider": {"data_collection": "deny"},
         "reasoning": {"effort": "low"},
     }
+
+
+def test_a_preset_suffixed_slug_carries_no_provider_block() -> None:
+    params = _build_chat_params(
+        [{"role": "user", "content": "member profile"}],
+        "provider/model@preset/zwerm",
+        "low",
+    )
+    assert params["extra_body"] == {"reasoning": {"effort": "low"}}
+    assert "provider" not in params["extra_body"]
+
+
+def test_a_fallback_chain_becomes_a_prioritized_models_array() -> None:
+    chain = ["a/primary@preset/p", "b/fallback@preset/p"]
+    params = _build_chat_params(
+        [{"role": "user", "content": "hi"}],
+        chain[0],
+        None,
+        chain,
+    )
+    assert params["model"] == chain[0]
+    assert params["extra_body"]["models"] == chain
+
+
+def test_a_one_entry_chain_sends_no_models_array() -> None:
+    # A `models` array of one buys nothing and costs a field on every request.
+    body = _build_extra_body(None, "a/primary", ["a/primary"])
+    assert "models" not in body
+
+
+def test_a_missing_model_raises_rather_than_substituting_one() -> None:
+    """A phase whose model resolved to None used to fall through to a packaged
+    Gemini slug — silently, on a call carrying member profile material, at a
+    different price and a different provider policy."""
+    with pytest.raises(ValueError, match="no model for this phase"):
+        _build_chat_params([{"role": "user", "content": "hi"}], "")
 
 
 def test_embed_calls_carry_denied_data_collection_and_ordered_routing(monkeypatch) -> None:

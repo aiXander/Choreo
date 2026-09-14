@@ -191,6 +191,22 @@ models:
   pair_llm: "deepseek/deepseek-v4-flash-0731"
   reasoning_effort: "low"           # global default for every phase
   pair_reasoning_effort: "low"      # pair scoring + query re-rank override
+  fallback_models: []               # optional prioritized chain, primary FIRST →
+                                    # OpenRouter's `models` array (failover inside ONE request)
+
+**Routing: a preset suffix OR a provider block, never both.** A slug carrying
+`@preset/<name>` already names a complete routing policy on the caller's
+OpenRouter account (provider order, quantization floor, retention posture), so
+`_build_extra_body` emits **no `provider` object** for it — a request-level block
+REPLACES a preset wholesale, silently, with every call still returning 200. A
+bare slug (standalone Choreo, no host account) keeps the `data_collection: deny`
+floor it has always had. Member profile material reaches every phase, so this is
+a correctness rule, not a style one.
+
+⚠️ **The transport substitutes no model.** A phase whose model resolves to `None`
+raises rather than falling through to a packaged default — it used to land on a
+stale Gemini slug, unrouted, at a different price. `choreo/defaults/config.yaml`
+carries the defaults; there is no chat-model constant in `llm.py` any more.
 
 instruction_prompt:
   goal: "…"                    # matching goal injected into every prompt

@@ -25,10 +25,22 @@ load_dotenv()
 # OpenRouter exposes an OpenAI-compatible REST API.
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Default models. These are overridden per-phase from config.yaml (`models:`),
-# but act as fallbacks when a model is not specified.
-DEFAULT_MODEL = "google/gemini-3.1-flash-lite"
+# The default embedding model, used when `models.embedding` is unset. There is
+# deliberately NO chat-model equivalent: `choreo/defaults/config.yaml` carries
+# `models.extraction_llm` / `models.pair_llm`, and a transport that quietly
+# substitutes a model the caller did not ask for is a bug, not a convenience —
+# a host overriding one phase to `None` used to fall through to a packaged
+# Gemini slug on a call carrying member profile material, silently, at a
+# different price and a different provider policy. `_build_chat_params` raises
+# instead.
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
+
+#: A model slug carrying this suffix already names a COMPLETE routing policy on
+#: OpenRouter's side (an account preset: provider order, quantization floor,
+#: retention posture). A request-level `provider` object REPLACES that preset
+#: wholesale rather than merging with it, so a slug with this suffix must travel
+#: with no `provider` block at all — see `_build_extra_body`.
+PRESET_SEP = "@preset/"
 
 # Optional attribution headers shown on OpenRouter dashboards (harmless to keep).
 _DEFAULT_HEADERS = {
@@ -134,18 +146,37 @@ def extract_usage(response: Any) -> Dict[str, Any]:
     }
 
 
-def _build_extra_body(reasoning_effort: Optional[str]) -> Dict[str, Any]:
+def _build_extra_body(
+    reasoning_effort: Optional[str],
+    model: str,
+    fallback_models: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     """Assemble OpenRouter-specific request extensions.
 
     Note: OpenRouter usage accounting (cost + token details) is always on, so no
     ``usage: {include: true}`` flag is needed — it returns automatically.
+
+    **Routing is either a preset or a provider block, never both.** Member
+    profile material reaches every Choreo LLM phase, so a route whose provider
+    policy permits data collection must be impossible. There are two ways to say
+    that and they are mutually exclusive:
+
+    * the slug carries ``@preset/<name>`` — the host has named a complete
+      routing policy on its OpenRouter account (provider order, quantization
+      floor, retention). Sending a ``provider`` object alongside it REPLACES the
+      preset wholesale while every request keeps returning 200, so this emits
+      none;
+    * the slug is bare (standalone Choreo, no host account) — emit the
+      ``data_collection: deny`` floor, as this has always done.
     """
-    # Member profile material reaches every Choreo LLM phase. Require an
-    # OpenRouter route whose provider policy denies data collection; this is
-    # distinct from OpenRouter's separate zero-data-retention control.
-    extra_body: Dict[str, Any] = {
-        "provider": {"data_collection": "deny"},
-    }
+    extra_body: Dict[str, Any] = {}
+    if PRESET_SEP not in (model or ""):
+        extra_body["provider"] = {"data_collection": "deny"}
+    # A prioritized chain: OpenRouter fails over INSIDE one request, so a
+    # provider outage costs one degraded answer rather than a failed phase.
+    chain = [m for m in (fallback_models or []) if m]
+    if len(chain) > 1:
+        extra_body["models"] = list(chain)
     # Forward the reasoning effort whenever one is set (including "none" to turn
     # reasoning off). OpenRouter silently ignores this for non-reasoning models,
     # so it's safe to always send; reasoning models that can't be disabled would
@@ -159,15 +190,25 @@ def _build_chat_params(
     messages: List[Dict[str, str]],
     model: str,
     reasoning_effort: Optional[str] = None,
+    fallback_models: Optional[Sequence[str]] = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Build the chat.completions request params shared by sync and async paths."""
+    """Build the chat.completions request params shared by sync and async paths.
+
+    Raises on a missing model rather than substituting one: see the note on
+    ``DEFAULT_EMBEDDING_MODEL`` for why there is no chat default any more.
+    """
+    if not model:
+        raise ValueError(
+            "no model for this phase — set models.extraction_llm / models.pair_llm "
+            "in config.yaml (or pass one explicitly); this transport substitutes none"
+        )
     params: Dict[str, Any] = {
-        "model": model or DEFAULT_MODEL,
+        "model": model,
         "messages": messages,
     }
 
-    extra_body = _build_extra_body(reasoning_effort)
+    extra_body = _build_extra_body(reasoning_effort, model, fallback_models)
     if extra_body:
         params["extra_body"] = extra_body
 
@@ -195,11 +236,12 @@ async def async_chat_completion(
     messages: List[Dict[str, str]],
     model: str,
     reasoning_effort: Optional[str] = None,
+    fallback_models: Optional[Sequence[str]] = None,
     **kwargs,
 ) -> Any:
     """Native async OpenRouter chat completion using a caller-provided client."""
     return await client.chat.completions.create(
-        **_build_chat_params(messages, model, reasoning_effort, **kwargs)
+        **_build_chat_params(messages, model, reasoning_effort, fallback_models, **kwargs)
     )
 
 
@@ -333,7 +375,8 @@ class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
     
     def __init__(self, cache_dir: Optional[str] = None, max_retries: int = 3, reasoning_effort: Optional[str] = "low",
-                 max_concurrent_llm_calls: int = 16):
+                 max_concurrent_llm_calls: int = 16,
+                 fallback_models: Optional[Sequence[str]] = None):
         # cache_dir=None disables the file-based response cache entirely
         # (in-memory pipeline runs, e.g. transient query matching).
         if cache_dir:
@@ -354,6 +397,13 @@ class LLMWrapper:
         # that doesn't pass an explicit reasoning_effort; "low" is the
         # cost-effective baseline and is ignored on non-reasoning models.
         self.reasoning_effort = reasoning_effort
+        # The prioritized model chain for every chat phase, primary FIRST, sent
+        # as OpenRouter's `models` array so failover happens inside one request.
+        # None (the standalone default) means no chain: one model, one attempt
+        # per retry. A host sets this from its own model contract; the entries
+        # must already be whatever routed form the host uses, because this class
+        # never rewrites a slug.
+        self.fallback_models = list(fallback_models) if fallback_models else None
         # Global cap on how many LLM HTTP requests are in flight at once across
         # every batched phase. The dispatcher in batch_json_complete keeps
         # exactly this many calls running and fires the next the instant one
@@ -756,6 +806,7 @@ class LLMWrapper:
                     messages=[{"role": "user", "content": json_prompt}],
                     model=model,
                     reasoning_effort=reasoning_effort if reasoning_effort is not None else self.reasoning_effort,
+                    fallback_models=self.fallback_models,
                     **call_kwargs,
                 )
 
