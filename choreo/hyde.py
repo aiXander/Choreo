@@ -28,6 +28,36 @@ __all__ = [
 ]
 
 
+def _clean_descriptors(raw: Any, *, n_descriptors: int, fallback: str) -> List[str]:
+    """Coerce whatever came back for one user into exactly `n_descriptors` STRINGS.
+
+    Non-string items are DROPPED (not str()-ed) and the list is padded with the
+    user's own source text — the same fallback the generation path already uses
+    when the LLM errors, so a partly-bad response degrades exactly like a fully
+    bad one instead of poisoning the pipeline.
+
+    ⚠️ This is not defensive decoration; it is the fix for a real outage. A model
+    answering `{"descriptors": ["...", false]}` put a raw JSON `false` into the
+    per-cross-key cache file, and because that cache is content-addressed on the
+    SOURCE TEXT the bad entry replayed on every subsequent run forever. Downstream
+    `hyde_content_hash` does `"\x1f".join(descriptors)`, so every full run for that
+    whole deployment died with `TypeError: sequence item 1: expected str instance,
+    bool found` — one member's malformed line taking down a 1,500-member nightly
+    reconcile (wintercircus, 2026-09-18 → 09-19).
+
+    Applied at BOTH ends on purpose: on the freshly parsed LLM response, so a bad
+    item never reaches the cache file, and on the merged result, so entries ALREADY
+    written to a cache file heal themselves on the next read with no cache wipe and
+    no LLM re-spend. `hyde_content_hash` is deliberately left strict — it is the
+    tripwire that caught this, and it should keep catching anything that bypasses
+    this function."""
+    items = raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) else [])
+    cleaned = [d for d in items if isinstance(d, str)][:n_descriptors]
+    while len(cleaned) < n_descriptors:
+        cleaned.append(fallback)
+    return cleaned
+
+
 def _section_guideline(sections_config: Optional[Dict[str, Any]], name: str) -> str:
     sec = (sections_config or {}).get("sections", {}).get(name)
     if isinstance(sec, dict):
@@ -228,15 +258,16 @@ def hyde_descriptors_for_sections(
                         if isinstance(response, Exception):
                             raise response
 
-                        descriptors = response.get('descriptors', [])
-                        if isinstance(descriptors, str):
-                            descriptors = [descriptors]
-                        # Ensure correct length
-                        descriptors = descriptors[:n_descriptors]
-                        while len(descriptors) < n_descriptors:
-                            descriptors.append(extracted_sections[section_idx].sections.get(src_section, "Not specified"))
-
-                        new_items[all_cache_keys[section_idx]] = descriptors
+                        # Coerce to exactly n_descriptors strings (see
+                        # _clean_descriptors): drops a non-string item and pads
+                        # with the source text, which also enforces the length.
+                        new_items[all_cache_keys[section_idx]] = _clean_descriptors(
+                            response.get('descriptors', []),
+                            n_descriptors=n_descriptors,
+                            fallback=extracted_sections[section_idx].sections.get(
+                                src_section, "Not specified"
+                            ),
+                        )
                     except Exception as e:
                         print(f"  Error processing HyDE for {extracted_sections[section_idx].id}: {e}")
                         fallback = extracted_sections[section_idx].sections.get(src_section, "Not specified")
@@ -260,10 +291,14 @@ def hyde_descriptors_for_sections(
                 # out of the fusion (neutral), never LLM-invented.
                 descriptors = [""] * n_descriptors
             else:
-                descriptors = merged.get(all_cache_keys[idx])
-            if descriptors is None:
-                # Should not happen, but fallback
-                descriptors = [es.sections.get(src_section, "Not specified")] * n_descriptors
+                # Cleaned on the way OUT too, so a cache file written by an older
+                # build (or hand-edited) heals itself instead of replaying a
+                # malformed entry forever. Covers the `is None` case as well.
+                descriptors = _clean_descriptors(
+                    merged.get(all_cache_keys[idx]),
+                    n_descriptors=n_descriptors,
+                    fallback=es.sections.get(src_section, "Not specified"),
+                )
 
             user_descriptors.append(HydeDescriptors(
                 user_id=es.id,
