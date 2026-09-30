@@ -290,6 +290,7 @@ def run_query_match(
     llm_wrapper: Optional[LLMWrapper] = None,
     prompt_paths: Optional[Dict[str, str]] = None,
     reference_scores: Optional[np.ndarray] = None,
+    embed_fn: Optional[Callable[[List[str]], np.ndarray]] = None,
 ) -> QueryMatchResult:
     """Rank a community pool against one transient query. Returns, never writes.
 
@@ -339,6 +340,13 @@ def run_query_match(
             takes precedence over paths.
         reference_scores: Optional stable reference distribution for the
             embed-score normalization (defaults to this pool's own row values).
+        embed_fn: Optional ``texts -> (n, dim)`` callable for embedding the
+            query atom (the pool is never embedded here). Defaults to
+            ``get_embeddings`` with the config's provider routing. A host
+            serving a person in real time passes its own to put a short
+            timeout on the call and to time it; it must return FULL-size
+            vectors from the pool's embedding model (MRL truncation still
+            happens below) and owns its own provider routing.
 
     Returns:
         QueryMatchResult with the ranked shortlist (id, scores, why/intro).
@@ -422,6 +430,7 @@ def run_query_match(
         extracted_sections=[query_atom],
         embedding_model=embedding_model,
         hyde_descriptors=hyde_descriptors or None,
+        embed_fn=embed_fn,
         embed_provider=models_cfg.get("embedding_provider"),
     )
 

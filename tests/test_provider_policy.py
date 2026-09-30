@@ -129,3 +129,56 @@ def test_embed_provider_override_cannot_re_allow_data_collection(monkeypatch) ->
     provider = captured["extra_body"]["provider"]
     assert provider["order"] == ["deepinfra"]
     assert provider["data_collection"] == "deny"
+
+
+def test_a_per_request_timeout_is_sent_and_a_timed_out_embed_is_retried(monkeypatch) -> None:
+    """A host embedding one short query for a waiting person passes a few
+    seconds; a provider that blows it must be abandoned and asked again, not
+    waited on for the client's batch-sized default."""
+    from choreo import embed as embed_mod
+
+    calls = []
+
+    class _Response:
+        data = [type("Item", (), {"embedding": [0.1, 0.2]})()]
+        usage = None
+        model_extra = {}
+
+    class _Embeddings:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise TimeoutError("Request timed out.")
+            return _Response()
+
+    class _Client:
+        embeddings = _Embeddings()
+
+    monkeypatch.setattr(embed_mod, "get_openrouter_client", lambda: _Client())
+    monkeypatch.setattr(embed_mod, "get_cost_tracker", lambda: None)
+    monkeypatch.setattr(embed_mod.time, "sleep", lambda _s: None)
+
+    out = embed_mod.get_embeddings(["hello"], "provider/model", timeout=6.0, max_retries=2)
+
+    assert out.shape == (1, 2)
+    assert [c["timeout"] for c in calls] == [6.0, 6.0]
+
+
+def test_no_timeout_argument_leaves_the_client_default_alone(monkeypatch) -> None:
+    from choreo import embed as embed_mod
+
+    captured = {}
+
+    class _Response:
+        data = [type("Item", (), {"embedding": [0.1]})()]
+        usage = None
+        model_extra = {}
+
+    class _Client:
+        embeddings = type("E", (), {"create": lambda self, **kw: (captured.update(kw), _Response())[1]})()
+
+    monkeypatch.setattr(embed_mod, "get_openrouter_client", lambda: _Client())
+    monkeypatch.setattr(embed_mod, "get_cost_tracker", lambda: None)
+
+    embed_mod.get_embeddings(["hello"], "provider/model")
+    assert "timeout" not in captured

@@ -93,6 +93,7 @@ def get_embeddings(
     max_retries: int = 4,
     retry_delay_base: float = 1.0,
     provider: Optional[Dict] = None,
+    timeout: Optional[float] = None,
 ) -> np.ndarray:
     """
     Get embeddings for a list of texts via OpenRouter's embeddings endpoint.
@@ -115,6 +116,12 @@ def get_embeddings(
         provider: OpenRouter provider routing override (`models.embedding_provider`
             in config). Merged OVER DEFAULT_EMBEDDING_PROVIDER; `data_collection`
             is forced to "deny" and is not overridable.
+        timeout: Per-REQUEST timeout in seconds (each retry gets a fresh one).
+            None keeps the shared client's default, which is sized for a batch
+            of documents. An interactive caller embedding one short query
+            passes a few seconds, so a slow provider is abandoned and retried
+            (a timeout counts as transient) instead of holding a person's
+            request for the whole batch-sized window.
 
     Returns:
         numpy array of shape (len(texts), embedding_dim)
@@ -151,6 +158,7 @@ def get_embeddings(
             response = client.embeddings.create(
                 model=model, input=api_texts, encoding_format="float",
                 extra_body={"provider": provider_block},
+                **({"timeout": timeout} if timeout is not None else {}),
             )
 
             # OpenRouter passes provider-side errors (e.g. a 400) back as a 200

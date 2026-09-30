@@ -55,6 +55,38 @@ def test_explicit_mapping_query_ranks_keyword_match(synthetic_bundle, fake_llm, 
     assert scores == sorted(scores, reverse=True)
 
 
+def test_a_host_supplied_embed_fn_embeds_the_query(synthetic_bundle, fake_llm, test_config,
+                                                   monkeypatch):
+    """A host serving a person in real time swaps in its own embed callable (a
+    short timeout, its own timing). It must be the ONE thing that embeds the
+    query atom — the default path is not called behind its back."""
+    pool, pool_sections = _pool(synthetic_bundle)
+    seen = []
+
+    def host_embed(texts):
+        seen.append(list(texts))
+        return np.vstack([keyword_embed(t) for t in texts])
+
+    def _default_must_not_run(*_a, **_k):
+        raise AssertionError("the default get_embeddings ran despite embed_fn")
+
+    monkeypatch.setattr(embed_mod, "get_embeddings", _default_must_not_run)
+
+    result = run_query_match(
+        query={"needs": "I need AGENTS engineering for my project"},
+        pool=pool,
+        config=test_config,
+        pool_sections=pool_sections,
+        llm_rerank=False,
+        generate_intros=False,
+        llm_wrapper=fake_llm,
+        embed_fn=host_embed,
+    )
+
+    assert seen and "AGENTS" in seen[0][0]
+    assert result.shortlist[0]["user_id"] == "alice"
+
+
 def test_llm_rerank_on_by_default_and_reorders(fake_llm, fake_embed_fn, test_config):
     # Two candidates share the AGENTS skill keyword (equal embed score 1.0);
     # the LLM re-rank is the tie-breaker that puts frank on top.
