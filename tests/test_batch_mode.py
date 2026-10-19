@@ -220,3 +220,33 @@ def test_blend_directional_keeps_strong_one_way_pairs_alive():
     assert strong_mutual > strong_one_way          # mutual still wins when both are strong
     assert blend_directional([0.8, 0.1]) < strong_mutual  # plain max would tie these
     assert blend_directional([0.42]) == 0.42       # single direction passes through
+
+
+def test_intro_writer_gets_its_own_guidance_not_the_scoring_rubric(
+    synthetic_bundle, fake_llm, test_config
+):
+    """The pair is already chosen when the intro is written: the packaged intro
+    template renders `recipe.intro_instruction`, never the scoring rubric — a
+    "score this / not a match if…" rubric there pushed the writer into judging
+    the pair instead of introducing it (2026-10-19)."""
+    pool, pool_sections = _pool(synthetic_bundle)
+    config = {**test_config,
+              "recipe": {**test_config["recipe"],
+                         "instruction": "SCORING-RUBRIC",
+                         "intro_instruction": "INTRO-GUIDANCE"}}
+    result = run_batch_match(
+        member_ids=list(pool.user_ids[:2]),
+        pool=pool,
+        config=config,
+        pool_sections=pool_sections,
+        llm_wrapper=fake_llm,
+    )
+    assert result.edges
+
+    scoring = [p for c, p in fake_llm.prompts_seen if c == "batch_pair_scoring"]
+    intros = [p for c, p in fake_llm.prompts_seen if c == "introduction_generation"]
+    assert scoring and intros
+    assert all("SCORING-RUBRIC" in p for p in scoring)
+    assert all("INTRO-GUIDANCE" not in p for p in scoring)
+    assert all("INTRO-GUIDANCE\n\nCreate:" in p for p in intros)
+    assert all("SCORING-RUBRIC" not in p for p in intros)

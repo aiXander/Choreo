@@ -311,6 +311,7 @@ def run_full_match(
             model=models_cfg.get("pair_llm"),
             force=force,
             display_names=display_names,
+            intro_instruction=config.get("recipe", {}).get("intro_instruction", ""),
         )
         for edge in final_edges:
             intro_obj = introductions.get(edge.pair_id)

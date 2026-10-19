@@ -83,14 +83,20 @@ hyde:
   n_descriptors: 2
 
 recipe:
-  # HOW a pair is scored (pair scoring + the intro writer; never the query
-  # path). Deployment flavour belongs in `instruction_prompt.goal`; a host that
+  # HOW a pair is scored (pair scoring only — never the query path, and not the
+  # packaged intro template since 2026-10-19). Deployment flavour belongs in `instruction_prompt.goal`; a host that
   # overrides this string replaces it wholesale and must carry the rules below
   # itself. The shared-direction clause used to reward "overlapping ambition"
   # unconditionally — in a real ~1.5k-member community that filled results with
   # same-niche peers and competitors (2026-10-19), hence the concreteness bar
   # and the two "not a match" rules.
   instruction: "Score this match on the value of connecting these two people. The primary signal is how directly each person's skills can address the other's project needs — the best matches are where both bring something the other needs, but strong one-directional help is also valuable. A shared direction (two people excited about the same problem) counts only when their profiles point to something concrete they could do together. Two people offering the same service to the same kind of client are competitors, not a match. People at the same company or organisation already know each other: not a match. Consider specificity — a vague overlap is less valuable than a concrete skill meeting a concrete need."
+  # Guidance for the INTRO writer only, rendered as its own paragraph (empty =
+  # none). Kept apart from `instruction` on purpose: the intro writer gets a
+  # pair that is already chosen, and the scoring rubric above ("not a match
+  # if…") pushed it into re-judging the pair instead of introducing it. A host
+  # with a per-run emphasis puts it here as well as in `instruction`.
+  intro_instruction: ""
   # Same-section similarity. NEGATIVE is deliberate and load-bearing: two
   # people with the SAME skills (or the same needs) are not a match to make —
   # complementarity is, and that is what the cross term below buys. Fusion is a

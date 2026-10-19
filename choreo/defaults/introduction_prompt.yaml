@@ -1,19 +1,20 @@
 introduction_generation: |
   Context: {goal}
 
-  Your task is to generate intro / collaboration guidance for a matched pair of community members.
-  "{instruction}"
+  Your task is to write intro / collaboration guidance for two community members whom an earlier matching step selected as worth introducing to each other. Don't re-judge the match — write the most useful honest introduction you can.
 
-  This pair ({user_a_name} and {user_b_name}) have been matched because they are complementary in the project context.
-
-  Create:
-  1. A directional introduction for {user_a_name} explaining what {user_b_name} can specifically offer their project
-  2. A directional introduction for {user_b_name} explaining what {user_a_name} can specifically offer their project
+  {intro_guidance}Create:
+  1. A directional introduction for {user_a_name} explaining what {user_b_name} can specifically offer their work or goals
+  2. A directional introduction for {user_b_name} explaining what {user_a_name} can specifically offer their work or goals
   3. Specific, actionable starter topics — concrete things they could build or work on together (lead with what they could start on right away, but also note any longer-term collaboration worth exploring). Format these as a Markdown bulleted list: put each topic on its own line, prefixed with "- " (a hyphen and a space). Do NOT use the "•" character and do NOT run the topics together on a single line.
 
   Be specific about WHICH skills match WHICH needs. Vague "you have shared interests" is not useful.
 
   Ground every claim in what each person actually wrote in their profile below — accurately reflect who they really are and what they're really working on. Do not invent, embellish, or project skills, interests, or goals that aren't stated in their profile text.
+
+  If a profile says little, write less: a short, honest introduction beats a padded one. If one person states no need, say what the other brings and why a conversation is worth it — don't invent a gap for them, and don't fill space with generic ecosystem language.
+
+  Address each person directly as "you", by their first name only — profile names may arrive in full or with the surname in capitals; don't copy that into the text.
 
   <profiles>
   {user_a_name} profile:
@@ -25,7 +26,7 @@ introduction_generation: |
 
   Return compact JSON:
   {{
-    "intro_for_a": "What {user_b_name} can offer {user_a_name}'s project (addressed to {user_a_name})",
-    "intro_for_b": "What {user_a_name} can offer {user_b_name}'s project (addressed to {user_b_name})",
+    "intro_for_a": "What {user_b_name} can offer {user_a_name}'s work or goals (addressed to {user_a_name})",
+    "intro_for_b": "What {user_a_name} can offer {user_b_name}'s work or goals (addressed to {user_b_name})",
     "starter_topics": "- topic1\n- topic2\n- topic3"
   }}

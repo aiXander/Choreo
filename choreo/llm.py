@@ -76,7 +76,9 @@ def _client_kwargs() -> Dict[str, Any]:
         # pinning a batch at N-1/N for the SDK's 600s default × retries — and
         # an SDK-level retry would also bypass the limiter's 429 accounting.
         # Same fix as the 2026-07-16 memory-engine sweep-timeout incident.
-        "timeout": 120.0,
+        # This is httpx's per-read timeout, NOT a wall-clock bound — that one
+        # is ATTEMPT_TIMEOUT_S, enforced around each attempt.
+        "timeout": ATTEMPT_TIMEOUT_S,
         "max_retries": 0,
     }
 
@@ -262,6 +264,11 @@ class JSONExtractionError(ValueError):
     """
 
 
+class LLMAttemptTimeout(TimeoutError):
+    """One HTTP attempt ran past ``ATTEMPT_TIMEOUT_S`` of wall clock — a
+    ``transient`` error, retried like a 5xx (see ``_is_retryable_error``)."""
+
+
 # ---------------------------------------------------------------------------
 # Response-shape validation
 #
@@ -406,6 +413,25 @@ BATCH_MAX_RETRIES = 6
 LEGACY_MAX_RETRIES = 3
 #: Upper bound on any single backoff sleep, including a server's Retry-After.
 RETRY_DELAY_CAP_S = 30.0
+#: Wall-clock cap on ONE HTTP attempt, enforced with `asyncio.wait_for` around
+#: the request. The SDK `timeout` is not one: httpx applies it per read, so a
+#: response that keeps sending bytes (or keep-alive whitespace) never trips it.
+#: On 2026-10-19 one intro attempt of a community rehearsal sat > 6 min with no
+#: timeout and held the whole phase at 3118/3119. An expired attempt is a
+#: `transient` error and goes through the normal retry loop.
+ATTEMPT_TIMEOUT_S = 60.0
+#: Hedging (unbounded phases only). Once at most this share of a phase is still
+#: unanswered, every call in flight gets a second, parallel request and the
+#: first usable answer wins (the loser is cancelled). Phases under 100 uncached
+#: prompts never hedge (1% of them rounds to zero calls); hedging also waits
+#: until stragglers + hedges fit in half the in-flight limit, so a very large
+#: phase does not hedge calls that are only queued.
+HEDGE_AT_FRACTION = 0.99
+#: Tail cutoff: after hedges launch, the phase waits at most this long, then
+#: cancels whatever is still in flight. Those slots stay `None` ("no answer"),
+#: exactly like a `deadline_s` cancellation: scoring retries the pair in its
+#: next round, an intro falls back to `fallback_introduction`.
+TAIL_GRACE_S = 60.0
 #: AIMD knobs. Halve on a rate limit (never below the floor — 8 keeps a phase
 #: moving even under sustained 429s; a smaller ceiling wins), +1 per 8
 #: consecutive successes back to the configured ceiling. 8 rather than 1:
@@ -648,7 +674,9 @@ class BatchStats:
     * ``retries`` — extra attempts (all causes); ``rate_limited`` — responses
       classified as a rate limit (429), including a final one.
     * ``failed`` — prompts whose slot holds an Exception (retries exhausted or
-      non-retryable); ``cancelled`` — slots left ``None`` at ``deadline_s``.
+      non-retryable); ``cancelled`` — slots left ``None`` at ``deadline_s`` or
+      at the tail cutoff (``TAIL_GRACE_S``).
+    * ``hedged`` — stragglers that got a second, parallel request.
     * ``ceiling`` / ``min_concurrency`` — configured in-flight cap and the
       lowest effective limit AIMD reached (== ceiling when never cut).
     """
@@ -661,6 +689,7 @@ class BatchStats:
     rate_limited: int = 0
     failed: int = 0
     cancelled: int = 0
+    hedged: int = 0
     ceiling: int = 0
     min_concurrency: int = 0
     elapsed_s: float = 0.0
@@ -675,6 +704,8 @@ class BatchStats:
             f"{self.dispatched} called · {self.retries} retries "
             f"({self.rate_limited} rate-limited) · {self.failed} failed"
         )
+        if self.hedged:
+            line += f" · {self.hedged} hedged"
         if self.cancelled:
             line += f" · {self.cancelled} cancelled at deadline"
         if self.ceiling:
@@ -700,6 +731,12 @@ class LLMWrapper:
         # dead config before the AIMD rework). A deadline-bounded batch ignores
         # it and keeps LEGACY_MAX_RETRIES — see batch_json_complete.
         self.max_retries = max_retries
+        # Tail-latency knobs (module constants; instance attributes so tests
+        # can shrink them). See ATTEMPT_TIMEOUT_S / HEDGE_AT_FRACTION /
+        # TAIL_GRACE_S.
+        self.attempt_timeout_s = ATTEMPT_TIMEOUT_S
+        self.hedge_at_fraction = HEDGE_AT_FRACTION
+        self.tail_grace_s = TAIL_GRACE_S
         # One BatchStats per batch_json_complete call, in order; get_stats()
         # sums them so a host can put retries/failures in its run summary.
         self.phase_stats: List[BatchStats] = []
@@ -917,7 +954,7 @@ class LLMWrapper:
         """
         totals: Dict[str, Any] = {"total_calls": self.call_count, "phases": len(self.phase_stats)}
         for key in ("prompts", "cache_hits", "dispatched", "retries",
-                    "rate_limited", "failed", "cancelled"):
+                    "rate_limited", "failed", "cancelled", "hedged"):
             totals[key] = sum(getattr(s, key) for s in self.phase_stats)
         floors = [s.min_concurrency for s in self.phase_stats if s.ceiling]
         totals["min_concurrency"] = min(floors) if floors else None
@@ -1072,10 +1109,11 @@ class LLMWrapper:
             total = len(uncached_indices)
             completed = 0
 
-            async def _run_one(i: int):
-                nonlocal completed
+            async def _attempt(i: int):
+                """One request chain for prompt ``i`` — the primary, or its
+                hedge. Never raises: the result or the Exception comes back."""
                 try:
-                    result = await self._async_json_complete_with_retry(
+                    return await self._async_json_complete_with_retry(
                         prompt=prompts[i],
                         model=model,
                         cache_key=cache_keys[i],
@@ -1093,15 +1131,7 @@ class LLMWrapper:
                         stats=stats,
                     )
                 except Exception as e:  # keep going; caller inspects per-item
-                    result = e
-                completed += 1
-                if isinstance(result, Exception):
-                    print(f"Task failed for prompt {i} ({completed}/{total}): {result}")
-                elif verbosity > 0:
-                    print(f"Completed {completed}/{total} LLM calls")
-                # Return the index alongside the result so out-of-order
-                # completion still maps back to the right slot.
-                return i, result
+                    return e
 
             # Periodic progress ticker: prints the completed fraction every
             # `progress_interval` seconds while the batch runs, so long phases
@@ -1123,30 +1153,97 @@ class LLMWrapper:
                 except asyncio.CancelledError:
                     pass
 
-            tasks = [asyncio.create_task(_run_one(i)) for i in uncached_indices]
+            # Every in-flight task maps to its prompt index; a hedged index has
+            # two. The first usable answer settles the index and cancels its
+            # twin; an Exception settles it only once no twin is left.
+            owner: Dict["asyncio.Task[Any]", int] = {}
+            live: Dict[int, set] = {}
+
+            def _launch(i: int) -> None:
+                task = asyncio.create_task(_attempt(i))
+                owner[task] = i
+                live.setdefault(i, set()).add(task)
+
+            for i in uncached_indices:
+                _launch(i)
             ticker = asyncio.create_task(_progress_ticker())
+            loop = asyncio.get_running_loop()
+            # A deadline-bounded phase keeps its one wall-clock budget and
+            # never hedges. An unbounded phase has no cutoff until it hedges;
+            # then the tail gets TAIL_GRACE_S. Hedges must fit beside their
+            # primaries in half the limit, so queued calls are never hedged.
+            cutoff_at = None if deadline_s is None else loop.time() + deadline_s
+            hedge_cap = 0 if legacy_backoff else math.floor(total * (1 - self.hedge_at_fraction))
+            hedging = False
+            losers: List["asyncio.Task[Any]"] = []
             try:
-                # timeout=None waits for every task (plain-gather semantics).
-                # With a deadline, whatever has landed by then is kept and the
-                # stragglers are cancelled — their slots stay None.
-                done, pending = await asyncio.wait(tasks, timeout=deadline_s)
-                for task in done:
-                    i, result = task.result()
-                    results[i] = result  # exceptions kept in-place for caller to handle
-                    if isinstance(result, Exception):
-                        stats.failed += 1
-                if pending:
-                    stats.cancelled = len(pending)
-                    for task in pending:
-                        task.cancel()
-                    # Let the cancellations settle before the client closes.
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    print(
-                        f"{label}Deadline {deadline_s:g}s reached at "
-                        f"{completed}/{total} complete — cancelled {len(pending)} "
-                        f"in-flight call(s); their slots stay unanswered"
+                while owner:
+                    timeout = None if cutoff_at is None else max(0.0, cutoff_at - loop.time())
+                    done, _ = await asyncio.wait(
+                        list(owner), timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if not done:
+                        break  # deadline or tail cutoff
+                    for task in done:
+                        i = owner.pop(task, None)
+                        if i is None:
+                            continue  # its twin settled the index in this same batch
+                        twins = live[i]
+                        twins.discard(task)
+                        result = task.result()
+                        if isinstance(result, Exception) and twins:
+                            continue  # the twin may still answer
+                        results[i] = result  # exceptions kept in-place for caller to handle
+                        completed += 1
+                        if isinstance(result, Exception):
+                            stats.failed += 1
+                            print(f"Task failed for prompt {i} ({completed}/{total}): {result}")
+                        elif verbosity > 0:
+                            print(f"Completed {completed}/{total} LLM calls")
+                        for twin in twins:
+                            twin.cancel()
+                            owner.pop(twin, None)
+                            losers.append(twin)
+                        twins.clear()
+                    remaining = total - completed
+                    if not hedging and 0 < remaining <= min(hedge_cap, limiter.limit // 2):
+                        hedging = True
+                        stragglers = [i for i, twins in live.items() if twins]
+                        for i in stragglers:
+                            _launch(i)
+                        stats.hedged = len(stragglers)
+                        cutoff_at = loop.time() + self.tail_grace_s
+                        print(
+                            f"{label}Hedging {len(stragglers)} straggler call(s) at "
+                            f"{completed}/{total} complete — tail cutoff in {self.tail_grace_s:g}s"
+                        )
+                if owner:
+                    unanswered = len(set(owner.values()))
+                    stats.cancelled = unanswered
+                    for task in owner:
+                        task.cancel()
+                        losers.append(task)
+                    owner.clear()
+                    if hedging:
+                        print(
+                            f"{label}Tail cutoff {self.tail_grace_s:g}s after hedging reached at "
+                            f"{completed}/{total} complete — cancelled {unanswered} "
+                            f"unanswered call(s); their slots stay unanswered"
+                        )
+                    else:
+                        print(
+                            f"{label}Deadline {deadline_s:g}s reached at "
+                            f"{completed}/{total} complete — cancelled {unanswered} "
+                            f"in-flight call(s); their slots stay unanswered"
+                        )
+                # Let the cancellations settle before the client closes.
+                if losers:
+                    await asyncio.gather(*losers, return_exceptions=True)
             finally:
+                # Only non-empty if the batch itself was cancelled mid-wait:
+                # don't leave its calls running against a closing client.
+                for task in owner:
+                    task.cancel()
                 ticker.cancel()
                 stats.min_concurrency = limiter.min_limit
         finally:
@@ -1238,14 +1335,24 @@ class LLMWrapper:
                     # The limit generation this request was sent under — a 429
                     # from it may cut the limit only if no cut happened since.
                     epoch = limiter.epoch
-                    response = await async_chat_completion(
-                        self._async_client,
-                        messages=[{"role": "user", "content": json_prompt}],
-                        model=model,
-                        reasoning_effort=reasoning_effort if reasoning_effort is not None else self.reasoning_effort,
-                        fallback_models=self.fallback_models,
-                        **call_kwargs,
-                    )
+                    try:
+                        response = await asyncio.wait_for(
+                            async_chat_completion(
+                                self._async_client,
+                                messages=[{"role": "user", "content": json_prompt}],
+                                model=model,
+                                reasoning_effort=reasoning_effort if reasoning_effort is not None else self.reasoning_effort,
+                                fallback_models=self.fallback_models,
+                                **call_kwargs,
+                            ),
+                            timeout=self.attempt_timeout_s,
+                        )
+                    except asyncio.TimeoutError as timeout:
+                        # A bare TimeoutError has an empty message, which the
+                        # string-based classifier would read as non-retryable.
+                        raise LLMAttemptTimeout(
+                            f"LLM attempt timed out after {self.attempt_timeout_s:g}s wall clock"
+                        ) from timeout
                 # The provider accepted the request — AIMD's additive half,
                 # whatever the body turns out to contain.
                 limiter.on_success()
@@ -1367,6 +1474,10 @@ class LLMWrapper:
         """
         # Malformed-JSON responses are stochastic — re-sampling usually fixes it.
         if isinstance(error, JSONExtractionError):
+            return True
+
+        # Our own wall-clock cap on an attempt (and any other timeout type).
+        if isinstance(error, TimeoutError):
             return True
 
         if self._is_rate_limit_error(error):

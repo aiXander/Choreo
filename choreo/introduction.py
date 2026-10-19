@@ -83,6 +83,7 @@ def build_introduction_prompt(
     goal: str,
     user1_name: Optional[str] = None,
     user2_name: Optional[str] = None,
+    intro_instruction: str = "",
 ) -> str:
     """Build prompt for introduction generation.
 
@@ -90,6 +91,13 @@ def build_introduction_prompt(
     prompt prose (defaults: the ids). Intros never need the model to output
     ids, so with names present the ids don't appear in the prompt at all —
     prose generated from uuids can't be repaired afterwards.
+
+    ``instruction`` is the pair-SCORING rubric (``recipe.instruction``). The
+    packaged template no longer renders it — the pair is already chosen, and a
+    "score this / not a match if…" rubric pushed the writer into judging —
+    but it stays a format variable so a custom template using it still renders.
+    ``intro_instruction`` (``recipe.intro_instruction``) is the writer's own
+    guidance, rendered as ``{intro_guidance}``: its own paragraph, or nothing.
     """
     name1 = user1_name or user1_id
     name2 = user2_name or user2_id
@@ -106,8 +114,10 @@ def build_introduction_prompt(
     user2_text = format_sections(user2_sections, name2)
 
     # Build the complete prompt using template with all variables
+    intro_instruction = (intro_instruction or "").strip()
     prompt = prompt_template.format(
         instruction=instruction,
+        intro_guidance=f"{intro_instruction}\n\n" if intro_instruction else "",
         goal=goal,
         user_a_name=name1,
         user_b_name=name2,
@@ -129,6 +139,7 @@ def generate_introductions_for_matches(
     force: bool = False,
     prompt_template: str = None,
     display_names: Optional[Dict[str, str]] = None,
+    intro_instruction: str = "",
 ) -> Dict[str, Introduction]:
     """
     Generate introductions and conversation starters for final matched pairs.
@@ -136,7 +147,10 @@ def generate_introductions_for_matches(
     Args:
         final_edges: List of final matched edges
         sections_dict: Dictionary mapping user_id to their sections
-        instruction: Instruction for what kind of matching was done
+        instruction: The pair-scoring rubric — only a custom template that
+            names {instruction} renders it; the packaged one does not
+        intro_instruction: Guidance for the intro writer itself
+            (``recipe.intro_instruction``), rendered as {intro_guidance}
         goal: Goal instruction for matching
         introduction_config_path: Path to introduction_prompt.yaml
         llm_wrapper: LLM wrapper instance
@@ -188,6 +202,7 @@ def generate_introductions_for_matches(
             goal=goal,
             user1_name=display_names.get(edge.user1),
             user2_name=display_names.get(edge.user2),
+            intro_instruction=intro_instruction,
         )
         prompts.append(prompt)
         

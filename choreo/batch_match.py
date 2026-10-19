@@ -414,6 +414,7 @@ def run_batch_match(
         llm_wrapper=llm_wrapper,
         model=models_cfg.get("pair_llm"),
         display_names=display_names,
+        intro_instruction=config.get("recipe", {}).get("intro_instruction", ""),
     )
     for edge in final_edges:
         intro = introductions.get(edge.pair_id)

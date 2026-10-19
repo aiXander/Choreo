@@ -353,8 +353,22 @@ there the deadline is the retry budget. Explicit `max_retries` always wins.
 Every phase prints one `LLM phase:` summary line and appends a `BatchStats`;
 `get_stats()` sums them (retries, rate-limited, failed, cancelled, min
 concurrency) so a host can surface silent degradation. Pinned in
-`tests/test_llm_retry.py`; the 120 s client timeout + SDK `max_retries=0` stay,
-so timeouts flow through this loop.
+`tests/test_llm_retry.py`; SDK `max_retries=0` stays, so timeouts flow through
+this loop.
+
+**Tail latency (`tests/test_llm_tail.py`)**: the SDK `timeout` is httpx's
+per-READ timeout, not a wall clock — on 2026-10-19 one intro request sat ~7 min
+with it never firing and held a 1,580-member phase at 3118/3119. So: every HTTP
+attempt is wall-clock capped at `ATTEMPT_TIMEOUT_S` (60 s, `asyncio.wait_for`;
+an expiry is `transient` → retried). An unbounded phase **hedges**: once ≤ 1 %
+of it is unanswered (`HEDGE_AT_FRACTION`) and stragglers + hedges fit in half
+the limit, each straggler gets a second parallel request, the first usable
+answer wins and the twin is cancelled (an Exception settles a slot only when no
+twin is left). Then a **tail cutoff** (`TAIL_GRACE_S`, 60 s) cancels what is
+still in flight; those slots are `None`, like a `deadline_s` cancellation
+(scoring retries the pair, an intro gets `fallback_introduction`). Phases under
+100 uncached prompts and deadline-bounded phases never hedge. `BatchStats`
+gains `hedged`; `cancelled` also counts tail cutoffs.
 
 **Response shape (`required_key_sets`)**: `json_mode` buys SYNTAX, not SCHEMA —
 `response_format={"type":"json_object"}` promises *an* object, not *your* keys.
