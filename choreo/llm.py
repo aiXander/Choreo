@@ -9,9 +9,16 @@ model strings in config.yaml under `models:` (e.g. "google/gemini-3.1-flash-lite
 
 import os
 import json
+import math
+import time
+import random
 import asyncio
+import contextlib
 import concurrent.futures
-from typing import Dict, Any, Optional, List, Sequence
+import email.utils
+from collections import deque
+from dataclasses import dataclass, asdict
+from typing import Callable, Dict, Any, Optional, List, Sequence
 
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
@@ -64,8 +71,10 @@ def _client_kwargs() -> Dict[str, Any]:
         "api_key": api_key,
         "default_headers": _DEFAULT_HEADERS,
         # Bounded per-request time + no hidden SDK retries: one hung call must
-        # fail fast into our own retry loop (max_retries/backoff above) instead
-        # of pinning a batch at N-1/N for the SDK's 600s default × retries.
+        # fail fast into our own retry loop (`_async_json_complete_with_retry`:
+        # jittered backoff, Retry-After, adaptive concurrency) instead of
+        # pinning a batch at N-1/N for the SDK's 600s default × retries — and
+        # an SDK-level retry would also bypass the limiter's 429 accounting.
         # Same fix as the 2026-07-16 memory-engine sweep-timeout incident.
         "timeout": 120.0,
         "max_retries": 0,
@@ -371,12 +380,315 @@ def run_coro_blocking(coro):
         return pool.submit(asyncio.run, coro).result()
 
 
+# ---------------------------------------------------------------------------
+# Retry backoff, adaptive concurrency, per-phase stats
+#
+# The old loop was `base * 2**attempt` (1 s, 2 s, 4 s), no jitter, no
+# Retry-After, 3 retries. Fine at 16 in flight; at 128 (the first whole-
+# community wintercircus run: ~3k scoring + ~3k intro calls) one upstream 429
+# burst made every in-flight call retry in LOCKSTEP and give up after ~7 s —
+# and a give-up is silent downstream (a scoring group falls back to embed-only
+# ranks, an intro to the honest-but-generic fallback card). So: full jitter
+# with a cap, Retry-After honored, more retries, and AIMD on the in-flight
+# limit so a 429 storm sheds load instead of re-hammering. Deadline-bounded
+# batches (the live `find_matches` re-rank) keep the legacy policy exactly —
+# see `batch_json_complete`.
+# ---------------------------------------------------------------------------
+
+#: Default retries for an unbounded (batch) phase. With full jitter capped at
+#: 30 s the worst-case sleep budget is 1+2+4+8+16+30 ≈ 61 s (mean half that) —
+#: long enough to ride out a provider's rate-limit window, short enough that a
+#: genuinely dead route still fails inside a couple of minutes.
+BATCH_MAX_RETRIES = 6
+#: Retries for a deadline-bounded batch when the caller names none: the
+#: pre-AIMD default, kept so the live query re-rank path is byte-for-byte the
+#: same retry count and sleeps (`1 s, 2 s, 4 s`, unjittered) as before.
+LEGACY_MAX_RETRIES = 3
+#: Upper bound on any single backoff sleep, including a server's Retry-After.
+RETRY_DELAY_CAP_S = 30.0
+#: AIMD knobs. Halve on a rate limit (never below the floor — 8 keeps a phase
+#: moving even under sustained 429s; a smaller ceiling wins), +1 per 8
+#: consecutive successes back to the configured ceiling. 8 rather than 1:
+#: recovering 64→128 then takes ~500 calls, so a limit we just tripped isn't
+#: re-tripped a few seconds later.
+ADAPTIVE_FLOOR = 8
+ADAPTIVE_DECREASE_FACTOR = 0.5
+ADAPTIVE_INCREASE_EVERY = 8
+
+# A Retry-After value longer than this is not a header, it's garbage.
+_MAX_RETRY_HEADER_LEN = 64
+# Module RNG so tests can swap in a seeded/stub one without touching `random`.
+_RETRY_RNG = random.Random()
+
+
+def _read_header(headers: Any, name: str) -> Optional[str]:
+    """One header value as a short string, or None — never raises."""
+    try:
+        value = headers.get(name)
+        if value is None and isinstance(headers, dict):
+            # Plain dicts aren't case-insensitive like httpx.Headers.
+            value = next((v for k, v in headers.items()
+                          if isinstance(k, str) and k.lower() == name), None)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("latin-1", errors="replace")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _MAX_RETRY_HEADER_LEN:
+        return None
+    return value
+
+
+def _finite_non_negative(raw: str) -> Optional[float]:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def parse_retry_after(error: BaseException, now: Optional[float] = None) -> Optional[float]:
+    """Seconds the server asked us to wait, from an SDK error's response headers.
+
+    Reads ``retry-after-ms`` (OpenAI-style, milliseconds) first, then
+    ``retry-after`` as delta-seconds or an HTTP-date. Anything absent,
+    oversized, negative, non-finite or unparseable is ``None`` ("no advice"),
+    and the caller clamps whatever comes back to ``RETRY_DELAY_CAP_S`` — a
+    server's say-so must not park a batch for an hour.
+    """
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw_ms = _read_header(headers, "retry-after-ms")
+    if raw_ms is not None:
+        ms = _finite_non_negative(raw_ms)
+        if ms is not None:
+            return ms / 1000.0
+    raw = _read_header(headers, "retry-after")
+    if raw is None:
+        return None
+    seconds = _finite_non_negative(raw)
+    if seconds is not None:
+        return seconds
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when is None or when.tzinfo is None:
+        return None
+    delta = when.timestamp() - (time.time() if now is None else now)
+    return max(0.0, delta) if math.isfinite(delta) else None
+
+
+def compute_retry_delay(
+    attempt: int,
+    kind: str,
+    *,
+    base: float,
+    cap: float = RETRY_DELAY_CAP_S,
+    retry_after: Optional[float] = None,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """Sleep before retry ``attempt`` (0-based) for an error of ``kind``.
+
+    * ``"sample"`` — malformed JSON / failed shape gate / JSON mode rejected.
+      Re-sampling is the fix and the provider isn't pushing back, so a short
+      jittered pause (``≤ base``) that does NOT grow with the attempt number.
+    * ``"rate_limit"`` / ``"transient"`` — full jitter,
+      ``uniform(0, min(cap, base·2^attempt))``: spreads a burst of simultaneous
+      failures across the whole window instead of re-firing them together.
+      With a server ``retry_after`` the wait is that, plus the same jitter so
+      128 calls told "5 s" don't all return at t+5 s — clamped to ``cap``.
+    """
+    rng = rng or _RETRY_RNG
+    cap = max(0.0, float(cap))
+    base = max(0.0, float(base))
+    if kind == "sample":
+        return rng.uniform(0.0, min(cap, base))
+    spread = min(cap, base * (2 ** min(max(attempt, 0), 30)))
+    if retry_after is not None:
+        return min(cap, max(0.0, retry_after) + rng.uniform(0.0, spread))
+    return rng.uniform(0.0, spread)
+
+
+class AdaptiveConcurrencyLimiter:
+    """An AIMD in-flight limit: a semaphore whose size can shrink and regrow.
+
+    ``asyncio.Semaphore`` can't shrink, so this keeps its own count and a FIFO
+    of waiters, and HANDS a permit to a waiter on release (the waiter never
+    re-checks), which makes it leak-free under cancellation: a waiter cancelled
+    before it got a permit just leaves the queue; one cancelled after it was
+    handed one gives it straight back. Shrinking withholds permits — calls
+    already in flight finish, nothing new starts until ``in_flight < limit``.
+
+    Rate-limit cuts are de-duplicated by ``epoch``: a caller passes the epoch
+    it saw when its request STARTED, so the 127 other 429s from the same burst
+    don't halve the limit 127 times — only a 429 from a request dispatched
+    after the latest cut can cut again.
+
+    With ``adaptive=False`` it is a plain fixed-size limiter (what a
+    deadline-bounded batch uses).
+    """
+
+    def __init__(
+        self,
+        ceiling: int,
+        *,
+        floor: int = ADAPTIVE_FLOOR,
+        decrease_factor: float = ADAPTIVE_DECREASE_FACTOR,
+        increase_every: int = ADAPTIVE_INCREASE_EVERY,
+        adaptive: bool = True,
+        label: str = "",
+    ):
+        self.ceiling = max(1, int(ceiling))
+        self.floor = max(1, min(int(floor), self.ceiling))
+        self.decrease_factor = float(decrease_factor)
+        self.increase_every = max(1, int(increase_every))
+        self.adaptive = adaptive
+        self.label = label
+        self.limit = self.ceiling
+        self.min_limit = self.ceiling
+        self.in_flight = 0
+        self.peak_in_flight = 0
+        self.epoch = 0
+        self._successes = 0
+        self._waiters: "deque[asyncio.Future]" = deque()
+
+    async def acquire(self, priority: bool = False) -> None:
+        """Take a permit. ``priority`` jumps the queue (used by retries, so a
+        phase's tail isn't every retried call queued behind all fresh work)."""
+        if self.in_flight < self.limit and not self._waiters:
+            self._take()
+            return
+        fut = asyncio.get_running_loop().create_future()
+        if priority:
+            self._waiters.appendleft(fut)
+        else:
+            self._waiters.append(fut)
+        try:
+            await fut
+        except BaseException:
+            if fut.done() and not fut.cancelled():
+                self.release()  # handed a permit, then cancelled: give it back
+            else:
+                with contextlib.suppress(ValueError):
+                    self._waiters.remove(fut)
+            raise
+
+    def release(self) -> None:
+        if self.in_flight <= 0:
+            raise ValueError("AdaptiveConcurrencyLimiter released more than acquired")
+        self.in_flight -= 1
+        self._grant()
+
+    @contextlib.asynccontextmanager
+    async def slot(self, priority: bool = False):
+        await self.acquire(priority)
+        try:
+            yield
+        finally:
+            self.release()
+
+    def on_rate_limit(self, epoch: Optional[int] = None) -> bool:
+        """Multiplicative decrease. Returns whether the limit actually moved."""
+        self._successes = 0
+        if not self.adaptive or (epoch is not None and epoch != self.epoch):
+            return False
+        new = max(self.floor, int(self.limit * self.decrease_factor))
+        if new >= self.limit:
+            return False
+        old, self.limit = self.limit, new
+        self.epoch += 1
+        self.min_limit = min(self.min_limit, new)
+        print(f"{self.label}LLM concurrency {old} → {new} "
+              f"(rate limited; ceiling {self.ceiling}, floor {self.floor})")
+        return True
+
+    def on_success(self) -> None:
+        """Additive increase: +1 per ``increase_every`` consecutive successes."""
+        if not self.adaptive or self.limit >= self.ceiling:
+            return
+        self._successes += 1
+        if self._successes < self.increase_every:
+            return
+        self._successes = 0
+        self.limit += 1
+        if self.limit >= self.ceiling:
+            # Sparse on purpose: cuts and full recovery only — the progress
+            # ticker shows the in-between value while the limit is below ceiling.
+            print(f"{self.label}LLM concurrency recovered to {self.ceiling}")
+        self._grant()
+
+    def _take(self) -> None:
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+
+    def _grant(self) -> None:
+        while self._waiters and self.in_flight < self.limit:
+            fut = self._waiters.popleft()
+            if fut.done():  # cancelled while queued
+                continue
+            self._take()
+            fut.set_result(None)
+
+
+@dataclass
+class BatchStats:
+    """What one ``batch_json_complete`` phase did — so silent degradation has
+    a count. Every field is a plain int/float, ready for a host run summary.
+
+    * ``prompts`` — prompts handed in; ``cache_hits`` — served from the file
+      cache without a call.
+    * ``dispatched`` — prompts that made at least one API attempt.
+    * ``retries`` — extra attempts (all causes); ``rate_limited`` — responses
+      classified as a rate limit (429), including a final one.
+    * ``failed`` — prompts whose slot holds an Exception (retries exhausted or
+      non-retryable); ``cancelled`` — slots left ``None`` at ``deadline_s``.
+    * ``ceiling`` / ``min_concurrency`` — configured in-flight cap and the
+      lowest effective limit AIMD reached (== ceiling when never cut).
+    """
+
+    label: Optional[str] = None
+    prompts: int = 0
+    cache_hits: int = 0
+    dispatched: int = 0
+    retries: int = 0
+    rate_limited: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    ceiling: int = 0
+    min_concurrency: int = 0
+    elapsed_s: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def summary_line(self) -> str:
+        label = f"[{self.label}] " if self.label else ""
+        line = (
+            f"{label}LLM phase: {self.prompts} prompts · {self.cache_hits} cached · "
+            f"{self.dispatched} called · {self.retries} retries "
+            f"({self.rate_limited} rate-limited) · {self.failed} failed"
+        )
+        if self.cancelled:
+            line += f" · {self.cancelled} cancelled at deadline"
+        if self.ceiling:
+            line += f" · min concurrency {self.min_concurrency}/{self.ceiling}"
+        return line + f" · {self.elapsed_s:.1f}s"
+
+
 class LLMWrapper:
     """Wrapper for LLM calls with caching and retries."""
     
-    def __init__(self, cache_dir: Optional[str] = None, max_retries: int = 3, reasoning_effort: Optional[str] = "low",
+    def __init__(self, cache_dir: Optional[str] = None, max_retries: int = BATCH_MAX_RETRIES, reasoning_effort: Optional[str] = "low",
                  max_concurrent_llm_calls: int = 16,
-                 fallback_models: Optional[Sequence[str]] = None):
+                 fallback_models: Optional[Sequence[str]] = None,
+                 checkpoint: Optional[Callable[[], None]] = None):
         # cache_dir=None disables the file-based response cache entirely
         # (in-memory pipeline runs, e.g. transient query matching).
         if cache_dir:
@@ -384,12 +696,26 @@ class LLMWrapper:
             ensure_dir(self.cache_dir)
         else:
             self.cache_dir = None
+        # Retries for an UNBOUNDED batch phase that names none per call (was
+        # dead config before the AIMD rework). A deadline-bounded batch ignores
+        # it and keeps LEGACY_MAX_RETRIES — see batch_json_complete.
         self.max_retries = max_retries
+        # One BatchStats per batch_json_complete call, in order; get_stats()
+        # sums them so a host can put retries/failures in its run summary.
+        self.phase_stats: List[BatchStats] = []
         self.call_count = 0
         # Number of new responses written to the file cache this run. Lets an
         # adapter skip persistence work (e.g. Modal volume.commit) when a call
         # was served entirely from cache and nothing on disk changed.
         self.cache_writes = 0
+        # Optional host hook to make the cache durable mid-run (e.g. a Modal
+        # volume.commit), called off the event loop at the end of every
+        # batch_json_complete that wrote >=1 new entry — i.e. between phases
+        # (scoring, intros, HyDE, extraction), never mid-phase. A long run that
+        # dies after scoring then retries with its scores already cached. A
+        # failing checkpoint is logged and swallowed: durability is a bonus,
+        # never a reason to fail the run.
+        self.checkpoint = checkpoint
         self.cost_tracker = get_cost_tracker()
         self.current_component = None  # Will be set by calling code
         # Default reasoning effort forwarded to OpenRouter (xhigh|high|medium|
@@ -581,9 +907,25 @@ class LLMWrapper:
             f"Could not extract valid JSON from response: {response[:200]}..."
         )
     
-    def get_stats(self) -> Dict[str, int]:
-        """Get usage statistics."""
-        return {"total_calls": self.call_count}
+    def get_stats(self) -> Dict[str, Any]:
+        """Cumulative usage across every batch phase this wrapper ran.
+
+        ``total_calls`` is successful API calls (unchanged meaning). The rest
+        sum ``BatchStats`` over ``phase_stats`` (see that class for each
+        field); ``min_concurrency`` is the lowest AIMD limit any phase reached,
+        ``None`` before the first phase. Per-phase detail: ``get_phase_stats``.
+        """
+        totals: Dict[str, Any] = {"total_calls": self.call_count, "phases": len(self.phase_stats)}
+        for key in ("prompts", "cache_hits", "dispatched", "retries",
+                    "rate_limited", "failed", "cancelled"):
+            totals[key] = sum(getattr(s, key) for s in self.phase_stats)
+        floors = [s.min_concurrency for s in self.phase_stats if s.ceiling]
+        totals["min_concurrency"] = min(floors) if floors else None
+        return totals
+
+    def get_phase_stats(self) -> List[Dict[str, Any]]:
+        """One dict per batch_json_complete call (label = its progress_label)."""
+        return [s.to_dict() for s in self.phase_stats]
 
     async def batch_json_complete(
         self,
@@ -592,7 +934,7 @@ class LLMWrapper:
         cache_keys: Optional[List[Optional[str]]] = None,
         schema_hints: Optional[List[Optional[str]]] = None,
         max_concurrent: Optional[int] = None,
-        max_retries: int = 3,
+        max_retries: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         retry_delay_base: float = 1.0,
         verbosity: int = 0,
@@ -602,14 +944,29 @@ class LLMWrapper:
         progress_interval: float = 10.0,
         deadline_s: Optional[float] = None,
         required_key_sets: KeySets = None,
+        retry_delay_cap: float = RETRY_DELAY_CAP_S,
+        adaptive_concurrency: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         Process multiple prompts concurrently with rate-limit retry handling.
 
-        Dispatch is semaphore-gated: at most ``max_concurrent`` calls run at any
-        instant, and the next prompt fires the moment any in-flight call returns
-        — no fire-a-batch-then-wait barrier — so the slowest call in a notional
-        batch never stalls the others.
+        Dispatch is limiter-gated: at most the current limit of HTTP requests
+        are in flight at any instant, and the next prompt fires the moment one
+        returns — no fire-a-batch-then-wait barrier — so the slowest call in a
+        notional batch never stalls the others. A permit covers one HTTP
+        attempt, not a retry's backoff sleep, so the limit bounds real requests.
+
+        **Two retry policies, chosen by ``deadline_s``.** An unbounded phase
+        (cohort/batch scoring, intros, HyDE, extraction) gets the hardened
+        policy: ``self.max_retries`` (default ``BATCH_MAX_RETRIES``) retries,
+        full-jitter backoff capped at ``retry_delay_cap``, server Retry-After
+        honored, and AIMD on the in-flight limit (``max_concurrent`` is the
+        ceiling). A deadline-bounded phase (the live ``find_matches`` re-rank)
+        keeps the legacy policy unchanged — ``LEGACY_MAX_RETRIES``, unjittered
+        ``retry_delay_base * 2**attempt``, no Retry-After, fixed limit — because
+        there the deadline IS the retry budget: a longer server-dictated sleep
+        only converts a retry into a cancellation. An explicit ``max_retries``
+        always wins on either path.
 
         Args:
             prompts: List of prompts to process
@@ -618,8 +975,13 @@ class LLMWrapper:
             schema_hints: Optional list of schema hints
             max_concurrent: Max concurrent in-flight requests. None inherits the
                 wrapper's ``max_concurrent_llm_calls`` (config `concurrency:`).
-            max_retries: Maximum retries for rate limit errors (default: 3)
+                The AIMD ceiling on an unbounded phase.
+            max_retries: Retries per prompt for transient errors. None = the
+                policy default above (wrapper ``max_retries`` unbounded,
+                ``LEGACY_MAX_RETRIES`` with a deadline); an int is used as-is.
             retry_delay_base: Base delay for exponential backoff (default: 1.0s)
+            retry_delay_cap: Max single backoff sleep on the hardened policy.
+            adaptive_concurrency: Force AIMD on/off. None = on iff no deadline.
             deadline_s: Optional wall-clock budget for the whole batch. None
                 (default) waits for every call. When set, calls still in flight
                 at the deadline are cancelled and their slots stay ``None``, so
@@ -655,8 +1017,21 @@ class LLMWrapper:
         cache_keys = cache_keys or [None] * n_prompts
         schema_hints = schema_hints or [None] * n_prompts
 
+        # Retry policy (see docstring): the deadline-bounded path keeps the
+        # legacy count + unjittered sleeps unless the caller names a count.
+        legacy_backoff = deadline_s is not None
+        if max_retries is None:
+            max_retries = LEGACY_MAX_RETRIES if legacy_backoff else self.max_retries
+        max_retries = max(0, int(max_retries))
+        if adaptive_concurrency is None:
+            adaptive_concurrency = not legacy_backoff
+        label = f"[{progress_label}] " if progress_label else ""
+        stats = BatchStats(label=progress_label, prompts=len(prompts),
+                           ceiling=max_concurrent, min_concurrency=max_concurrent)
+        started_at = asyncio.get_running_loop().time()
+
         print(f"Processing {n_prompts} prompts with up to {max_concurrent} concurrent LLM calls")
-        
+
         # Check cache first and prepare uncached tasks
         results = [None] * n_prompts
         uncached_indices = []
@@ -669,46 +1044,56 @@ class LLMWrapper:
             uncached_indices.append(i)
         
         cached_count = n_prompts - len(uncached_indices)
+        stats.cache_hits = cached_count
         if cached_count > 0:
             print(f"Found {cached_count} cached results")
 
         if not uncached_indices:
+            self._finish_phase(stats, started_at)
             return results
 
+        writes_before = self.cache_writes
         # Open one async client for this run (bound to the current event loop)
         # and close it when done — see make_async_openrouter_client.
         self._async_client = make_async_openrouter_client()
         try:
-            # Semaphore-gated continuous dispatch: every uncached prompt becomes
-            # a task immediately, but the semaphore lets only `max_concurrent`
+            # Limiter-gated continuous dispatch: every uncached prompt becomes
+            # a task immediately, but the limiter lets only its current limit
             # actually hit the API at once. As soon as any call returns it
-            # releases its slot and the next queued task acquires it — so the
-            # provider is kept saturated at exactly `max_concurrent` without the
-            # slowest call in a window stalling the rest (the old fire-a-batch-
-            # then-await behavior).
-            semaphore = asyncio.Semaphore(max_concurrent)
+            # releases its permit and the next queued task gets it — so the
+            # provider is kept saturated at the limit without the slowest call
+            # in a window stalling the rest (the old fire-a-batch-then-await
+            # behavior). The permit is taken per HTTP attempt inside
+            # _async_json_complete_with_retry, and AIMD moves the limit
+            # between ADAPTIVE_FLOOR and `max_concurrent` on 429s.
+            limiter = AdaptiveConcurrencyLimiter(
+                max_concurrent, adaptive=adaptive_concurrency, label=label,
+            )
             total = len(uncached_indices)
             completed = 0
 
             async def _run_one(i: int):
                 nonlocal completed
-                async with semaphore:
-                    try:
-                        result = await self._async_json_complete_with_retry(
-                            prompt=prompts[i],
-                            model=model,
-                            cache_key=cache_keys[i],
-                            schema_hint=schema_hints[i],
-                            max_retries=max_retries,
-                            retry_delay_base=retry_delay_base,
-                            reasoning_effort=reasoning_effort,
-                            verbosity=verbosity,
-                            print_reasoning_summary=print_reasoning_summary,
-                            max_tokens=max_tokens,
-                            required_key_sets=required_key_sets,
-                        )
-                    except Exception as e:  # keep going; caller inspects per-item
-                        result = e
+                try:
+                    result = await self._async_json_complete_with_retry(
+                        prompt=prompts[i],
+                        model=model,
+                        cache_key=cache_keys[i],
+                        schema_hint=schema_hints[i],
+                        max_retries=max_retries,
+                        retry_delay_base=retry_delay_base,
+                        reasoning_effort=reasoning_effort,
+                        verbosity=verbosity,
+                        print_reasoning_summary=print_reasoning_summary,
+                        max_tokens=max_tokens,
+                        required_key_sets=required_key_sets,
+                        retry_delay_cap=retry_delay_cap,
+                        legacy_backoff=legacy_backoff,
+                        limiter=limiter,
+                        stats=stats,
+                    )
+                except Exception as e:  # keep going; caller inspects per-item
+                    result = e
                 completed += 1
                 if isinstance(result, Exception):
                     print(f"Task failed for prompt {i} ({completed}/{total}): {result}")
@@ -722,9 +1107,9 @@ class LLMWrapper:
             # `progress_interval` seconds while the batch runs, so long phases
             # show liveness instead of going silent until the final line. It
             # only reads `completed`/`total`, never touches the result slots,
-            # and is cancelled the moment all tasks finish.
-            label = f"[{progress_label}] " if progress_label else ""
-
+            # and is cancelled the moment all tasks finish. While AIMD holds the
+            # limit below its ceiling the line says so — that's the in-between
+            # signal the limiter itself deliberately doesn't log.
             async def _progress_ticker():
                 try:
                     while True:
@@ -732,7 +1117,9 @@ class LLMWrapper:
                         if completed >= total:
                             break
                         pct = 100.0 * completed / total if total else 100.0
-                        print(f"{label}LLM progress: {completed}/{total} ({pct:.0f}%)")
+                        throttled = (f" · concurrency {limiter.limit}/{limiter.ceiling}"
+                                     if limiter.limit < limiter.ceiling else "")
+                        print(f"{label}LLM progress: {completed}/{total} ({pct:.0f}%){throttled}")
                 except asyncio.CancelledError:
                     pass
 
@@ -746,7 +1133,10 @@ class LLMWrapper:
                 for task in done:
                     i, result = task.result()
                     results[i] = result  # exceptions kept in-place for caller to handle
+                    if isinstance(result, Exception):
+                        stats.failed += 1
                 if pending:
+                    stats.cancelled = len(pending)
                     for task in pending:
                         task.cancel()
                     # Let the cancellations settle before the client closes.
@@ -758,37 +1148,77 @@ class LLMWrapper:
                     )
             finally:
                 ticker.cancel()
+                stats.min_concurrency = limiter.min_limit
         finally:
             await self._async_client.close()
             self._async_client = None
 
         print(f"Completed processing all {n_prompts} prompts")
+        self._finish_phase(stats, started_at)
+        await self._checkpoint_if_written(writes_before)
         await cleanup_background_tasks()
         return results
+
+    async def _checkpoint_if_written(self, writes_before: int) -> None:
+        """Run the host `checkpoint` hook iff this batch wrote new cache entries.
+
+        Called once every task of the batch has settled, so no cache file of
+        this batch is mid-write. Off the event loop (`asyncio.to_thread`): a
+        host's commit is blocking I/O and must not stall another coroutine.
+        """
+        if self.checkpoint is None or self.cache_writes <= writes_before:
+            return
+        try:
+            await asyncio.to_thread(self.checkpoint)
+        except Exception as e:  # never fail a run because persistence failed
+            print(f"⚠️  WARNING: LLM cache checkpoint failed (run continues): {e!r}")
     
+    def _finish_phase(self, stats: BatchStats, started_at: float) -> None:
+        """Close out one batch phase: record its stats and print ONE line."""
+        stats.elapsed_s = asyncio.get_running_loop().time() - started_at
+        self.phase_stats.append(stats)
+        print(stats.summary_line())
+
     async def _async_json_complete_with_retry(
         self,
         prompt: str,
         model: str,
         cache_key: Optional[str] = None,
         schema_hint: Optional[str] = None,
-        max_retries: int = 3,
+        max_retries: int = LEGACY_MAX_RETRIES,
         retry_delay_base: float = 1.0,
         reasoning_effort: Optional[str] = None,
         verbosity: int = 0,
         print_reasoning_summary: bool = False,
         max_tokens: Optional[int] = None,
         required_key_sets: KeySets = None,
+        retry_delay_cap: float = RETRY_DELAY_CAP_S,
+        legacy_backoff: bool = False,
+        limiter: Optional[AdaptiveConcurrencyLimiter] = None,
+        stats: Optional[BatchStats] = None,
     ) -> Dict[str, Any]:
-        """Single async JSON completion with retry logic."""
+        """Single async JSON completion with retry logic.
+
+        Each HTTP attempt holds one ``limiter`` permit; the backoff sleep holds
+        none, so a call waiting out a 429 doesn't occupy a slot and a retry
+        re-queues at the FRONT (``priority``) behind the current limit. A
+        cancellation (deadline) anywhere in here leaves no permit behind — the
+        slot context manager and the limiter's own acquire both clean up.
+        """
         # Check cache first
         cached = self._load_cached(cache_key, required_key_sets)
         if cached is not None:
             return cached
 
         json_prompt = self._prepare_json_prompt(prompt, schema_hint)
-        
+        if limiter is None:  # direct call outside a batch: unlimited, fixed
+            limiter = AdaptiveConcurrencyLimiter(1 << 30, adaptive=False)
+        if stats is None:
+            stats = BatchStats()
+        dispatched = False
+
         for attempt in range(max_retries + 1):
+            epoch: Optional[int] = None
             try:
                 if verbosity > 1:
                     print("-----------------------------------------------------------")
@@ -801,14 +1231,24 @@ class LLMWrapper:
                 if max_tokens is not None:
                     call_kwargs["max_tokens"] = max_tokens
 
-                response = await async_chat_completion(
-                    self._async_client,
-                    messages=[{"role": "user", "content": json_prompt}],
-                    model=model,
-                    reasoning_effort=reasoning_effort if reasoning_effort is not None else self.reasoning_effort,
-                    fallback_models=self.fallback_models,
-                    **call_kwargs,
-                )
+                async with limiter.slot(priority=attempt > 0):
+                    if not dispatched:
+                        dispatched = True
+                        stats.dispatched += 1
+                    # The limit generation this request was sent under — a 429
+                    # from it may cut the limit only if no cut happened since.
+                    epoch = limiter.epoch
+                    response = await async_chat_completion(
+                        self._async_client,
+                        messages=[{"role": "user", "content": json_prompt}],
+                        model=model,
+                        reasoning_effort=reasoning_effort if reasoning_effort is not None else self.reasoning_effort,
+                        fallback_models=self.fallback_models,
+                        **call_kwargs,
+                    )
+                # The provider accepted the request — AIMD's additive half,
+                # whatever the body turns out to contain.
+                limiter.on_success()
 
                 # Track token usage and cost.
                 self._record_usage(response, model, "completion")
@@ -861,13 +1301,29 @@ class LLMWrapper:
                 if self.json_mode and "response_format" in str(e).lower():
                     print(f"⚠️  Provider rejected JSON mode (response_format); disabling for this run: {e}")
                     self.json_mode = False
-                    retryable = True
+                    kind: Optional[str] = "sample"
                 else:
-                    retryable = self._is_retryable_error(e)
+                    kind = self._retry_kind(e)
 
-                if attempt < max_retries and retryable:
-                    delay = retry_delay_base * (2 ** attempt)
-                    print(f"Transient LLM error, retrying in {delay}s: {e}")
+                retry_after = None
+                if kind == "rate_limit":
+                    stats.rate_limited += 1
+                    if epoch is not None:
+                        limiter.on_rate_limit(epoch)
+                if kind in ("rate_limit", "transient") and getattr(e, "status_code", None) in (429, 503):
+                    retry_after = parse_retry_after(e)
+
+                if attempt < max_retries and kind is not None:
+                    stats.retries += 1
+                    if legacy_backoff:
+                        # Deadline-bounded path: the pre-AIMD schedule, exactly.
+                        delay = retry_delay_base * (2 ** attempt)
+                    else:
+                        delay = compute_retry_delay(
+                            attempt, kind, base=retry_delay_base,
+                            cap=retry_delay_cap, retry_after=retry_after,
+                        )
+                    print(f"Transient LLM error ({kind}), retrying in {delay:.2f}s: {str(e)[:300]}")
                     await asyncio.sleep(delay)
                 else:
                     print(f"Failed after {attempt + 1} attempts: {e}")
@@ -876,6 +1332,21 @@ class LLMWrapper:
         # Should not reach here
         raise RuntimeError("Unexpected end of retry loop")
     
+    def _retry_kind(self, error: Exception) -> Optional[str]:
+        """``"sample"`` | ``"rate_limit"`` | ``"transient"``, or None = don't retry.
+
+        JSON/shape failures are checked first: their message embeds up to 200
+        chars of model output, which may well contain "429" or "rate limit"
+        and must not trip the limiter.
+        """
+        if isinstance(error, JSONExtractionError):
+            return "sample"
+        if not self._is_retryable_error(error):
+            return None
+        if getattr(error, "status_code", None) == 429 or self._is_rate_limit_error(error):
+            return "rate_limit"
+        return "transient"
+
     def _is_rate_limit_error(self, error: Exception) -> bool:
         """Check if error is related to rate limiting."""
         error_str = str(error).lower()

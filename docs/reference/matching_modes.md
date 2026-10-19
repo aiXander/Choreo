@@ -101,8 +101,16 @@ Key behaviors and why:
   *matching* (defense in depth).
 - **Pair selection is rectangular** (`select_pairs_rectangular`): pairs
   restricted to member × pool, self-pairs skipped, member↔member pairs scored
-  once with the two directional entries averaged, round-robin over members so
-  budgets are spent fairly.
+  once with the two directional entries blended `0.7·max + 0.3·mean`
+  (`blend_directional`; a lone finite direction passes through), round-robin
+  over members so budgets are spent fairly. Cost: vectorized score matrix +
+  a per-member ranked row walked by a pointer (`score._RankedCandidates`),
+  ~0.15 s at 1.6k × 1.6k — the old rescan-the-global-list loop was
+  O(picks × N²) (~10 min). Output is pinned pair-for-pair, order and ties
+  included, against a verbatim copy of the old loop
+  (`tests/test_pair_selection_equivalence.py`); the square cohort selector
+  and `create_profile_groups_from_pairs` got the same treatment, so groups
+  (and the LLM cache keys they produce) are unchanged.
 - **b-matching is asymmetric** (`greedy_b_matching(member_ids=…,
   pool_b_max=…)`): `b_min`/`b_max` bind on members only; pool users get the
   optional looser `matching.pool_b_max` cap (None = uncapped) so one popular
@@ -121,8 +129,8 @@ Key behaviors and why:
 member×pool (or 1×M) similarity values; only the legacy square path still
 derives the reference from the current matrix's upper triangle. Callers that
 need scores comparable over time should pass stable reference stats from their
-store. (An absolute/rubric-anchored LLM score is still an open lever — see
-[../TODO/scoring_calibration.md](../TODO/scoring_calibration.md).)
+store. (An absolute/rubric-anchored LLM score is still an open lever — tracked in
+the motherbrain repo, `docs/TODO/130_matchmaking.md` §C.)
 
 ## Config surface (config.yaml)
 

@@ -25,6 +25,7 @@ from .schemas import Edge, EmbeddingsBundle, ExtractedSections, Introduction
 from .candidate import CandidatePair, generate_rectangular_similarity
 from .embed import supports_mrl, truncate_embeddings
 from .score import score_pairs_with_llm, create_sections_dict  # noqa: F401
+from .score import _RankedCandidates, _pairs_matching_pair_id, _require_unique_ids
 from .match import create_matches
 from .introduction import attach_fallback_intro, generate_introductions_for_matches
 from .report import build_report_data
@@ -93,64 +94,129 @@ def select_pairs_rectangular(
     Selection round-robins over members so every member gets its best
     available pairs before anyone exhausts the budget; per-profile caps apply
     to every participant (members and pool users alike).
+
+    Implementation: the blended scores are computed as one numpy matrix over
+    members × (pool ∪ members) and each member walks its own ranked row
+    (``score._RankedCandidates``) instead of rescanning one global sorted
+    list per pick — the old loop was O(picks × N²), ~10 min of pure CPU at
+    ~1.6k members. The result is pair-for-pair and order-for-order identical
+    to that loop (pinned against a verbatim copy in
+    ``tests/test_pair_selection_equivalence.py``), ties included: equal
+    blended scores break by the pair's first member-major ``(i, j)``
+    position, exactly as the old stable sort over dict insertion order did.
+    Requires unique ids within ``member_ids`` and within ``pool_ids``, and
+    distinct pairs to have distinct ``stable_pair_id``s (always true unless
+    ids mix different numbers of ``_``).
     """
     excluded_pairs = excluded_pairs or set()
+    member_ids, pool_ids = list(member_ids), list(pool_ids)
+    _require_unique_ids(member_ids, "member_ids")
+    _require_unique_ids(pool_ids, "pool_ids")
+    n_members, n_pool = len(member_ids), len(pool_ids)
+    cap = max_n_llm_evaluations_per_profile
 
-    # One score per unordered pair: collect available directional values.
-    pair_values: Dict[str, List[float]] = {}
-    pair_users: Dict[str, tuple] = {}
-    for i, member in enumerate(member_ids):
-        for j, candidate in enumerate(pool_ids):
-            if candidate == member:
-                continue  # self-pair
-            value = dir_matrix[i, j]
-            if not np.isfinite(value):
-                continue
-            pair_id = stable_pair_id(member, candidate)
-            if pair_id in excluded_pairs:
-                continue
-            pair_values.setdefault(pair_id, []).append(float(value))
-            pair_users[pair_id] = (min(member, candidate), max(member, candidate))
+    # Columns = every user a member can pair with: the pool, then members
+    # missing from it (their pairs only exist in the member→member direction).
+    pool_index = {user: j for j, user in enumerate(pool_ids)}
+    col_ids = pool_ids + [m for m in member_ids if m not in pool_index]
+    col_index = {user: c for c, user in enumerate(col_ids)}
+    member_index = {user: i for i, user in enumerate(member_ids)}
+    member_cols = np.array([col_index[m] for m in member_ids], dtype=np.int64)
+    member_pool_j = np.array([pool_index.get(m, -1) for m in member_ids], dtype=np.int64)
+    col_member = np.full(len(col_ids), -1, dtype=np.int64)  # col -> member row (or -1)
+    col_member[member_cols] = np.arange(n_members)
 
-    all_pairs: List[CandidatePair] = []
-    for pair_id, values in pair_values.items():
-        score = blend_directional(values)
-        if score > 0:  # only positive similarities (consistent with square mode)
-            user1, user2 = pair_users[pair_id]
-            all_pairs.append(CandidatePair(
-                user1=user1, user2=user2, similarity_score=score, pair_id=pair_id,
-            ))
+    # The (up to) two directional values of pair (member a, user c):
+    #   fwd[a, c] = dir[a, c]          "c helps a"   (c in pool)
+    #   rev[a, c] = dir[row(c), j(a)]  "a helps c"   (c a member, a in pool)
+    dm = np.asarray(dir_matrix, dtype=np.float64)[:n_members, :n_pool].reshape(n_members, n_pool)
+    fwd = np.full((n_members, len(col_ids)), np.nan)
+    fwd[:, :n_pool] = dm
+    rev = np.full((n_members, len(col_ids)), np.nan)
+    a_in_pool = np.flatnonzero(member_pool_j >= 0)
+    rev[np.ix_(a_in_pool, member_cols)] = dm[:, member_pool_j[a_in_pool]].T
+    fwd_ok, rev_ok = np.isfinite(fwd), np.isfinite(rev)
 
-    all_pairs.sort(key=lambda p: p.similarity_score, reverse=True)
-    print(f"Rectangular selection: {len(all_pairs)} eligible member×pool pairs "
+    # blend_directional, vectorized: same float ops in the same order, so the
+    # scores are bit-identical; a lone finite direction passes through.
+    with np.errstate(invalid="ignore", over="ignore"):
+        blended = (DIRECTIONAL_MAX_SHARE * np.maximum(fwd, rev)
+                   + (1.0 - DIRECTIONAL_MAX_SHARE) * ((fwd + rev) / 2))
+    scores = np.where(fwd_ok & rev_ok, blended,
+                      np.where(fwd_ok, fwd, np.where(rev_ok, rev, np.nan)))
+    scores[np.arange(n_members), member_cols] = np.nan  # self-pairs
+    with np.errstate(invalid="ignore"):
+        scores[~(scores > 0)] = np.nan  # only positive similarities (as square mode)
+    del fwd, rev, blended
+
+    def pair_score(x: str, y: str) -> float:
+        if x in member_index:
+            return scores[member_index[x], col_index[y]]
+        if y in member_index:
+            return scores[member_index[y], col_index[x]]
+        return np.nan
+
+    # member×member pairs appear twice (scores[a, b] == scores[b, a]).
+    n_eligible = int(np.count_nonzero(~np.isnan(scores)))
+    n_eligible -= int(np.count_nonzero(~np.isnan(scores[:, member_cols]))) // 2
+    n_eligible -= sum(
+        1
+        for pair_id in excluded_pairs
+        for x, y in _pairs_matching_pair_id(pair_id, col_index)
+        if not np.isnan(pair_score(x, y))
+    )
+    print(f"Rectangular selection: {n_eligible} eligible member×pool pairs "
           f"({len(excluded_pairs)} pair ids excluded by history)")
+
+    def tiebreak(a: int, cols: np.ndarray) -> np.ndarray:
+        """First member-major (i, j) index at which the old loop saw the pair."""
+        pos = np.full(cols.shape, np.iinfo(np.int64).max, dtype=np.int64)
+        at = np.flatnonzero(cols < n_pool)  # forward direction: cell (a, c)
+        at = at[np.isfinite(dm[a, cols[at]])]
+        pos[at] = a * n_pool + cols[at]
+        j = member_pool_j[a]
+        if j >= 0:  # reverse direction: cell (row(c), j(a))
+            at = np.flatnonzero(col_member[cols] >= 0)
+            rows = col_member[cols[at]]
+            ok = np.isfinite(dm[rows, j])
+            at, rows = at[ok], rows[ok]
+            pos[at] = np.minimum(pos[at], rows * n_pool + j)
+        return pos
+
+    ranked = _RankedCandidates(scores, tiebreak, first_chunk=max(64, 4 * cap))
 
     # Round-robin greedy over members, mirroring the square-mode behavior.
     selected: List[CandidatePair] = []
     used: Set[str] = set()
-    counts: Dict[str, int] = {}
+    counts = [0] * len(col_ids)  # per user (column), members and pool alike
 
-    member_order = list(member_ids)
     idx = 0
     consecutive_skips = 0
-    while consecutive_skips < len(member_order) and len(selected) < global_cap:
-        member = member_order[idx]
-        idx = (idx + 1) % len(member_order)
+    while consecutive_skips < n_members and len(selected) < global_cap:
+        a = idx
+        idx = (idx + 1) % n_members
+        member = member_ids[a]
 
-        if counts.get(member, 0) >= max_n_llm_evaluations_per_profile:
+        if counts[member_cols[a]] >= max_n_llm_evaluations_per_profile:
             consecutive_skips += 1
             continue
 
+        # Best available pair = next eligible entry of this member's ranked row.
         best = None
-        for pair in all_pairs:
-            if pair.pair_id in used:
+        while True:
+            c = ranked.pop(a)
+            if c is None:
+                break
+            if counts[c] >= max_n_llm_evaluations_per_profile:
                 continue
-            if member not in (pair.user1, pair.user2):
+            other = col_ids[c]
+            pair_id = stable_pair_id(member, other)
+            if pair_id in used or pair_id in excluded_pairs:
                 continue
-            other = pair.user2 if pair.user1 == member else pair.user1
-            if counts.get(other, 0) >= max_n_llm_evaluations_per_profile:
-                continue
-            best = pair
+            best = CandidatePair(
+                user1=min(member, other), user2=max(member, other),
+                similarity_score=float(scores[a, c]), pair_id=pair_id,
+            )
             break
 
         if best is None:
@@ -159,12 +225,12 @@ def select_pairs_rectangular(
 
         selected.append(best)
         used.add(best.pair_id)
-        counts[best.user1] = counts.get(best.user1, 0) + 1
-        counts[best.user2] = counts.get(best.user2, 0) + 1
+        counts[member_cols[a]] += 1
+        counts[c] += 1
         consecutive_skips = 0
 
-    member_counts = [counts.get(m, 0) for m in member_order]
-    print(f"Selected {len(selected)}/{len(all_pairs)} pairs for LLM scoring "
+    member_counts = [counts[c] for c in member_cols]
+    print(f"Selected {len(selected)}/{n_eligible} pairs for LLM scoring "
           f"(per-member evals min/max: {min(member_counts) if member_counts else 0}"
           f"/{max(member_counts) if member_counts else 0})")
     return selected

@@ -1,12 +1,12 @@
 """LLM-based pair scoring for candidate pairs."""
 
-from typing import Any, List, Dict, Set, Tuple, Optional
+from typing import Any, Callable, List, Dict, Set, Tuple, Optional
 import numpy as np
 from itertools import combinations
 
 from .candidate import CandidatePair
 from .llm import LLMWrapper, run_coro_blocking
-from .utils import QUERY_ID, load_yaml, hash_text, is_absent
+from .utils import QUERY_ID, load_yaml, hash_text, is_absent, stable_pair_id
 from .schemas import ExtractedSections, PairScore  # noqa: F401 — PairScore re-exported
 
 
@@ -67,46 +67,54 @@ def create_profile_groups_from_pairs(
     covered: Set[frozenset] = set()
     groups: List[Set[str]] = []
 
-    def uncovered_gain(user: str, group: Set[str]) -> int:
-        """Number of still-uncovered candidate pairs adding `user` to `group` covers."""
-        gain = 0
-        for member in group:
-            key = frozenset((user, member))
-            if key in pair_key_set and key not in covered:
-                gain += 1
-        return gain
+    # Adjacency over still-UNCOVERED candidate pairs: a user's gain for a group
+    # is how many group members it has an uncovered pair with, so scanning the
+    # members' adjacency touches only real candidates instead of every user ×
+    # every member per growth step (the old O(users) scan took seconds at
+    # ~1.5k users). Same gains, same tie-break (lowest id in sorted order,
+    # matching the old first-strictly-greater scan over ``users_sorted``), so
+    # the groups — and therefore the LLM cache keys — are unchanged.
+    uncovered_adj: Dict[str, Set[str]] = {user: set() for user in users_sorted}
+    for key in pair_keys:
+        if len(key) == 2:
+            u, v = sorted(key)
+            uncovered_adj[u].add(v)
+            uncovered_adj[v].add(u)
 
     total_pairs = len(pair_key_set)
+    seed_idx = 0  # covered only grows, so the first-uncovered seed scan is monotone
     while len(covered) < total_pairs:
         if max_groups is not None and len(groups) >= max_groups:
             break
 
         # Seed from the highest-priority pair that is still uncovered.
-        seed = next((key for key in pair_keys if key not in covered), None)
-        if seed is None:
+        while seed_idx < len(pair_keys) and pair_keys[seed_idx] in covered:
+            seed_idx += 1
+        if seed_idx >= len(pair_keys):
             break
-        group: Set[str] = set(seed)
+        group: Set[str] = set(pair_keys[seed_idx])
 
         # Grow greedily to size n by maximum uncovered-pair gain.
         while len(group) < n:
-            best_user, best_gain = None, 0
-            for user in users_sorted:
-                if user in group:
-                    continue
-                gain = uncovered_gain(user, group)
-                if gain > best_gain:
-                    best_user, best_gain = user, gain
-            if best_user is None:  # no remaining user covers a new pair
+            gains: Dict[str, int] = {}
+            for member in group:
+                for user in uncovered_adj[member]:
+                    if user not in group:
+                        gains[user] = gains.get(user, 0) + 1
+            if not gains:  # no remaining user covers a new pair
                 break
-            group.add(best_user)
+            best_gain = max(gains.values())
+            group.add(min(user for user, gain in gains.items() if gain == best_gain))
 
         # Mark every candidate pair inside this group as covered.
         members = sorted(group)
         for a in range(len(members)):
             for b in range(a + 1, len(members)):
                 key = frozenset((members[a], members[b]))
-                if key in pair_key_set:
+                if key in pair_key_set and key not in covered:
                     covered.add(key)
+                    uncovered_adj[members[a]].discard(members[b])
+                    uncovered_adj[members[b]].discard(members[a])
         groups.append(group)
 
     n_covered = len(covered)
@@ -303,6 +311,100 @@ def _merge_scores_from_response(
     return missing
 
 
+def _require_unique_ids(ids: List[str], label: str) -> None:
+    """The vectorized selectors index users by position; a repeated id would
+    silently merge two rows the legacy dict-keyed code treated differently."""
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{label} contains duplicate user ids — dedupe before pair selection")
+
+
+def _pairs_matching_pair_id(pair_id: str, index: Dict[str, int]) -> List[Tuple[str, str]]:
+    """Every ``(x, y)`` of known users with ``stable_pair_id(x, y) == pair_id``.
+
+    Pair ids are ``f"{min}_{max}"`` and user ids may themselves contain ``_``,
+    so try every split point instead of parsing. Only used to count how many
+    eligible pairs an ``excluded_pairs`` set removes (for the log line).
+    """
+    out: List[Tuple[str, str]] = []
+    cut = pair_id.find("_")
+    while cut >= 0:
+        x, y = pair_id[:cut], pair_id[cut + 1:]
+        if x < y and x in index and y in index:
+            out.append((x, y))
+        cut = pair_id.find("_", cut + 1)
+    return out
+
+
+class _RankedCandidates:
+    """Each picker's candidates in exact legacy greedy order, ranked lazily.
+
+    The legacy selectors kept ONE globally sorted pair list and, for every
+    single pick, rescanned it from the top for "the first unused pair
+    involving this picker whose partner is under the cap" — O(picks × N²).
+    That first hit is exactly the next eligible entry of the picker's OWN
+    candidate list in global order, so each picker gets its own ranked row
+    and a pointer. Every skip reason (pair already used, partner at the cap,
+    pair history-excluded) is permanent — counts only grow — so the pointer
+    never has to look back: total work ≈ picks + skipped entries.
+
+    ``scores[a, c]`` is picker ``a``'s pair score with column ``c`` (NaN = not
+    a candidate). Global order is score desc, then ``tiebreak(a, cols)`` asc —
+    the pair's insertion index in the legacy list, so equal scores resolve
+    exactly as Python's stable ``sort(reverse=True)`` did. A row is ranked in
+    growing top-K chunks cut at a score THRESHOLD (every entry tied with the
+    K-th score joins the chunk), so ties never straddle a chunk boundary.
+    """
+
+    def __init__(
+        self,
+        scores: np.ndarray,
+        tiebreak: Callable[[int, np.ndarray], np.ndarray],
+        first_chunk: int,
+    ):
+        n = scores.shape[0]
+        self._scores = scores
+        self._tiebreak = tiebreak
+        self._buf: List[List[int]] = [[] for _ in range(n)]
+        self._ptr = [0] * n
+        self._floor: List[Optional[float]] = [None] * n  # rank only scores < floor next
+        self._chunk = [max(1, first_chunk)] * n
+        self._drained = [False] * n
+
+    def pop(self, a: int) -> Optional[int]:
+        """Next not-yet-visited candidate column of picker ``a`` (None = none left)."""
+        ptr = self._ptr[a]
+        if ptr >= len(self._buf[a]):
+            if not self._rank_next_chunk(a):
+                return None
+            ptr = 0
+        self._ptr[a] = ptr + 1
+        return self._buf[a][ptr]
+
+    def _rank_next_chunk(self, a: int) -> bool:
+        if self._drained[a]:
+            return False
+        row = self._scores[a]
+        floor = self._floor[a]
+        cols = np.flatnonzero(~np.isnan(row) if floor is None else row < floor)
+        if cols.size == 0:
+            self._drained[a] = True
+            return False
+        vals = row[cols]
+        k = self._chunk[a]
+        if cols.size > k:
+            cut = np.partition(vals, cols.size - k)[cols.size - k]  # K-th largest
+            keep = vals >= cut
+            cols, vals = cols[keep], vals[keep]
+            self._floor[a] = cut
+            self._chunk[a] = 2 * k
+        else:
+            self._drained[a] = True  # this chunk holds the rest of the row
+        order = np.lexsort((self._tiebreak(a, cols), -vals))
+        self._buf[a] = cols[order].tolist()
+        self._ptr[a] = 0
+        return True
+
+
 def select_pairs_for_llm_scoring_optimal(
     similarity_matrix: np.ndarray,
     user_ids: List[str],
@@ -313,6 +415,17 @@ def select_pairs_for_llm_scoring_optimal(
     """
     Select optimal subset of pairs for LLM scoring using greedy per-profile selection.
     Works directly with similarity matrix instead of pre-filtered candidates.
+
+    Pairs are the upper triangle (``i < j``) with ``score > 0``, minus
+    ``excluded_pairs``, sorted by score desc (ties: row-major ``(i, j)``
+    order). Round-robin over users: each takes its best still-unused pair
+    whose partner is under the per-profile cap, until every user is skipped
+    in a row or ``global_cap`` is hit.
+
+    Implemented with per-user ranked rows (``_RankedCandidates``), which
+    selects exactly the pairs, in exactly the order, of the legacy
+    rescan-the-global-list loop — including ties — in ~O(picks + skipped)
+    instead of O(picks × N²). Requires unique ``user_ids``.
 
     Args:
         similarity_matrix: Full similarity matrix (n_users, n_users)
@@ -328,83 +441,92 @@ def select_pairs_for_llm_scoring_optimal(
     n_users = len(user_ids)
     if n_users == 0:
         return []
+    _require_unique_ids(user_ids, "user_ids")
 
     print(f"Greedy pair selection for {n_users} users with max {max_n_llm_evaluations_per_profile} evaluations per profile")
 
-    # Create all possible pairs with their scores (upper triangle only to avoid duplicates)
     excluded_pairs = excluded_pairs or set()
-    all_pairs = []
-    for i in range(n_users):
-        for j in range(i + 1, n_users):
-            score = similarity_matrix[i, j]
-            if score > 0:  # Only positive similarities
-                pair = CandidatePair.create(user_ids[i], user_ids[j], score)
-                if pair.pair_id in excluded_pairs:
-                    continue
-                all_pairs.append(pair)
-    
-    # Sort by similarity score (highest first)
-    all_pairs.sort(key=lambda p: p.similarity_score, reverse=True)
-    
+    cap = max_n_llm_evaluations_per_profile
+
+    # Symmetric view of the upper triangle: scores[a, b] = M[min(a,b), max(a,b)],
+    # NaN where the pair is not eligible (diagonal, NaN, score <= 0).
+    upper_vals = np.asarray(similarity_matrix)[:n_users, :n_users].astype(np.float64)
+    rows, cols = np.indices((n_users, n_users))
+    with np.errstate(invalid="ignore"):
+        scores = np.where(cols > rows, upper_vals, upper_vals.T)
+        scores[~(scores > 0)] = np.nan
+    np.fill_diagonal(scores, np.nan)
+    del rows, cols
+
+    index = {user: i for i, user in enumerate(user_ids)}
+    n_excluded_eligible = sum(
+        1
+        for pair_id in excluded_pairs
+        for x, y in _pairs_matching_pair_id(pair_id, index)
+        if not np.isnan(scores[index[x], index[y]])
+    )
+    n_all_pairs = int(np.count_nonzero(~np.isnan(scores))) // 2 - n_excluded_eligible
+
+    def tiebreak(a: int, partners: np.ndarray) -> np.ndarray:
+        lo, hi = np.minimum(partners, a), np.maximum(partners, a)
+        return lo.astype(np.int64) * n_users + hi
+
+    ranked = _RankedCandidates(scores, tiebreak, first_chunk=max(64, 4 * cap))
+
     # Greedy per-profile selection
     selected_pairs = []
-    user_pair_counts = {user: 0 for user in user_ids}
+    user_pair_counts = [0] * n_users
     used_pair_ids = set()
-    
+
     # Round-robin through users, adding their best available pair each time
     user_idx = 0
     consecutive_skips = 0
-    
+
     while consecutive_skips < n_users and len(selected_pairs) < global_cap:
         current_user = user_ids[user_idx]
-        
+
         # Skip this user if they've reached their maximum
-        if user_pair_counts[current_user] >= max_n_llm_evaluations_per_profile:
+        if user_pair_counts[user_idx] >= max_n_llm_evaluations_per_profile:
             user_idx = (user_idx + 1) % n_users
             consecutive_skips += 1
             continue
-        
-        # Find the best available pair involving this user
+
+        # Best available pair = next eligible entry of this user's ranked row.
         best_pair = None
-        for pair in all_pairs:
-            # Skip if already selected
-            if pair.pair_id in used_pair_ids:
+        while True:
+            other_idx = ranked.pop(user_idx)
+            if other_idx is None:
+                break
+            if user_pair_counts[other_idx] >= max_n_llm_evaluations_per_profile:
                 continue
-                
-            # Skip if this user is not involved in the pair
-            if pair.user1 != current_user and pair.user2 != current_user:
+            pair_id = stable_pair_id(current_user, user_ids[other_idx])
+            if pair_id in used_pair_ids or pair_id in excluded_pairs:
                 continue
-                
-            # Skip if the other user in the pair has reached their maximum
-            other_user = pair.user2 if pair.user1 == current_user else pair.user1
-            if user_pair_counts[other_user] >= max_n_llm_evaluations_per_profile:
-                continue
-            
-            # This is the best available pair for this user
-            best_pair = pair
+            i, j = min(user_idx, other_idx), max(user_idx, other_idx)
+            best_pair = CandidatePair.create(user_ids[i], user_ids[j], similarity_matrix[i, j])
             break
-        
+
         if best_pair is not None:
             # Add the pair
             selected_pairs.append(best_pair)
             used_pair_ids.add(best_pair.pair_id)
-            user_pair_counts[best_pair.user1] += 1
-            user_pair_counts[best_pair.user2] += 1
+            user_pair_counts[user_idx] += 1
+            user_pair_counts[other_idx] += 1
             consecutive_skips = 0  # Reset skip counter
         else:
             # No available pair for this user
             consecutive_skips += 1
-        
+
         # Move to next user
         user_idx = (user_idx + 1) % n_users
-    
+
     # Print statistics
     total_score = sum(pair.similarity_score for pair in selected_pairs)
-    user_counts = list(user_pair_counts.values())
+    user_counts = list(user_pair_counts)
     min_count, max_count = (min(user_counts), max(user_counts)) if user_counts else (0, 0)
     avg_count = sum(user_counts) / len(user_counts) if user_counts else 0
     
-    print(f"Selected {len(selected_pairs)}/{len(all_pairs)} pairs for LLM scoring")
+    print(f"Selected {len(selected_pairs)}/{n_all_pairs} pairs for LLM scoring")
     print(f"Total similarity score: {total_score:.4f}")
     print(f"Per-user evaluation counts - Min: {min_count}, Max: {max_count}, Avg: {avg_count:.1f}")
     

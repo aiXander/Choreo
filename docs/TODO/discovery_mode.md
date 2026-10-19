@@ -6,7 +6,12 @@ with that sprint's positioning notes. Paths modernized to the current package
 layout (`src/` → `choreo/`, `config/` → `choreo/defaults/` + config-dir
 overlays).
 
-**Positioning (from [improvement_sprint.md](improvement_sprint.md)):** this is
+**Open matchmaking work for Choreo and its host lives in ONE plan:** the motherbrain
+repo's `docs/TODO/130_matchmaking.md` (it absorbed this repo's improvement sprint,
+2026-10-19; §C1 there is the eval harness this plan shares). This file stays the
+design spec for discovery mode only.
+
+**Positioning:** this is
 the **serendipity half** of the platform's "matchmaking and serendipity
 engine" — the capability Murmura / show-night orchestration actually needs
 (groups + project seeds, not 1:1 intros). Run it as its own sprint, sequenced
@@ -452,7 +457,7 @@ possible third tool_key — that decision belongs to
 - **No fixture cohort exists yet.** The vivid multi-domain cohort needed to validate
   serendipity must be authored (~20 `.txt` profiles); current `data/*` groups are
   small and homogeneous. Shared task with the improvement sprint's Track 1
-  ([improvement_sprint.md](improvement_sprint.md) §2) — whichever sprint runs
+  (motherbrain `docs/TODO/130_matchmaking.md` §C1) — whichever sprint runs
   first authors it.
 - **Don't sample on a signed fused matrix.** Keep similarity a *soft probability
   landscape*; collapsing it into a single maximized score recreates mean-collapse.

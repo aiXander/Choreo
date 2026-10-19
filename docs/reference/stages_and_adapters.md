@@ -1,9 +1,8 @@
 # Stages & adapters: how Choreo's granular architecture fits together
 
 *(Built June 2026 in the "granular, incremental & pluggable" refactor.
-Remaining follow-ups:
-[../TODO/external_adapter_integration.md](../TODO/external_adapter_integration.md),
-[../TODO/scoring_calibration.md](../TODO/scoring_calibration.md).)*
+Remaining follow-ups live in the motherbrain repo, `docs/TODO/130_matchmaking.md`
+§C–D — the one matchmaking improvement plan for both repos.)*
 
 ## The one-sentence model
 
@@ -157,7 +156,13 @@ points is tested.
 - `LLMWrapper(cache_dir=None)` disables the response cache (used for
   transient query atoms). `LLMWrapper.cache_writes` counts new cache files
   this run — adapters use it to skip persistence (e.g. Modal `volume.commit`)
-  on fully cache-hit calls.
+  on fully cache-hit calls. `LLMWrapper(checkpoint=fn)` makes a long run
+  crash-safe: `fn()` runs off the event loop after every `batch_json_complete`
+  that wrote ≥1 entry (between phases — scoring, each scoring retry round,
+  intros, HyDE, extraction — never mid-phase), and a raising `fn` is logged and
+  swallowed (`tests/test_cache_checkpoint.py`). Cache files are plain
+  `open('w')` writes; a torn file reads as a miss (`_load_cached`), never as a
+  cached value.
 - Cross-section keys are split on a single `_` (`needs_skills`) or the
   preferred `->` form; multi-word section names need `->`.
 - **Freshness timestamps**: `Profile` / `ExtractedSections` /

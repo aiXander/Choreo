@@ -330,10 +330,25 @@ store (Neon `updated_at`) can pass its timestamps in
 **Batching**: scoring evaluates `n_profiles_to_score_together` profiles per LLM call, generating N*(N-1)/2 pairs.
 
 **Concurrency**: every batched phase (extract, HyDE, scoring, query re-rank,
-intros) routes through `LLMWrapper.batch_json_complete`, which is semaphore-gated
-by `concurrency.max_concurrent_llm_calls` (default 16) — exactly that many calls
-are in flight at once and the next fires the instant one returns (continuous
-dispatch, not fire-a-window-then-await). One global knob; no per-stage batch sizes.
+intros) routes through `LLMWrapper.batch_json_complete`, gated by an
+`AdaptiveConcurrencyLimiter` whose ceiling is `concurrency.max_concurrent_llm_calls`
+(default 16) — the next call fires the instant one returns (continuous
+dispatch, not fire-a-window-then-await). A permit covers one HTTP attempt, never
+a backoff sleep. One global knob; no per-stage batch sizes.
+
+**Retries (two policies, chosen by `deadline_s`)**: an unbounded phase gets
+`BATCH_MAX_RETRIES` (6) with full-jitter backoff capped at 30 s, server
+`Retry-After`/`retry-after-ms` honored on 429/503, short non-growing pauses for
+JSON/shape failures, and **AIMD** on the in-flight limit (×0.5 per 429 burst —
+deduped by epoch so one burst cuts once — floor 8, +1 per 8 successes back to
+the ceiling). A deadline-bounded phase (the live query re-rank) keeps the legacy
+policy unchanged: 3 retries at 1/2/4 s, no jitter, no Retry-After, fixed limit —
+there the deadline is the retry budget. Explicit `max_retries` always wins.
+Every phase prints one `LLM phase:` summary line and appends a `BatchStats`;
+`get_stats()` sums them (retries, rate-limited, failed, cancelled, min
+concurrency) so a host can surface silent degradation. Pinned in
+`tests/test_llm_retry.py`; the 120 s client timeout + SDK `max_retries=0` stay,
+so timeouts flow through this loop.
 
 **Response shape (`required_key_sets`)**: `json_mode` buys SYNTAX, not SCHEMA —
 `response_format={"type":"json_object"}` promises *an* object, not *your* keys.
@@ -381,6 +396,10 @@ docs: [stages_and_adapters.md](docs/reference/stages_and_adapters.md) (stage
 contracts, bundle, FileStore, adapters),
 [matching_modes.md](docs/reference/matching_modes.md) (cohort / query / batch
 semantics). `choreo_IO.md` (repo root) is the external-integration IO spec.
+Open improvement work (scoring, HyDE, eval harness, embedding-model migration)
+is tracked in ONE plan in the host repo: motherbrain's
+`docs/TODO/130_matchmaking.md`. The only plan here is
+[discovery_mode.md](docs/TODO/discovery_mode.md) (a new mode, not started).
 
 ## Environment
 
