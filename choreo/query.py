@@ -409,6 +409,7 @@ def run_query_match(
     effective_recipe = {
         "section_weights": recipe.get("section_weights", {}) or {},
         "cross_section_weights": cross_weights,
+        "absent_penalty": recipe.get("absent_penalty", 0.0),
     }
 
     hyde_descriptors = {}

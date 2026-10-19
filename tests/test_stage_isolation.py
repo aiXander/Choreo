@@ -219,12 +219,102 @@ def test_rectangular_reduces_to_square_exactly():
         target_embeddings=embeddings, target_section_names=section_names,
     )
 
-    # Square mode (no target passed) preserves the legacy path BIT-EXACTLY.
-    assert np.array_equal(fused_square, legacy)
-    # Explicit rectangular with target == source agrees to numerical noise
-    # (BLAS uses a symmetric kernel for A @ A.T that the rectangular
-    # A @ B.T path reproduces only to ~1 ULP).
-    assert np.allclose(fused_rect, legacy, rtol=0, atol=1e-12)
+    # Square mode preserves the legacy path BIT-EXACTLY on every pair whose
+    # terms are all present. User 2's absent vision is mean-imputed now (the
+    # 2026-10-19 change, pinned below), so its row and column differ by design.
+    full = np.ones((n, n), dtype=bool)
+    full[2, :] = full[:, 2] = False
+    assert np.array_equal(fused_square[full], legacy[full])
+    assert not np.allclose(fused_square[2], legacy[2])
+    # Explicit rectangular with target == source agrees with square to
+    # numerical noise (BLAS uses a symmetric kernel for A @ A.T that the
+    # rectangular A @ B.T path reproduces only to ~1 ULP).
+    assert np.allclose(fused_rect, fused_square, rtol=0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# similarity — absent terms: mean-imputed at full weight, minus a small penalty
+# ---------------------------------------------------------------------------
+
+def _unit(v):
+    return v / np.linalg.norm(v)
+
+
+def _absent_fixture():
+    """Source 0 vs targets 1..4 (rectangular). Target 4 has an EMPTY skills
+    section; skills carries a NEGATIVE weight, as in the packaged recipe."""
+    rng = np.random.default_rng(11)
+    dim = 8
+    names = ["skills", "vision"]
+    src = rng.normal(size=(1, 2, dim))
+    tgt = rng.normal(size=(4, 2, dim))
+    tgt[3, 0] = 0.0
+    return names, src, tgt, {"skills": -0.4, "vision": 0.6}
+
+
+def test_absent_term_counts_as_its_mean_at_full_weight():
+    """The masking it replaces dropped the term and renormalized, so an empty
+    section under a NEGATIVE weight dodged the penalty every full profile pays
+    (live pool 2026-10-19: the 17% with an empty `needs` took 63% of top-16
+    slots). Now the absent term is the mean over present pairs, full weight."""
+    names, src, tgt, weights = _absent_fixture()
+    fused, m = compute_fused_similarity_matrix(
+        embeddings=src, section_names=names, section_weights=weights,
+        target_embeddings=tgt,
+    )
+    skills = m["section_matrices"]["skills"][0]
+    vision = m["section_matrices"]["vision"][0]
+    mean_skills = skills[:3].mean()
+    expected = (-0.4 * mean_skills + 0.6 * vision[3]) / 1.0
+    assert np.isclose(fused[0, 3], expected)
+    # …and NOT the masked value, which would have been vision alone.
+    assert not np.isclose(fused[0, 3], vision[3])
+
+
+def test_absent_penalty_is_small_and_proportional_to_absent_mass():
+    names, src, tgt, weights = _absent_fixture()
+    base, _ = compute_fused_similarity_matrix(
+        embeddings=src, section_names=names, section_weights=weights,
+        target_embeddings=tgt,
+    )
+    pen, _ = compute_fused_similarity_matrix(
+        embeddings=src, section_names=names, section_weights=weights,
+        target_embeddings=tgt, absent_penalty=0.05,
+    )
+    assert np.array_equal(pen[0, :3], base[0, :3])           # full profiles untouched
+    assert np.isclose(base[0, 3] - pen[0, 3], 0.05 * 0.4 / 1.0)  # 0.4 of the mass absent
+
+
+def test_recipe_absent_penalty_reaches_the_fusion():
+    names, src, tgt, weights = _absent_fixture()
+    from choreo.schemas import EmbeddingsBundle
+    def bundle(e, ids):
+        return EmbeddingsBundle(user_ids=ids, section_names=names, embeddings=e, hyde={},
+                                embedding_model="fake", dim=e.shape[-1])
+    s, t = bundle(src, ["q"]), bundle(tgt, ["a", "b", "c", "d"])
+    plain = generate_rectangular_similarity(s, t, {"section_weights": weights}).dir_matrix
+    pen = generate_rectangular_similarity(
+        s, t, {"section_weights": weights, "absent_penalty": 0.05}).dir_matrix
+    assert np.isclose(plain[0, 3] - pen[0, 3], 0.02)
+
+
+def test_term_absent_for_every_pair_is_dropped_and_no_signal_scores_zero():
+    """A needs-only query (every other source section empty) must score on
+    needs alone — a term absent EVERYWHERE has no mean and carries no mass —
+    and a pair with no present term at all stays 0 (no signal)."""
+    rng = np.random.default_rng(3)
+    names = ["skills", "needs"]
+    src = rng.normal(size=(1, 2, 8))
+    src[0, 0] = 0.0                       # query fills `needs` only
+    tgt = rng.normal(size=(3, 2, 8))
+    tgt[2, 1] = 0.0                       # target 2 has no needs either
+    fused, m = compute_fused_similarity_matrix(
+        embeddings=src, section_names=names,
+        section_weights={"skills": 0.5, "needs": 0.5}, target_embeddings=tgt,
+    )
+    needs = m["section_matrices"]["needs"][0]
+    assert np.allclose(fused[0, :2], needs[:2])
+    assert fused[0, 2] == 0.0
 
 
 def test_rectangular_subset_consistency(synthetic_bundle):

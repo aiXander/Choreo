@@ -108,11 +108,17 @@ writing and similarity plots (`main.py`).
   to movement") is rewritten by an LLM into skill-vocabulary text, so it
   embeds close to the matching skills. `n_descriptors > 1` is supported
   end-to-end (max-pool over descriptor pairs).
-- **Absent sections are neutral, not zero** — empty sections AND the
+- **Absent sections score the pool mean, not zero** — empty sections AND the
   `"Not specified"` extraction placeholder (`utils.is_absent`) embed to zero
-  vectors, skip HyDE entirely, and are masked out of the per-pair fusion. This
-  is what lets a query that only fills `needs` drop into the same machinery
-  ([docs/reference/matching_modes.md](docs/reference/matching_modes.md)).
+  vectors and skip HyDE entirely. In the fusion an absent term counts as that
+  term's mean over present pairs at full weight, minus a small
+  `recipe.absent_penalty` (`candidate.compute_fused_similarity_matrix`). Plain
+  masking was not neutral under the NEGATIVE same-section weights: empty
+  profiles dodged the penalty and flooded shortlists (2026-10-19). A term absent
+  for EVERY pair is dropped (that is what lets a query that only fills `needs`
+  drop into the same machinery —
+  [docs/reference/matching_modes.md](docs/reference/matching_modes.md)), and a
+  pair with no present term scores 0.
 
 ### Key Data Flow
 

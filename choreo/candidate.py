@@ -42,6 +42,7 @@ def compute_fused_similarity_matrix(
     hyde_embeddings: Optional[Dict[str, np.ndarray]] = None,
     target_embeddings: Optional[np.ndarray] = None,  # (n_target, n_sections, dim); None = square
     target_section_names: Optional[List[str]] = None,
+    absent_penalty: float = 0.0,
 ) -> Tuple[np.ndarray, Dict]:
     """
     Compute fused similarity between a source user set and a target user set.
@@ -67,6 +68,8 @@ def compute_fused_similarity_matrix(
         target_embeddings: Optional target embeddings (n_target, n_sections, dim)
         target_section_names: Section names of the target embeddings (defaults
             to ``section_names``)
+        absent_penalty: Score subtracted per unit of the pair's weight mass that
+            was absent (see the absent-term note below); 0 = imputation only
 
     Returns:
         Tuple of (fused_matrix [n_source, n_target], matrices_dict)
@@ -111,19 +114,44 @@ def compute_fused_similarity_matrix(
     for missing in set(section_weights) - set(valid_section_weights):
         print(f"Warning: Section '{missing}' not found in embeddings")
 
-    # Per-pair fusion with masking: a section contributes to a pair only when the
-    # relevant side(s) are present, and the denominator is the weight mass that
-    # was *actually present* for that pair. This makes a missing section neutral
-    # (ignored) instead of an extreme low that drags a sparse profile's scores.
-    # When every section is present for a pair, this reduces exactly to the old
-    # global-normalization behavior (denominator == sum of all abs weights).
+    # Per-pair fusion with MEAN IMPUTATION. A term (section or cross) whose
+    # side(s) are absent for a pair counts as that term's MEAN over the pairs
+    # where it is present, keeping its full weight, minus a small
+    # `absent_penalty` per unit of absent weight mass. Plain masking (dropping
+    # the term and renormalizing over the mass present) looked neutral but was
+    # not: the recipe's same-section weights are NEGATIVE (complementarity, not
+    # sameness), so a profile with an empty `needs` skipped a penalty every full
+    # profile pays. On the live Wintercircus pool (2026-10-19) the 17% of members
+    # with an empty `needs` took 63% of all top-16 candidate slots. The mean is
+    # neutral whatever the weight's sign; the penalty makes "rich" profiles win
+    # ties.
+    #   - A term absent for EVERY pair is dropped outright, with no mass. That
+    #     is how a needs-only query (every other source section empty) still
+    #     drops into this machinery.
+    #   - A pair with no present term at all scores 0 (no signal), as before.
+    #   - With every term present for a pair this reduces bit-exactly to the old
+    #     global-normalization behavior.
     weighted_sum = np.zeros((n_source, n_target))
-    weight_mass = np.zeros((n_source, n_target))
+    weight_mass = np.zeros((n_source, n_target))   # mass actually present
+    absent_mass = np.zeros((n_source, n_target))
+    full_mass = 0.0
+
+    def _add_term(weight: float, present: np.ndarray, matrix: np.ndarray) -> None:
+        nonlocal weighted_sum, weight_mass, absent_mass, full_mass
+        # Mean over ALL present pairs, self-pairs included, in both modes: the
+        # rectangular path cannot tell a self-pair, and square == rectangular
+        # is pinned (the diagonal's pull is ~1/n of the mean).
+        if not present.any():
+            return
+        mean = float(matrix[present].mean())
+        weighted_sum += weight * np.where(present, matrix, mean)
+        weight_mass += abs(weight) * present
+        absent_mass += abs(weight) * ~present
+        full_mass += abs(weight)
 
     for section_name, weight in valid_section_weights.items():
-        mask = np.outer(src_present[section_name], tgt_present[section_name]).astype(float)
-        weighted_sum += weight * mask * section_matrices[section_name]
-        weight_mass += abs(weight) * mask
+        present = np.outer(src_present[section_name], tgt_present[section_name])
+        _add_term(weight, present, section_matrices[section_name])
 
     # Cross-section similarity — DIRECTIONAL (not symmetrized)
     cross_section_matrices = {}
@@ -173,13 +201,13 @@ def compute_fused_similarity_matrix(
         # Directional presence: source i (HyDE of i's needs) and target j (j's section).
         src_hyde_present = np.linalg.norm(src_emb, axis=2).max(axis=1) > 1e-8
         tgt_sec_present = np.linalg.norm(tgt_emb[:, 0, :], axis=1) > 1e-8
-        mask = np.outer(src_hyde_present, tgt_sec_present).astype(float)
-        weighted_sum += weight * mask * cross_matrix
-        weight_mass += abs(weight) * mask
+        _add_term(weight, np.outer(src_hyde_present, tgt_sec_present), cross_matrix)
 
-    # Per-pair normalization. Pairs with no overlapping present signal get 0.
+    # Pairs with no present signal at all get 0.
     with np.errstate(invalid="ignore", divide="ignore"):
-        fused_matrix = np.where(weight_mass > 0, weighted_sum / weight_mass, 0.0)
+        fused_matrix = np.where(
+            weight_mass > 0, (weighted_sum - absent_penalty * absent_mass) / full_mass, 0.0
+        )
 
     matrices_dict = {
         'section_matrices': section_matrices,
@@ -260,6 +288,7 @@ def apply_recipe(
         section_weights=section_weights,
         cross_section_weights=cross_section_weights,
         hyde_embeddings=hyde_embeddings,
+        absent_penalty=float(recipe_config.get('absent_penalty', 0.0)),
     )
 
     return similarity_matrix, matrices_dict
@@ -331,6 +360,7 @@ def generate_rectangular_similarity(
         hyde_embeddings=source.hyde or None,
         target_embeddings=target.embeddings,
         target_section_names=target.section_names,
+        absent_penalty=float(recipe_config.get('absent_penalty', 0.0)),
     )
 
     sym_matrix = None

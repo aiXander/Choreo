@@ -79,10 +79,14 @@ keeps the legacy output **bit-exact** (locked by
 `tests/test_stage_isolation.py::test_rectangular_reduces_to_square_exactly`).
 
 Two semantics that must survive any future rewrite:
-- **Absent section = neutral, not zero**: empty sections embed to zero
-  vectors, are masked out of the per-pair fusion, and the denominator is the
-  weight mass *actually present* for that pair. This is what lets a query that
-  only fills `needs` drop into the same machinery.
+- **Absent section = the pool mean, not zero**: empty sections embed to zero
+  vectors. In the per-pair fusion an absent term counts as that term's mean over
+  the pairs where it is present, at full weight, minus `recipe.absent_penalty`
+  per unit of absent mass (ties go to richer profiles). It replaced masking
+  (drop + renormalize over the mass present), which let empty profiles dodge
+  the negative same-section weights. A term absent for every pair is dropped
+  outright — that is what lets a query that only fills `needs` drop into the
+  same machinery — and a pair with no present term scores 0.
 - **Directional cross terms are never symmetrized** in rectangular mode;
   `(dir+dir.T)/2` only happens on the legacy square path
   (`generate_similarity_matrix`).

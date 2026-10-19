@@ -14,7 +14,8 @@ covers the plumbing; this one covers the three product trigger shapes.)*
 
 A query ("find me a CTO great at agentic engineering") is a pseudo-user
 (`__query__`) with only some sections filled — it drops into the normal
-directional machinery because absent sections are masked as neutral. Two input
+directional machinery because a section absent for every pair is dropped from
+the fusion (an absent term otherwise scores the pool mean — `stages_and_adapters.md`). Two input
 shapes:
 
 - **explicit mapping** (default, no extraction call): `{"needs": "<text>"}`

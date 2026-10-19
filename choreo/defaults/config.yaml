@@ -94,8 +94,9 @@ recipe:
   # Same-section similarity. NEGATIVE is deliberate and load-bearing: two
   # people with the SAME skills (or the same needs) are not a match to make —
   # complementarity is, and that is what the cross term below buys. Fusion is a
-  # masked weighted mean normalized by the |weight| mass actually present for
-  # the pair, so these are relative, not absolute (full mass = 1.65).
+  # weighted mean over the FULL |weight| mass (1.65). A term that is absent for
+  # a pair counts as that term's mean over the present pairs, minus
+  # `absent_penalty` below, so these weights are relative, not absolute.
   section_weights:
     skills:   -0.20
     vision:   0.35
@@ -103,6 +104,14 @@ recipe:
     needs:    -0.10
   cross_section_weights:
     needs_skills: 0.80
+  # Score subtracted per unit of a pair's weight mass that was ABSENT (an
+  # empty section, or no HyDE). Kept very small: it only breaks ties toward
+  # richer profiles. An empty profile scoring at the pool mean is the neutral
+  # baseline; this tips near-ties toward people who said more. On the live
+  # Wintercircus pool (2026-10-19, placeholder facets blanked) 0.01 moved
+  # empty-`needs` members from 14% to 13% of shortlist slots (30% of the
+  # roster). 0 = imputation only.
+  absent_penalty: 0.01
 
 blending:
   embed_weight: 0.35
